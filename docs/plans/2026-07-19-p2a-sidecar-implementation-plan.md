@@ -74,10 +74,10 @@
 **What to build:** Minimal compiling workspace with the verb skeleton, lib/bin split, pre-declared deps, and repo hygiene files. AGENTS.md: concise working notes — the pinned Miller contract/fixture paths and commit, the frozen-contract rule (defects are Miller-repo amendments, not local edits), verification commands, the no-publish rule, the two-layer sanitization rule. LICENSE: MIT, copyright Alan Northam. `.gitignore`: `/target`, `.razorback/`, local model caches.
 
 **Acceptance criteria:**
-- [ ] `cargo build` + `cargo test` + clippy + fmt green on the stub
-- [ ] `--version` prints the semver; unknown verb exits 2; `serve` blocks on stdin and exits on EOF; `prepare` verb dispatches to `prepare::run` stub
-- [ ] `src/lib.rs` exposes all stub modules; an integration test can `use julie_semantic_sidecar::protocol` (compile check)
-- [ ] AGENTS.md carries the contract pointers (with pinned Miller commit) and command reference
+- [x] `cargo build` + `cargo test` + clippy + fmt green on the stub
+- [x] `--version` prints the semver; unknown verb exits 2; `serve` blocks on stdin and exits on EOF; `prepare` verb dispatches to `prepare::run` stub
+- [x] `src/lib.rs` exposes all stub modules; an integration test can `use julie_semantic_sidecar::protocol` (compile check)
+- [x] AGENTS.md carries the contract pointers (with pinned Miller commit) and command reference
 
 ## Task 2: Protocol core (pure, engine behind a trait)
 
@@ -95,9 +95,9 @@
 **What to build:** The protocol module + a `FakeEngine` test double. Tests: one per Group A row that is testable without a real engine (A1–A17, A19–A21, A23 — batch isolation A18 lands with the engine in Task 5), plus the both-keys precedence cases (valid+valid → request_id wins; invalid request_id + valid id → `invalid_request`).
 
 **Acceptance criteria:**
-- [ ] Every § Errors emission condition and every fake-testable Group A row has a named test; error vocabulary is exactly the four codes
-- [ ] `request_id`-precedence tests pass against the reference's behavior
-- [ ] Protocol tests run with no llama dependency and no network
+- [x] Every § Errors emission condition and every fake-testable Group A row has a named test; error vocabulary is exactly the four codes
+- [x] `request_id`-precedence tests pass against the reference's behavior
+- [x] Protocol tests run with no llama dependency and no network
 
 ## Task 3: Manifest + health assembly
 
@@ -112,9 +112,9 @@
 **Serialization:** No — Batch A.
 
 **Acceptance criteria:**
-- [ ] Manifest values byte-match Global Constraints (tests against literal strings, both models)
-- [ ] Health assembly tested for: ready model, missing model (`ready:false` + exact `model_not_prepared`, no `dims` required), degraded backend (A9 mirror invariants enforced)
-- [ ] All four torch-compat capability keys always present as objects with boolean `available`
+- [x] Manifest values byte-match Global Constraints (tests against literal strings, both models)
+- [x] Health assembly tested for: ready model, missing model (`ready:false` + exact `model_not_prepared`, no `dims` required), degraded backend (A9 mirror invariants enforced)
+- [x] All four torch-compat capability keys always present as objects with boolean `available`
 
 ## Task 4: `prepare` subcommand
 
@@ -135,9 +135,9 @@
 **What to build:** The full download path, tested against a local `tiny_http` fixture server (no live network in tests): success, sha256 mismatch, disk-preflight failure (fake a huge manifest size), concurrent-lock (two threads, one server), unknown id, cache-dir env override, stale-partial cleanup.
 
 **Acceptance criteria:**
-- [ ] All seven fixture-server scenarios tested; sha256 mismatch provably deletes the temp and exits 1
-- [ ] Event stream shape matches the frozen interface above (tests parse stdout lines as JSON)
-- [ ] No live-network access in any test
+- [x] All seven fixture-server scenarios tested; sha256 mismatch provably deletes the temp and exits 1
+- [x] Event stream shape matches the frozen interface above (tests parse stdout lines as JSON)
+- [x] No live-network access in any test
 
 ## Task 5: Engine — llama-cpp-2 integration
 
