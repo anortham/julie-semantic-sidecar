@@ -104,16 +104,16 @@ mod sys {
     pub const STDERR: i32 = 2;
 
     pub fn dup(fd: i32) -> i32 {
-        unsafe { libc::_dup(fd) }
+        unsafe { libc::dup(fd) }
     }
 
     pub fn dup2(source: i32, target: i32) -> i32 {
-        unsafe { libc::_dup2(source, target) }
+        unsafe { libc::dup2(source, target) }
     }
 
     pub fn close(fd: i32) {
         unsafe {
-            libc::_close(fd);
+            libc::close(fd);
         }
     }
 }
