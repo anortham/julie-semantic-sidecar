@@ -252,15 +252,21 @@ fn a_forced_cpu_backend_offloads_no_layers_to_the_gpu() {
     let output = child.wait_with_output().expect("wait");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(
-        offloaded_layers(&stderr),
-        Some(0),
-        "a cpu selection must load with zero layers on the GPU; llama.cpp reported: {:?}",
-        stderr
-            .lines()
-            .filter(|l| l.contains("offload"))
-            .collect::<Vec<_>>()
-    );
+    let offload_lines: Vec<_> = stderr.lines().filter(|l| l.contains("offload")).collect();
+    match offloaded_layers(&stderr) {
+        Some(layers) => assert_eq!(
+            layers, 0,
+            "a cpu selection must load with zero layers on the GPU; llama.cpp reported: {offload_lines:?}"
+        ),
+        // A GPU-less build (Linux CI) prints no placement line at all: nothing was
+        // offloaded because there is nowhere to offload to. Any surviving offload
+        // mention we failed to parse is format drift and must still fail.
+        None => assert_eq!(
+            offload_lines,
+            Vec::<&str>::new(),
+            "offload lines present but none parseable as a placement report"
+        ),
+    }
     assert!(
         !stderr.contains("offloading output layer to GPU"),
         "the output layer must stay on the cpu"
