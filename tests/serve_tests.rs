@@ -212,6 +212,120 @@ fn a_ready_health_reports_the_selected_backend() {
     served.shutdown();
 }
 
+/// llama.cpp's own placement report, e.g. `load_tensors: offloaded 29/29 layers to GPU`.
+///
+/// It is the only evidence of where the weights actually went; `health` reports the
+/// *decision*, and before the load applied `n_gpu_layers` the two disagreed silently.
+fn offloaded_layers(stderr: &str) -> Option<u32> {
+    let line = stderr.lines().find(|l| l.contains("offloaded "))?;
+    let tail = line.split("offloaded ").nth(1)?;
+    tail.split('/').next()?.trim().parse().ok()
+}
+
+#[test]
+#[ignore = "requires the prepared model in the shared cache"]
+fn a_forced_cpu_backend_offloads_no_layers_to_the_gpu() {
+    let mut command = Command::new(BIN);
+    command
+        .arg("serve")
+        .env("JULIE_SIDECAR_FORCE_BACKEND", "cpu")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn serve");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"request_id": "h1", "method": "health"})
+    )
+    .expect("write");
+    stdin.flush().expect("flush");
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("read");
+    let health: Value = serde_json::from_str(&line).expect("protocol json");
+    assert_eq!(health["result"]["ready"], true, "{health}");
+    assert_eq!(health["result"]["resolved_backend"], "cpu", "{health}");
+
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        offloaded_layers(&stderr),
+        Some(0),
+        "a cpu selection must load with zero layers on the GPU; llama.cpp reported: {:?}",
+        stderr
+            .lines()
+            .filter(|l| l.contains("offload"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !stderr.contains("offloading output layer to GPU"),
+        "the output layer must stay on the cpu"
+    );
+}
+
+#[test]
+#[ignore = "requires the prepared model in the shared cache"]
+fn a_corrupt_cached_model_serves_not_ready_rather_than_loading_it() {
+    let cache = tempfile::tempdir().expect("tempdir");
+    let real = dirs_cache().join("Qwen3-Embedding-0.6B-f16.gguf");
+    assert!(
+        real.is_file(),
+        "the pinned model must be prepared: {real:?}"
+    );
+    let corrupt = cache.path().join("Qwen3-Embedding-0.6B-f16.gguf");
+    // Real GGUF header bytes, wrong contents: existence and file-type checks both pass, so
+    // only the digest can tell this from the pinned weights.
+    let mut bytes = std::fs::read(&real).expect("read model")[..4096].to_vec();
+    bytes[4095] ^= 0xff;
+    std::fs::write(&corrupt, &bytes).expect("seed corrupt model");
+
+    let mut served = Served::spawn(Some(cache.path()));
+    let health = served.request("h1", "health", serde_json::json!({}));
+    assert_eq!(health["result"]["ready"], false, "{health}");
+    assert_eq!(
+        health["result"]["degraded_reason"], "model_not_prepared",
+        "{health}"
+    );
+
+    let embed = served.request("e1", "embed_query", serde_json::json!({"text": "hello"}));
+    assert_eq!(embed["error"]["code"], "internal_error", "{embed}");
+    assert!(served.is_alive(), "a corrupt model must not kill serve");
+
+    let (_stdout, stderr) = served.shutdown();
+    assert!(
+        stderr.contains("does not match its pinned digest"),
+        "the diagnostic must name the mismatch: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("expected sha256") && stderr.contains("found"),
+        "the diagnostic must name expected and actual: {stderr:?}"
+    );
+}
+
+/// The shared cache `prepare` writes to, resolved the same way the binary resolves it.
+fn dirs_cache() -> std::path::PathBuf {
+    std::env::var_os("JULIE_EMBEDDING_CACHE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            #[cfg(windows)]
+            {
+                std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA"))
+                    .join("julie-semantic")
+            }
+            #[cfg(not(windows))]
+            {
+                std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                    .join(".cache")
+                    .join("julie-semantic")
+            }
+        })
+}
+
 #[test]
 #[ignore = "requires the prepared model in the shared cache"]
 fn a_forced_unavailable_backend_stays_ready_and_degraded() {

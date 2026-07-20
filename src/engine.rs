@@ -9,6 +9,7 @@
 //! testable without a model — the engine supplies the real closure.
 
 use std::cell::RefCell;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
@@ -17,8 +18,9 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
-use llama_cpp_2::TokenToStringError;
+use llama_cpp_2::{DecodeError, EncodeError, TokenToStringError};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::backend_select::{self, Selection};
 use crate::engine_trait::{EmbedEngine, EmbedOutput, EngineError, Role};
@@ -46,6 +48,9 @@ const OVERHEAD_PROBE: &str = "probe";
 /// single input longer than it still gets a context sized to fit it exactly.
 const MAX_TOKENS_PER_ENCODE: usize = 16_384;
 
+/// Bytes read per digest chunk when the cached model file is verified at load.
+const DIGEST_CHUNK_BYTES: usize = 1024 * 1024;
+
 /// Ceiling on the physical micro-batch a single encode step processes.
 ///
 /// The attention compute buffer grows with the square of the micro-batch, so sizing it to
@@ -68,9 +73,12 @@ pub struct LlamaEngine {
 impl LlamaEngine {
     /// Loads `pin`'s weights from `cache_dir`.
     ///
-    /// The model file is checked for existence only — never re-hashed. `prepare` owns
-    /// digest verification, and re-hashing a multi-gigabyte GGUF on every start would cost
-    /// seconds to minutes.
+    /// The cached file is verified against the pin's sha256 before it is loaded: existence
+    /// alone would let `serve` hand a truncated, swapped, or corrupt GGUF straight to
+    /// llama.cpp. A streaming hash runs at roughly a second per gigabyte in a release
+    /// build, which the contract's 120s cold-start budget absorbs. A digest mismatch is
+    /// reported as `ModelNotPrepared` so `serve` answers the contract's unready health
+    /// rather than dying.
     ///
     /// Backend initialisation, weight load, and the tokenizer probe all run inside a
     /// [`stdio_guard`](crate::stdio_guard) so llama.cpp's native chatter can never reach fd
@@ -84,12 +92,13 @@ impl LlamaEngine {
                 format!("{} is not in the cache; run `prepare`", path.display()),
             ));
         }
+        verify_cached_digest(&path, pin.sha256)?;
 
         crate::stdio_guard::guarded(|| {
             let selection = backend_select::select(cache_dir, VERSION, pin.sha256);
             let backend = LlamaBackend::init()
                 .map_err(|err| EngineError::new("BackendInit", err.to_string()))?;
-            let model = LlamaModel::load_from_file(&backend, &path, &LlamaModelParams::default())
+            let model = LlamaModel::load_from_file(&backend, &path, &model_params(&selection))
                 .map_err(|err| EngineError::new("ModelLoad", err.to_string()))?;
 
             let eos_reserve = match pin.eos_marker {
@@ -216,9 +225,10 @@ impl LlamaEngine {
 
     /// Encodes one group of pre-tokenized inputs in a single fresh context.
     ///
-    /// Returns `None` on any failure so [`isolate`] can bisect the group; a fresh context
-    /// per call is both the crate's requirement and the batch memory hygiene the contract
-    /// implies.
+    /// Failures are typed so [`isolate`] can tell a poison input from a broken backend: an
+    /// [`EncodeFailure::Item`] is bisected down to the offending input, while an
+    /// [`EncodeFailure::Systemic`] aborts the whole request. A fresh context per call is
+    /// both the crate's requirement and the batch memory hygiene the contract implies.
     ///
     /// The two pinned models take different llama.cpp entry points. A `cls`-pooled model
     /// is a non-causal encoder: `llama_encode` asserts the whole batch fits one micro-batch
@@ -226,16 +236,19 @@ impl LlamaEngine {
     /// `last`-pooled model is a causal LM, so `llama_decode` accepts a micro-batch smaller
     /// than the sequence (`llama-context.cpp:1714`) — the only way a 32k-token Qwen3 input
     /// is embeddable without asking the backend for tens of gigabytes.
-    fn encode_group(&self, group: &[&Vec<LlamaToken>]) -> Option<Vec<Vec<f32>>> {
+    fn encode_group(&self, group: &[&Vec<LlamaToken>]) -> Result<Vec<Vec<f32>>, EncodeFailure> {
         let total_tokens: usize = group.iter().map(|t| t.len()).sum();
+        let (Ok(n_tokens), Ok(n_seq)) = (u32::try_from(total_tokens), i32::try_from(group.len()))
+        else {
+            return Err(EncodeFailure::Item);
+        };
         if total_tokens == 0 {
-            return None;
+            return Err(EncodeFailure::Item);
         }
-        let n_tokens = u32::try_from(total_tokens).ok()?;
-        let n_seq = i32::try_from(group.len()).ok()?;
         let n_ubatch = match self.pin.pooling {
             Pooling::Cls => n_tokens,
-            Pooling::Last => u32::try_from(total_tokens.min(MAX_UBATCH_TOKENS)).ok()?,
+            Pooling::Last => u32::try_from(total_tokens.min(MAX_UBATCH_TOKENS))
+                .map_err(|_| EncodeFailure::Item)?,
         };
 
         let params = LlamaContextParams::default()
@@ -247,27 +260,36 @@ impl LlamaEngine {
                 Pooling::Last => LlamaPoolingType::Last,
                 Pooling::Cls => LlamaPoolingType::Cls,
             });
-        let mut context = self.model.new_context(&self.backend, params).ok()?;
+        // A context that cannot be created is an allocation failure, not a bad input:
+        // bisecting it would zero-vector an entire healthy batch.
+        let mut context = self
+            .model
+            .new_context(&self.backend, params)
+            .map_err(|err| EncodeFailure::systemic("ContextAlloc", err.to_string()))?;
 
         let mut batch = LlamaBatch::new(total_tokens, n_seq);
         for (seq_id, tokens) in group.iter().enumerate() {
+            let seq_id = i32::try_from(seq_id).map_err(|_| EncodeFailure::Item)?;
             batch
-                .add_sequence(tokens, i32::try_from(seq_id).ok()?, true)
-                .ok()?;
+                .add_sequence(tokens, seq_id, true)
+                .map_err(|_| EncodeFailure::Item)?;
         }
         match self.pin.pooling {
-            Pooling::Cls => context.encode(&mut batch).ok()?,
-            Pooling::Last => context.decode(&mut batch).ok()?,
+            Pooling::Cls => context.encode(&mut batch).map_err(encode_failure)?,
+            Pooling::Last => context.decode(&mut batch).map_err(decode_failure)?,
         }
 
         let mut vectors = Vec::with_capacity(group.len());
         for seq_id in 0..group.len() {
+            let seq_id = i32::try_from(seq_id).map_err(|_| EncodeFailure::Item)?;
+            // Every variant of this error names a context that was configured wrong, which
+            // is true for every item in the batch equally.
             let raw = context
-                .embeddings_seq_ith(i32::try_from(seq_id).ok()?)
-                .ok()?;
-            vectors.push(self.serve_lane(raw)?);
+                .embeddings_seq_ith(seq_id)
+                .map_err(|err| EncodeFailure::systemic("Embeddings", err.to_string()))?;
+            vectors.push(self.serve_lane(raw).ok_or(EncodeFailure::Item)?);
         }
-        Some(vectors)
+        Ok(vectors)
     }
 
     /// Normalizes, slices to the served MRL lane, and renormalizes.
@@ -349,7 +371,7 @@ impl EmbedEngine for LlamaEngine {
         };
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
         for group in group_by_token_budget(&inputs, group_budget) {
-            vectors.extend(isolate(&group, dims, &|items| self.encode_group(items)));
+            vectors.extend(isolate(&group, dims, &|items| self.encode_group(items))?);
         }
 
         if vectors.len() != texts.len() {
@@ -399,34 +421,79 @@ where
     groups
 }
 
+/// Why an encode attempt failed, and therefore whether bisecting it means anything.
+///
+/// The distinction is the difference between a degraded batch and a silent lie: bisecting
+/// a backend-wide failure reaches one item at a time, fails at every level, and returns a
+/// full set of zero vectors as a successful embedding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodeFailure {
+    /// A single input in the group can explain the failure, so [`isolate`] bisects.
+    Item,
+    /// The backend itself failed — allocation, a fatal encode, a misconfigured context.
+    /// Every item would fail identically, so the request errors instead.
+    Systemic(EngineError),
+}
+
+impl EncodeFailure {
+    /// Builds a systemic failure carrying the error the request will fail with.
+    pub fn systemic(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Systemic(EngineError::new(kind, message))
+    }
+}
+
+/// Classifies a `llama_decode` result per `llama.h`'s documented return codes.
+///
+/// `1` (no KV slot) explicitly suggests reducing the batch size, and `-1` is an invalid
+/// input batch — both are exactly what bisection isolates. Everything else is `2` (aborted)
+/// or `< -1` (fatal error), where llama.h notes the context's memory state is left dirty.
+fn decode_failure(err: DecodeError) -> EncodeFailure {
+    match err {
+        DecodeError::NoKvCacheSlot | DecodeError::NTokensZero => EncodeFailure::Item,
+        other => EncodeFailure::systemic("Decode", other.to_string()),
+    }
+}
+
+/// Classifies a `llama_encode` result; `llama.h` documents only `0` and `< 0` here.
+fn encode_failure(err: EncodeError) -> EncodeFailure {
+    match err {
+        EncodeError::NoKvCacheSlot | EncodeError::NTokensZero => EncodeFailure::Item,
+        other => EncodeFailure::systemic("Encode", other.to_string()),
+    }
+}
+
 /// Binary-search failure isolation over an encode operation.
 ///
-/// Encodes the whole slice; on failure splits in half and recurses, so a single poison
-/// item costs about `log2(n)` extra encodes rather than `n`. When recursion reaches one
-/// item that still fails, that item receives a zero vector of `dims` and the batch
-/// succeeds — `vectors.len()` always equals `items.len()`, and the caller never sees an
-/// error. Generic over `encode` so the algorithm is testable without a model.
-pub fn isolate<T, F>(items: &[T], dims: usize, encode: &F) -> Vec<Vec<f32>>
+/// Encodes the whole slice; on an item-shaped failure splits in half and recurses, so a
+/// single poison item costs about `log2(n)` extra encodes rather than `n`. When recursion
+/// reaches one item that still fails, that item receives a zero vector of `dims` and the
+/// batch succeeds — `vectors.len()` always equals `items.len()`.
+///
+/// A [`EncodeFailure::Systemic`] propagates immediately from whatever depth raised it: the
+/// backend, not the input, is broken, and answering with zero vectors would report a
+/// working embedding for a request that produced none. Generic over `encode` so the
+/// algorithm is testable without a model.
+pub fn isolate<T, F>(items: &[T], dims: usize, encode: &F) -> Result<Vec<Vec<f32>>, EngineError>
 where
-    F: Fn(&[T]) -> Option<Vec<Vec<f32>>>,
+    F: Fn(&[T]) -> Result<Vec<Vec<f32>>, EncodeFailure>,
     T: Clone,
 {
     if items.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    if let Some(vectors) = encode(items) {
-        if vectors.len() == items.len() {
-            return vectors;
-        }
+    match encode(items) {
+        Ok(vectors) if vectors.len() == items.len() => return Ok(vectors),
+        Ok(_) | Err(EncodeFailure::Item) => {}
+        Err(EncodeFailure::Systemic(err)) => return Err(err),
     }
     if items.len() == 1 {
         eprintln!("julie-semantic-sidecar: substituting a zero vector for an unencodable input");
-        return vec![vec![0.0; dims]];
+        return Ok(vec![vec![0.0; dims]]);
     }
     let mid = items.len() / 2;
-    let mut vectors = isolate(&items[..mid], dims, encode);
-    vectors.extend(isolate(&items[mid..], dims, encode));
-    vectors
+    let mut vectors = isolate(&items[..mid], dims, encode)?;
+    vectors.extend(isolate(&items[mid..], dims, encode)?);
+    Ok(vectors)
 }
 
 /// Scales `vector` to unit length in place, returning `None` if it has no direction.
@@ -450,6 +517,67 @@ fn measure_special_token_overhead(model: &LlamaModel) -> Result<usize, EngineErr
         .str_to_token(OVERHEAD_PROBE, AddBos::Never)
         .map_err(|err| EngineError::new("Tokenize", err.to_string()))?;
     Ok(with_special.len().saturating_sub(without_special.len()))
+}
+
+/// Model load parameters that actually apply the resolved backend placement.
+///
+/// `LlamaModelParams::default()` leaves `n_gpu_layers` at llama.cpp's `-1` — offload every
+/// layer — so on a machine with an accelerator a `cpu` resolution would load onto the GPU
+/// anyway while `health` reported `cpu`. Pinning zero offloaded layers makes the reported
+/// device the applied one, which is what `JULIE_SIDECAR_FORCE_BACKEND=cpu` and the
+/// CPU-generated conformance goldens both depend on.
+fn model_params(selection: &Selection) -> LlamaModelParams {
+    let params = LlamaModelParams::default();
+    if selection.resolved == backend_select::CPU {
+        params.with_n_gpu_layers(0)
+    } else {
+        params
+    }
+}
+
+/// Verifies the cached model file against the pin's digest before it is loaded.
+///
+/// A mismatch is reported as `ModelNotPrepared` — the cached bytes are not the pinned
+/// model, so the honest state is "not prepared" rather than a hard start failure. The
+/// message names both digests so the operator can tell corruption from a swapped file.
+fn verify_cached_digest(path: &Path, expected: &str) -> Result<(), EngineError> {
+    let actual = file_digest(path).map_err(|err| {
+        EngineError::new(
+            "ModelNotPrepared",
+            format!("cannot read {} to verify its digest: {err}", path.display()),
+        )
+    })?;
+    if actual.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+    Err(EngineError::new(
+        "ModelNotPrepared",
+        format!(
+            "{} does not match its pinned digest: expected sha256 {expected}, found {actual}; \
+             delete it and re-run `prepare`",
+            path.display()
+        ),
+    ))
+}
+
+/// Streams `path` through sha256, returning the lowercase hex digest.
+fn file_digest(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; DIGEST_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let mut hex = String::with_capacity(Sha256::output_size() * 2);
+    for byte in hasher.finalize() {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
 }
 
 /// Cache directory the model file is read from, matching `prepare`'s resolution rule.
@@ -481,11 +609,13 @@ mod tests {
         assert!(l2_normalize(&mut v).is_none());
     }
 
+    fn encoded(items: &[usize]) -> Result<Vec<Vec<f32>>, EncodeFailure> {
+        Ok(items.iter().map(|i| unit(*i as f32 + 1.0, 4)).collect())
+    }
+
     #[test]
     fn isolate_returns_encoder_output_when_the_batch_succeeds() {
-        let encode =
-            |items: &[usize]| Some(items.iter().map(|i| unit(*i as f32 + 1.0, 4)).collect());
-        let vectors = isolate(&[0usize, 1, 2], 4, &encode);
+        let vectors = isolate(&[0usize, 1, 2], 4, &encoded).expect("no failure");
         assert_eq!(vectors.len(), 3);
         assert!(vectors.iter().all(|v| v.len() == 4));
     }
@@ -495,12 +625,12 @@ mod tests {
         let poison = 2usize;
         let encode = |items: &[usize]| {
             if items.contains(&poison) {
-                None
+                Err(EncodeFailure::Item)
             } else {
-                Some(items.iter().map(|i| unit(*i as f32 + 1.0, 4)).collect())
+                encoded(items)
             }
         };
-        let vectors = isolate(&[0usize, 1, 2, 3, 4], 4, &encode);
+        let vectors = isolate(&[0usize, 1, 2, 3, 4], 4, &encode).expect("item failures isolate");
         assert_eq!(vectors.len(), 5);
         assert_eq!(vectors[poison], vec![0.0; 4]);
         for (i, v) in vectors.iter().enumerate() {
@@ -512,27 +642,112 @@ mod tests {
 
     #[test]
     fn isolate_handles_every_item_failing() {
-        let encode = |_: &[usize]| None;
-        let vectors = isolate(&[0usize, 1, 2], 4, &encode);
+        let encode = |_: &[usize]| Err(EncodeFailure::Item);
+        let vectors = isolate(&[0usize, 1, 2], 4, &encode).expect("item failures isolate");
         assert_eq!(vectors, vec![vec![0.0; 4]; 3]);
+    }
+
+    #[test]
+    fn isolate_propagates_a_systemic_failure_instead_of_zero_vectoring_the_batch() {
+        let encode = |_: &[usize]| Err(EncodeFailure::systemic("ContextAlloc", "out of memory"));
+        let err = isolate(&[0usize, 1, 2, 3], 4, &encode).expect_err("systemic failures error");
+        assert_eq!(err, EngineError::new("ContextAlloc", "out of memory"));
+    }
+
+    #[test]
+    fn isolate_propagates_a_systemic_failure_raised_deep_in_the_bisection() {
+        let encode = |items: &[usize]| {
+            if items.len() == 1 {
+                Err(EncodeFailure::systemic("Decode", "fatal error"))
+            } else {
+                Err(EncodeFailure::Item)
+            }
+        };
+        let err = isolate(&[0usize, 1, 2, 3], 4, &encode).expect_err("systemic failures error");
+        assert_eq!(err.kind, "Decode");
     }
 
     #[test]
     fn isolate_rejects_a_count_mismatch_from_the_encoder() {
         let encode = |items: &[usize]| {
             if items.len() == 1 {
-                Some(vec![unit(1.0, 4)])
+                Ok(vec![unit(1.0, 4)])
             } else {
-                Some(Vec::new())
+                Ok(Vec::new())
             }
         };
-        assert_eq!(isolate(&[0usize, 1], 4, &encode).len(), 2);
+        assert_eq!(isolate(&[0usize, 1], 4, &encode).expect("bisects").len(), 2);
     }
 
     #[test]
     fn isolate_of_an_empty_batch_is_empty() {
-        let encode = |_: &[usize]| None;
-        assert!(isolate::<usize, _>(&[], 4, &encode).is_empty());
+        let encode = |_: &[usize]| Err(EncodeFailure::Item);
+        assert!(isolate::<usize, _>(&[], 4, &encode)
+            .expect("empty is not a failure")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_no_kv_slot_decode_is_an_item_failure_and_a_fatal_one_is_systemic() {
+        assert_eq!(
+            decode_failure(DecodeError::NoKvCacheSlot),
+            EncodeFailure::Item
+        );
+        assert_eq!(
+            decode_failure(DecodeError::NTokensZero),
+            EncodeFailure::Item
+        );
+        assert!(matches!(
+            decode_failure(DecodeError::Unknown(-2)),
+            EncodeFailure::Systemic(_)
+        ));
+        assert!(matches!(
+            encode_failure(EncodeError::Unknown(-2)),
+            EncodeFailure::Systemic(_)
+        ));
+    }
+
+    #[test]
+    fn a_cpu_resolution_pins_zero_offloaded_layers() {
+        assert_eq!(model_params(&Selection::cpu()).n_gpu_layers(), 0);
+    }
+
+    #[test]
+    fn a_file_whose_bytes_do_not_match_the_pin_is_not_prepared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.gguf");
+        std::fs::write(&path, b"not the pinned weights").expect("seed");
+        let expected = "0".repeat(64);
+
+        let err = verify_cached_digest(&path, &expected).expect_err("a mismatch is rejected");
+        assert_eq!(err.kind, "ModelNotPrepared");
+        assert!(err.message.contains(&expected), "{}", err.message);
+        assert!(
+            err.message.contains(&file_digest(&path).expect("digest")),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_file_matching_the_pin_verifies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.gguf");
+        std::fs::write(&path, b"the pinned weights").expect("seed");
+        let digest = file_digest(&path).expect("digest");
+        assert!(verify_cached_digest(&path, &digest).is_ok());
+        assert!(verify_cached_digest(&path, &digest.to_uppercase()).is_ok());
+    }
+
+    #[test]
+    fn the_digest_of_a_known_input_is_the_standard_sha256() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("abc");
+        std::fs::write(&path, b"abc").expect("seed");
+        assert_eq!(
+            file_digest(&path).expect("digest"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

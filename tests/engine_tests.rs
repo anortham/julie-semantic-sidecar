@@ -6,7 +6,7 @@
 //! required — `LlamaBackend::init` is a process-global initialisation and two engines
 //! loading concurrently race on it.
 
-use julie_semantic_sidecar::engine::{isolate, LlamaEngine, LLAMA_CPP_BUILD};
+use julie_semantic_sidecar::engine::{isolate, EncodeFailure, LlamaEngine, LLAMA_CPP_BUILD};
 use julie_semantic_sidecar::engine_trait::{EmbedEngine, Role};
 use julie_semantic_sidecar::manifest;
 use julie_semantic_sidecar::sanitize::sanitize;
@@ -65,18 +65,41 @@ fn fit_keeps_the_instruction_prefix_and_cuts_the_tail() {
 fn isolation_substitutes_a_zero_vector_only_for_the_failing_item() {
     let encode = |items: &[usize]| {
         if items.contains(&3) {
-            None
+            Err(EncodeFailure::Item)
         } else {
-            Some(items.iter().map(|_| vec![0.5f32; 4]).collect())
+            Ok(items.iter().map(|_| vec![0.5f32; 4]).collect())
         }
     };
-    let vectors = isolate(&[0usize, 1, 2, 3, 4, 5], 4, &encode);
+    let vectors = isolate(&[0usize, 1, 2, 3, 4, 5], 4, &encode).expect("an item failure isolates");
     assert_eq!(vectors.len(), 6);
     assert_eq!(vectors[3], vec![0.0; 4]);
     assert!(vectors
         .iter()
         .enumerate()
         .all(|(i, v)| i == 3 || v[0] == 0.5));
+}
+
+#[test]
+fn a_systemic_encoder_failure_errors_the_request_instead_of_returning_zero_vectors() {
+    let encode = |_: &[usize]| Err(EncodeFailure::systemic("ContextAlloc", "null reference"));
+    let err = isolate(&[0usize, 1, 2, 3], 4, &encode).expect_err("a broken backend must not pass");
+    assert_eq!(err.kind, "ContextAlloc");
+}
+
+#[test]
+fn a_systemic_failure_surfacing_only_at_the_leaf_still_errors_the_request() {
+    let encode = |items: &[usize]| {
+        if items.len() == 1 {
+            Err(EncodeFailure::systemic(
+                "Decode",
+                "Decode Error -2: unknown",
+            ))
+        } else {
+            Err(EncodeFailure::Item)
+        }
+    };
+    let err = isolate(&[0usize, 1, 2, 3], 4, &encode).expect_err("a broken backend must not pass");
+    assert_eq!(err.kind, "Decode");
 }
 
 #[test]
