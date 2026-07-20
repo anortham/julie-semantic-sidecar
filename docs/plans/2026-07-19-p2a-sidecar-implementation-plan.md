@@ -74,10 +74,10 @@
 **What to build:** Minimal compiling workspace with the verb skeleton, lib/bin split, pre-declared deps, and repo hygiene files. AGENTS.md: concise working notes — the pinned Miller contract/fixture paths and commit, the frozen-contract rule (defects are Miller-repo amendments, not local edits), verification commands, the no-publish rule, the two-layer sanitization rule. LICENSE: MIT, copyright Alan Northam. `.gitignore`: `/target`, `.razorback/`, local model caches.
 
 **Acceptance criteria:**
-- [ ] `cargo build` + `cargo test` + clippy + fmt green on the stub
-- [ ] `--version` prints the semver; unknown verb exits 2; `serve` blocks on stdin and exits on EOF; `prepare` verb dispatches to `prepare::run` stub
-- [ ] `src/lib.rs` exposes all stub modules; an integration test can `use julie_semantic_sidecar::protocol` (compile check)
-- [ ] AGENTS.md carries the contract pointers (with pinned Miller commit) and command reference
+- [x] `cargo build` + `cargo test` + clippy + fmt green on the stub
+- [x] `--version` prints the semver; unknown verb exits 2; `serve` blocks on stdin and exits on EOF; `prepare` verb dispatches to `prepare::run` stub
+- [x] `src/lib.rs` exposes all stub modules; an integration test can `use julie_semantic_sidecar::protocol` (compile check)
+- [x] AGENTS.md carries the contract pointers (with pinned Miller commit) and command reference
 
 ## Task 2: Protocol core (pure, engine behind a trait)
 
@@ -95,9 +95,9 @@
 **What to build:** The protocol module + a `FakeEngine` test double. Tests: one per Group A row that is testable without a real engine (A1–A17, A19–A21, A23 — batch isolation A18 lands with the engine in Task 5), plus the both-keys precedence cases (valid+valid → request_id wins; invalid request_id + valid id → `invalid_request`).
 
 **Acceptance criteria:**
-- [ ] Every § Errors emission condition and every fake-testable Group A row has a named test; error vocabulary is exactly the four codes
-- [ ] `request_id`-precedence tests pass against the reference's behavior
-- [ ] Protocol tests run with no llama dependency and no network
+- [x] Every § Errors emission condition and every fake-testable Group A row has a named test; error vocabulary is exactly the four codes
+- [x] `request_id`-precedence tests pass against the reference's behavior
+- [x] Protocol tests run with no llama dependency and no network
 
 ## Task 3: Manifest + health assembly
 
@@ -112,9 +112,9 @@
 **Serialization:** No — Batch A.
 
 **Acceptance criteria:**
-- [ ] Manifest values byte-match Global Constraints (tests against literal strings, both models)
-- [ ] Health assembly tested for: ready model, missing model (`ready:false` + exact `model_not_prepared`, no `dims` required), degraded backend (A9 mirror invariants enforced)
-- [ ] All four torch-compat capability keys always present as objects with boolean `available`
+- [x] Manifest values byte-match Global Constraints (tests against literal strings, both models)
+- [x] Health assembly tested for: ready model, missing model (`ready:false` + exact `model_not_prepared`, no `dims` required), degraded backend (A9 mirror invariants enforced)
+- [x] All four torch-compat capability keys always present as objects with boolean `available`
 
 ## Task 4: `prepare` subcommand
 
@@ -135,9 +135,9 @@
 **What to build:** The full download path, tested against a local `tiny_http` fixture server (no live network in tests): success, sha256 mismatch, disk-preflight failure (fake a huge manifest size), concurrent-lock (two threads, one server), unknown id, cache-dir env override, stale-partial cleanup.
 
 **Acceptance criteria:**
-- [ ] All seven fixture-server scenarios tested; sha256 mismatch provably deletes the temp and exits 1
-- [ ] Event stream shape matches the frozen interface above (tests parse stdout lines as JSON)
-- [ ] No live-network access in any test
+- [x] All seven fixture-server scenarios tested; sha256 mismatch provably deletes the temp and exits 1
+- [x] Event stream shape matches the frozen interface above (tests parse stdout lines as JSON)
+- [x] No live-network access in any test
 
 ## Task 5: Engine — llama-cpp-2 integration
 
@@ -156,10 +156,10 @@
 **What to build:** The real engine, CPU-only in tests. `truncate.rs`/`sanitize.rs` are pure (token ops injected via a closure/trait so tests run without a model). Engine integration tests (`#[ignore]`-gated unless the model file is present in cache) load each model from the cache and assert: dims/norm/count invariants, a 2-text embed round trip, the bge truncation cut matching the goldens' 510-content-token point, and zero-vector isolation via a forced-failure seam.
 
 **Acceptance criteria:**
-- [ ] `truncate.rs` reproduces the amended contract algorithm (tests: below-budget no-op, exact-budget, over-budget cut at `max_text_tokens − eos_reserve − special_token_overhead` for both models' constants, stability-loop shrink case)
-- [ ] `sanitize.rs` matches the engine-layer rules only (non-string handling is Task 2's wire rejection, not sanitization)
-- [ ] Model-gated integration tests green locally with cached models; vendored llama.cpp build recorded in the report
-- [ ] `cargo build` remains green with the CPU-default feature set (no Metal/Vulkan features)
+- [x] `truncate.rs` reproduces the amended contract algorithm (tests: below-budget no-op, exact-budget, over-budget cut at `max_text_tokens − eos_reserve − special_token_overhead` for both models' constants, stability-loop shrink case)
+- [x] `sanitize.rs` matches the engine-layer rules only (non-string handling is Task 2's wire rejection, not sanitization)
+- [x] Model-gated integration tests green locally with cached models; vendored llama.cpp build recorded in the report
+- [x] `cargo build` remains green with the CPU-default feature set (no Metal/Vulkan features)
 
 ## Task 6: Backend selection, stdout purity, unready state
 
@@ -175,10 +175,10 @@
 **Serialization:** Yes.
 
 **Acceptance criteria:**
-- [ ] Stdout purity proven by a whole-session test (spawn → load → embed → shutdown, zero non-protocol stdout bytes)
-- [ ] Unready serve path tested end-to-end without any model file (empty temp cache dir)
-- [ ] Selection cache round-trips; invalidation tested for each key component including driver identity; a cached "cpu" choice skips the probe
-- [ ] Backend plugin loading uses an executable-relative path (unit-test the path resolution; packaged proof lands in Task 8)
+- [x] Stdout purity proven by a whole-session test (spawn → load → embed → shutdown, zero non-protocol stdout bytes)
+- [x] Unready serve path tested end-to-end without any model file (empty temp cache dir)
+- [x] Selection cache round-trips; invalidation tested for each key component including driver identity; a cached "cpu" choice skips the probe
+- [x] Backend plugin loading uses an executable-relative path (unit-test the path resolution; packaged proof lands in Task 8)
 
 ## Task 7: Conformance harness — Groups A, B, and C
 
@@ -195,10 +195,10 @@
 **Serialization:** Yes.
 
 **Acceptance criteria:**
-- [ ] Every A/B/C row from the contract appears as a named assertion; B4/B5 budgets enforced as hard failures
-- [ ] Harness green on local macOS arm64 CPU for BOTH models against Miller fixtures at the pinned commit (branch-gate entry)
-- [ ] A deliberately perturbed vector and a deliberately shifted truncation point each fail Group C (negative tests)
-- [ ] A tolerance failure produces the vendored-build diagnostic (recorded `llama_cpp_build` vs goldens' `b10068`) before any escalation
+- [x] Every A/B/C row from the contract appears as a named assertion; B4/B5 budgets enforced as hard failures
+- [x] Harness green on local macOS arm64 CPU for BOTH models against Miller fixtures at the pinned commit (branch-gate entry)
+- [x] A deliberately perturbed vector and a deliberately shifted truncation point each fail Group C (negative tests)
+- [x] A tolerance failure produces the vendored-build diagnostic (recorded `llama_cpp_build` vs goldens' `b10068`) before any escalation
 
 ## Task 8: CI + packaging draft
 
@@ -214,7 +214,8 @@
 **Serialization:** Yes.
 
 **Acceptance criteria:**
-- [ ] ci.yml validates (actionlint) and encodes the matrix, the model-cache stage (prepare-driven, sha256-keyed), the pinned Miller fixture checkout, and the Linux packaged Vulkan-load assertion
-- [ ] Conformance jobs run the FULL Task 7 harness (A+B+C, both models) on every platform leg
-- [ ] release.yml has no armed publish; archives + sha256 + packaged smoke only
-- [ ] `package.sh`'s frozen file list matches what Task 6's loader expects (one source of truth, cross-referenced)
+- [ ] ci.yml Linux packaged Vulkan-load assertion — DEFERRED with the accelerated-builds follow-up (current leg ships a vulkaninfo diagnostic only; codex pre-merge F7): the CPU-only build has no Vulkan module to assert. Accelerated Metal/Vulkan builds, backend-DL packaging, and this assertion are one follow-up unit. The same follow-up owns B6's title path (codex pre-merge round 2): on a CPU-only build the B6 test can only exercise the unavailable-backend fallback, not "benchmark selects CPU over an available GPU" — the test's pass message says so explicitly until an accelerated build exists.
+- [x] ci.yml validates (actionlint) and encodes the matrix, the model-cache stage (prepare-driven, sha256-keyed), and the pinned Miller fixture checkout
+- [x] Conformance jobs run the FULL Task 7 harness (A+B+C, both models) on every platform leg
+- [x] release.yml has no armed publish; archives + sha256 + packaged smoke only
+- [x] `package.sh`'s frozen file list matches what Task 6's loader expects (one source of truth, cross-referenced)

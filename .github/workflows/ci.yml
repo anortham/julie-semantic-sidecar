@@ -1,0 +1,183 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Frozen fixture pin: anortham/miller, the commit the protocol contract and the
+  # conformance goldens were taken from. Bumping it is a contract decision, not a CI edit.
+  MILLER_PIN: 8edfa14ffb4f0f696d6c4c4aaa572d5967495961
+
+jobs:
+  fast:
+    name: fast (fmt + clippy + unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add clippy rustfmt
+          rustc --version
+          cargo --version
+
+      # llama-cpp-sys-2 builds vendored llama.cpp with CMake; without it the crate cannot build.
+      - name: Verify cmake is present
+        run: cmake --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Non-ignored tests only: no model weights, no network, no spawned sidecar.
+      - name: cargo test
+        run: cargo test
+
+  conformance:
+    name: conformance (${{ matrix.name }})
+    needs: fast
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # CI covers only what the reference machine (macOS arm64) cannot prove locally.
+      # PR pushes run the 1x-billed Linux leg; pushes to main add Windows; the
+      # 10x-billed macOS legs run on workflow_dispatch only — they burned ~1,100
+      # macOS minutes in one day of PR iteration (2026-07-20) re-proving the platform
+      # every local branch gate already covers.
+      matrix:
+        include: >-
+          ${{ github.event_name == 'pull_request'
+              && fromJSON('[{"name":"linux-x64","os":"ubuntu-latest"}]')
+              || github.event_name == 'push'
+              && fromJSON('[{"name":"linux-x64","os":"ubuntu-latest"},{"name":"windows-x64","os":"windows-2025"}]')
+              || fromJSON('[{"name":"macos-arm64","os":"macos-15"},{"name":"macos-x64","os":"macos-15-intel"},{"name":"linux-x64","os":"ubuntu-latest"},{"name":"windows-x64","os":"windows-2025"}]') }}
+    env:
+      JULIE_EMBEDDING_CACHE_DIR: ${{ github.workspace }}/model-cache
+      JULIE_SIDECAR_FORCE_BACKEND: cpu
+      FIXTURES_DIR: ${{ github.workspace }}/miller-fixtures/eval/sidecar-conformance
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout sidecar
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned Miller fixtures
+        uses: actions/checkout@v4
+        with:
+          repository: anortham/miller
+          ref: ${{ env.MILLER_PIN }}
+          path: miller-fixtures
+          sparse-checkout: eval/sidecar-conformance
+          sparse-checkout-cone-mode: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Verify cmake is present
+        run: cmake --version
+
+      - name: Install Vulkan ICD (lavapipe) and tools
+        if: matrix.name == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+
+      # Diagnostic only while the build is CPU-only. When the accelerated (backend-DL)
+      # builds land, this becomes the hard assertion that the packaged Vulkan backend
+      # module actually loads and registers from the executable-relative plugin dir.
+      - name: Vulkan diagnostic
+        if: matrix.name == 'linux-x64'
+        run: vulkaninfo --summary || true
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Key = both manifest sha256 values (src/manifest.rs, qwen3 then bge). A pin bump
+      # changes the key, so the next run re-prepares instead of serving a stale weight file.
+      - name: Restore model cache
+        id: models
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/model-cache
+          key: models-${{ runner.os }}-${{ runner.arch }}-421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340-bf40c42ad7d89382e9ba7376d5c4b73f6b556cb541fab37aaa1da9c320149b65
+
+      # Cache miss doubles as the prepare end-to-end test: real downloads, real
+      # sha256-before-visibility, real cache layout.
+      - name: Prepare pinned models
+        if: steps.models.outputs.cache-hit != 'true'
+        # HuggingFace intermittently answers 503; retry with backoff before failing the leg.
+        run: |
+          mkdir -p "$JULIE_EMBEDDING_CACHE_DIR"
+          retry() {
+            for attempt in 1 2 3; do
+              if cargo run --release -- prepare "$@"; then return 0; fi
+              if [ "$attempt" = 3 ]; then echo "prepare failed after 3 attempts" >&2; return 1; fi
+              sleep $((attempt * 30))
+            done
+          }
+          retry
+          retry --model bge-small-en-v1.5-f32
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # The full Task 7 gate: Group A (wire), Group B (lifecycle + hard budgets),
+      # Group C (both models, every fixture text) plus every other ignored test.
+      # The ignored targets run as separate bounded steps so a hang names the target
+      # that hung instead of taking the whole leg down opaquely (2026-07-20: the
+      # combined step passed conformance 9/9, then stalled 30 min in a later target
+      # and the runner was reclaimed).
+      - name: Conformance gate (groups A, B, C)
+        # B5's 30 s contract budget is the hard bar on end-user hardware and in the
+        # local branch gate (reference machine: 7.8 s). Shared 2-3 core CI runners
+        # miss it on raw throughput (84-507 s observed 2026-07-20), so CI raises the
+        # ceiling; correctness rows are unaffected.
+        timeout-minutes: 45
+        env:
+          CONFORMANCE_B5_BUDGET_MS: "600000"
+        run: cargo test --release --test conformance -- --ignored --test-threads=1 --nocapture
+
+      # Each test gets its own process: a qwen3 engine reserves a 3.5 GB KV cache on
+      # top of the 1.2 GB model, and sharing one process across tests killed the
+      # runner outright twice (2026-07-20). Slow, not hanging — the budget-length
+      # embed alone takes 22 min on a 2-core runner, seconds on the reference machine.
+      - name: Model-backed engine tests
+        timeout-minutes: 90
+        run: |
+          names=$(cargo test --release --test engine_tests -- --ignored --list \
+                  | sed -n 's/: test$//p')
+          # The long-input qwen3 embeds (24k-32k tokens) take ~15-22 min EACH on a
+          # 2-core runner and seconds in the local branch gate on the reference
+          # machine, which runs them on every branch. CI runs them only on
+          # workflow_dispatch; the conformance gate above still covers the frozen
+          # contract's long-truncation rows end-to-end through the real binary.
+          if [[ "${{ github.event_name }}" != "workflow_dispatch" ]]; then
+            names=$(printf '%s\n' $names | grep -Ev \
+              '^qwen3_(worst_case_prose_saturates_the_whole_token_budget|truncates_prose_whose_pieces_exceed_the_initial_buffer_guess|embeds_a_long_sub_budget_input_without_error)$')
+          fi
+          for name in $names; do
+            echo "::group::$name"
+            cargo test --release --test engine_tests -- --ignored --exact "$name" --nocapture
+            echo "::endgroup::"
+          done
+
+      - name: Model-backed serve tests
+        timeout-minutes: 30
+        run: cargo test --release --test serve_tests -- --ignored --test-threads=1 --nocapture
