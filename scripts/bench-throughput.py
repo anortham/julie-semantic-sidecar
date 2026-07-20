@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Steady-state embedding throughput benchmark for julie-semantic-sidecar.
+
+Speaks the frozen `julie.embedding.sidecar` v1 protocol (newline-delimited JSON on
+stdin/stdout) against a sidecar binary spawned as a child process. It probes `health`
+first and refuses to measure a binary that is not `ready:true` — a `model_not_prepared`
+sidecar FAILS the bench rather than reporting zeros. It then times `embed_batch` rounds
+after a discarded warm-up round and reports steady-state units/s with a PASS/FAIL verdict
+against a floor.
+
+This makes the RC->v0.1.0 promotion gate's throughput floor checkable in one command:
+
+    scripts/bench-throughput.py --binary target/release/julie-semantic-sidecar
+
+See docs/rc-promotion-gate.md for the floor and its rationale, and the protocol contract
+mirrored in Miller at docs/contracts/semantic-sidecar-protocol-v1.md.
+
+Input texts are generated deterministically from their indices — no randomness, no
+timestamps — so two runs embed byte-identical payloads.
+"""
+import argparse
+import json
+import subprocess
+import sys
+import tempfile
+import time
+
+SCHEMA = "julie.embedding.sidecar"
+VERSION = 1
+PROTOCOL_MAX_BATCH = 250
+DEFAULT_BATCH = 64
+DEFAULT_ROUNDS = 4
+DEFAULT_FLOOR = 40.0
+HEALTH_TIMEOUT_S = 120.0
+
+
+class BenchError(Exception):
+    pass
+
+
+def deterministic_text(round_index, item_index):
+    return (
+        f"method Miller.Indexing.Semantic.ProbeType{round_index}.DoWork{item_index} "
+        f"public VectorConvergeOutcome DoWork{item_index}(WorkspaceContext workspace, int revision) "
+        f"Converges the {item_index}th probe cursor and records the outcome for round {round_index}."
+    )
+
+
+def rpc(request_id, method, params):
+    return json.dumps(
+        {
+            "schema": SCHEMA,
+            "version": VERSION,
+            "request_id": request_id,
+            "method": method,
+            "params": params,
+        },
+        separators=(",", ":"),
+    ) + "\n"
+
+
+class Sidecar:
+    def __init__(self, binary, stderr_file):
+        self._proc = subprocess.Popen(
+            [binary, "serve"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            text=True,
+            bufsize=1,
+        )
+
+    def call(self, request_id, method, params):
+        proc = self._proc
+        if proc.stdin is None or proc.stdout is None:
+            raise BenchError("sidecar stdio pipes are not open")
+        start = time.monotonic()
+        proc.stdin.write(rpc(request_id, method, params))
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        elapsed = time.monotonic() - start
+        if line == "":
+            raise BenchError(
+                "sidecar closed stdout before answering "
+                f"'{method}' (exit code {proc.poll()})"
+            )
+        try:
+            reply = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise BenchError(f"sidecar emitted non-JSON on stdout: {line!r} ({exc})")
+        if reply.get("error"):
+            err = reply["error"]
+            raise BenchError(
+                f"sidecar error for '{method}': "
+                f"[{err.get('code')}] {err.get('message')}"
+            )
+        return elapsed, reply.get("result", {})
+
+    def close(self):
+        proc = self._proc
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+
+
+def run_bench(binary, batch, rounds, floor):
+    with tempfile.NamedTemporaryFile(
+        mode="w+", suffix=".sidecar-bench-stderr.log", delete=False
+    ) as stderr_file:
+        stderr_path = stderr_file.name
+        sidecar = Sidecar(binary, stderr_file)
+        try:
+            _, health = sidecar.call("bench-health", "health", {})
+            if not health.get("ready", False):
+                reason = health.get("degraded_reason") or "unknown"
+                raise BenchError(
+                    "sidecar health is not ready "
+                    f"(degraded_reason={reason}); a not-prepared sidecar cannot be "
+                    "benched — run `prepare` first. stderr: " + stderr_path
+                )
+
+            warmup_texts = [deterministic_text(0, i) for i in range(batch)]
+            sidecar.call("bench-warmup", "embed_batch", {"texts": warmup_texts})
+
+            rates = []
+            for r in range(1, rounds + 1):
+                texts = [deterministic_text(r, i) for i in range(batch)]
+                elapsed, result = sidecar.call(
+                    f"bench-round-{r}", "embed_batch", {"texts": texts}
+                )
+                n = len(result.get("vectors", []))
+                if n != batch:
+                    raise BenchError(
+                        f"round {r}: expected {batch} vectors, got {n}"
+                    )
+                if elapsed <= 0:
+                    raise BenchError(f"round {r}: non-positive elapsed time")
+                rates.append(n / elapsed)
+        finally:
+            sidecar.close()
+
+    steady = sum(rates) / len(rates)
+    return {
+        "binary": binary,
+        "batch": batch,
+        "rounds": rounds,
+        "warmup_rounds": 1,
+        "floor_units_per_s": floor,
+        "steady_state_units_per_s": steady,
+        "per_round_units_per_s": rates,
+        "pass": steady >= floor,
+        "health": {
+            "ready": health.get("ready"),
+            "dims": health.get("dims"),
+            "model_id": health.get("model_id"),
+            "resolved_backend": health.get("resolved_backend"),
+            "device": health.get("device"),
+            "accelerated": health.get("accelerated"),
+            "sidecar_version": health.get("sidecar_version"),
+        },
+    }
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Steady-state embedding throughput benchmark for julie-semantic-sidecar."
+    )
+    parser.add_argument("--binary", required=True, help="path to the sidecar binary")
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=DEFAULT_BATCH,
+        help=f"texts per embed_batch (default {DEFAULT_BATCH}, protocol max {PROTOCOL_MAX_BATCH})",
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=DEFAULT_ROUNDS,
+        help=f"measured rounds after one warm-up round (default {DEFAULT_ROUNDS})",
+    )
+    parser.add_argument(
+        "--floor",
+        type=float,
+        default=DEFAULT_FLOOR,
+        help=f"PASS/FAIL floor in units/s (default {DEFAULT_FLOOR})",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="emit the result as a single JSON object"
+    )
+    args = parser.parse_args(argv)
+    if args.batch < 1:
+        parser.error("--batch must be >= 1")
+    if args.batch > PROTOCOL_MAX_BATCH:
+        parser.error(
+            f"--batch {args.batch} exceeds the protocol maximum of {PROTOCOL_MAX_BATCH}"
+        )
+    if args.rounds < 1:
+        parser.error("--rounds must be >= 1")
+    if args.floor < 0:
+        parser.error("--floor must be >= 0")
+    return args
+
+
+def main(argv):
+    args = parse_args(argv)
+    try:
+        report = run_bench(args.binary, args.batch, args.rounds, args.floor)
+    except BenchError as exc:
+        if args.json:
+            print(json.dumps({"error": str(exc), "pass": False}))
+        else:
+            print(f"bench: FAIL — {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(report))
+    else:
+        h = report["health"]
+        print(
+            f"health: ready backend={h['resolved_backend']} device={h['device']} "
+            f"accelerated={h['accelerated']} dims={h['dims']} model={h['model_id']}"
+        )
+        for i, rate in enumerate(report["per_round_units_per_s"], start=1):
+            print(f"round {i}: {rate:.1f} units/s")
+        verdict = "PASS" if report["pass"] else "FAIL"
+        print(
+            f"steady-state: {report['steady_state_units_per_s']:.1f} units/s "
+            f"(batch={report['batch']}, {report['rounds']} rounds, warm model) "
+            f"vs floor {report['floor_units_per_s']:.1f} -> {verdict}"
+        )
+    return 0 if report["pass"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
