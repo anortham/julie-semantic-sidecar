@@ -34,6 +34,32 @@ const GOLDEN_LLAMA_CPP_BUILD: &str = "b10068";
 const INIT_BUDGET_MS: u128 = 120_000;
 const REQUEST_BUDGET_MS: u128 = 30_000;
 
+#[cfg(unix)]
+fn force_kill(pid: u32) {
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+}
+
+#[cfg(windows)]
+fn force_kill(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output();
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .expect("tasklist");
+    String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+}
+
 /// The contract's 30 s request budget is the hard bar on end-user hardware and
 /// for the local branch gate (measured 7.8 s on the reference machine). Shared
 /// 2–3-core CI runners miss it on raw throughput alone (70–500 s observed), so
@@ -344,7 +370,7 @@ fn arm_watchdog(pid: u32) -> Arc<AtomicBool> {
             std::thread::sleep(Duration::from_millis(200));
         }
         if !flag.load(Ordering::SeqCst) {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            force_kill(pid);
         }
     });
     done
@@ -680,7 +706,7 @@ fn group_b2_sigkill_leaves_no_orphan_or_lock_residue() {
     sidecar.watchdog_done.store(true, Ordering::SeqCst);
     assert!(!status.success(), "B2 a killed process does not exit clean");
 
-    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    let alive = pid_alive(pid);
     assert!(!alive, "B2 pid {pid} survived SIGKILL as an orphan");
 
     let after = cache_entries(&cache);
