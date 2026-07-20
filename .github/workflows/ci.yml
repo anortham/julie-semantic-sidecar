@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -120,10 +120,18 @@ jobs:
       # sha256-before-visibility, real cache layout.
       - name: Prepare pinned models
         if: steps.models.outputs.cache-hit != 'true'
+        # HuggingFace intermittently answers 503; retry with backoff before failing the leg.
         run: |
           mkdir -p "$JULIE_EMBEDDING_CACHE_DIR"
-          cargo run --release -- prepare
-          cargo run --release -- prepare --model bge-small-en-v1.5-f32
+          retry() {
+            for attempt in 1 2 3; do
+              if cargo run --release -- prepare "$@"; then return 0; fi
+              if [ "$attempt" = 3 ]; then echo "prepare failed after 3 attempts" >&2; return 1; fi
+              sleep $((attempt * 30))
+            done
+          }
+          retry
+          retry --model bge-small-en-v1.5-f32
 
       - name: Build release binary
         run: cargo build --release
