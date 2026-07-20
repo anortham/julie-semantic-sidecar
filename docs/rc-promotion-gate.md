@@ -12,9 +12,11 @@ promotion.
    `semantic-sidecar-protocol-v1.md` § Conformance). No changes to its pass rule.
 2. **Unit tests, both feature sets** — `cargo test` and `cargo test --features metal` both green.
    No changes to what they assert.
-3. **Packaged smoke** — the release archive built by `scripts/package.sh` unpacks and its
-   bundled binary answers `--version` and a `health` probe with `ready: true`. No changes to its
-   checks.
+3. **Packaged smoke** — the release archive built by `scripts/package.sh --smoke` unpacks, its
+   bundled binary answers `--version`, and an offline `health` probe against an empty cache dir
+   reports `ready: false` / `degraded_reason: "model_not_prepared"` (the archive ships no model,
+   so the smoke proves the fail-loud path — a `ready: false` here is the expected pass). No
+   changes to its checks.
 4. **Throughput floor (this document)** — the packaged binary sustains
    **≥ 40 units/s steady-state on the M2 Ultra reference machine (64-text batches, warm model)**,
    measured by `scripts/bench-throughput.py`.
