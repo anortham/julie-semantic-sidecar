@@ -63,7 +63,13 @@ fn serve_reads_stdin_and_exits_cleanly_on_eof() {
     drop(stdin);
     let out = child.wait_with_output().expect("wait");
     assert!(out.status.success());
-    assert!(out.stdout.is_empty(), "serve stub must not write to stdout");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "one protocol line per request: {stdout}");
+    let envelope: serde_json::Value = serde_json::from_str(lines[0]).expect("protocol json");
+    assert_eq!(envelope["schema"], "julie.embedding.sidecar");
+    assert_eq!(envelope["version"], 1);
+    assert_eq!(envelope["result"]["ready"], false);
 }
 
 #[test]
