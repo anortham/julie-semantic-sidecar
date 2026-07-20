@@ -6,9 +6,10 @@
 //! survives. See `docs/contracts/semantic-sidecar-protocol-v1.md` in the Miller repository.
 
 use crate::engine_trait::{EmbedEngine, EngineError, Role};
+use crate::health::Limits;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, ErrorKind, Write};
 
 /// Schema identifier carried by every request and response envelope.
 pub const SCHEMA: &str = "julie.embedding.sidecar";
@@ -63,20 +64,47 @@ pub fn serve(model_id: &str) -> std::io::Result<()> {
 
 /// Reads NDJSON requests from `input` until EOF or `shutdown`, writing responses to `output`.
 ///
+/// Enforces the limits `health` advertises: a request line longer than
+/// [`Limits::max_request_bytes`] and an `embed_batch` carrying more than
+/// [`Limits::max_batch_items`] texts are both answered `invalid_request` without being
+/// buffered or embedded.
+///
 /// Returns `Err` only on a writer I/O failure; malformed input is answered, never propagated.
 pub fn run_loop<R: BufRead, W: Write, E: EmbedEngine>(
+    input: R,
+    output: W,
+    engine: &E,
+) -> std::io::Result<()> {
+    run_loop_with_limits(input, output, engine, Limits::default())
+}
+
+/// [`run_loop`] with caller-supplied limits, so tests can exercise the caps without
+/// materialising a 32 MiB line.
+pub fn run_loop_with_limits<R: BufRead, W: Write, E: EmbedEngine>(
     mut input: R,
     mut output: W,
     engine: &E,
+    limits: Limits,
 ) -> std::io::Result<()> {
     let mut buffer: Vec<u8> = Vec::new();
     loop {
-        buffer.clear();
-        if input.read_until(b'\n', &mut buffer)? == 0 {
-            return Ok(());
-        }
-        let Some(outcome) = handle_line(&buffer, engine) else {
-            continue;
+        let outcome = match read_line_capped(&mut input, &mut buffer, limits.max_request_bytes)? {
+            LineRead::Eof => return Ok(()),
+            LineRead::Oversized => Outcome {
+                response: failure(
+                    "",
+                    INVALID_REQUEST,
+                    format!(
+                        "request line exceeds max_request_bytes ({})",
+                        limits.max_request_bytes
+                    ),
+                ),
+                stop: false,
+            },
+            LineRead::Line => match handle_line(&buffer, engine, limits) {
+                Some(outcome) => outcome,
+                None => continue,
+            },
         };
         let line = serde_json::to_string(&outcome.response).map_err(std::io::Error::other)?;
         output.write_all(line.as_bytes())?;
@@ -84,6 +112,62 @@ pub fn run_loop<R: BufRead, W: Write, E: EmbedEngine>(
         output.flush()?;
         if outcome.stop {
             return Ok(());
+        }
+    }
+}
+
+enum LineRead {
+    /// `buffer` holds one line's bytes, terminator excluded.
+    Line,
+    /// The line exceeded the cap; it was discarded without being buffered.
+    Oversized,
+    Eof,
+}
+
+/// Reads one newline-terminated line into `buffer`, never buffering more than `max_bytes`.
+///
+/// A line over the cap is drained to its terminator (or EOF) in place rather than collected,
+/// so a caller cannot grow the process's memory by withholding a newline.
+fn read_line_capped<R: BufRead>(
+    input: &mut R,
+    buffer: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<LineRead> {
+    buffer.clear();
+    let mut oversized = false;
+    loop {
+        let available = match input.fill_buf() {
+            Ok(available) => available,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if available.is_empty() {
+            return Ok(if oversized {
+                LineRead::Oversized
+            } else if buffer.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line
+            });
+        }
+        let newline = available.iter().position(|&byte| byte == b'\n');
+        let content = newline.unwrap_or(available.len());
+        if !oversized {
+            if buffer.len() + content > max_bytes {
+                oversized = true;
+                buffer.clear();
+                buffer.shrink_to_fit();
+            } else {
+                buffer.extend_from_slice(&available[..content]);
+            }
+        }
+        input.consume(content + usize::from(newline.is_some()));
+        if newline.is_some() {
+            return Ok(if oversized {
+                LineRead::Oversized
+            } else {
+                LineRead::Line
+            });
         }
     }
 }
@@ -146,7 +230,7 @@ fn failure(
     }
 }
 
-fn handle_line<E: EmbedEngine>(raw: &[u8], engine: &E) -> Option<Outcome> {
+fn handle_line<E: EmbedEngine>(raw: &[u8], engine: &E, limits: Limits) -> Option<Outcome> {
     let Ok(text) = std::str::from_utf8(raw) else {
         return Outcome::reply(failure(
             "",
@@ -167,10 +251,10 @@ fn handle_line<E: EmbedEngine>(raw: &[u8], engine: &E) -> Option<Outcome> {
     let Value::Object(request) = request else {
         return Outcome::reply(failure("", INVALID_REQUEST, "request must be an object"));
     };
-    Some(dispatch(&request, engine))
+    Some(dispatch(&request, engine, limits))
 }
 
-fn dispatch<E: EmbedEngine>(request: &Map<String, Value>, engine: &E) -> Outcome {
+fn dispatch<E: EmbedEngine>(request: &Map<String, Value>, engine: &E, limits: Limits) -> Outcome {
     let request_id = match extract_request_id(request) {
         Ok(id) => id,
         Err(message) => {
@@ -220,7 +304,7 @@ fn dispatch<E: EmbedEngine>(request: &Map<String, Value>, engine: &E) -> Outcome
             stop: false,
         },
         "embed_batch" => Outcome {
-            response: embed_batch(request_id, params, engine),
+            response: embed_batch(request_id, params, engine, limits),
             stop: false,
         },
         "shutdown" => Outcome {
@@ -284,6 +368,7 @@ fn embed_batch<E: EmbedEngine>(
     request_id: String,
     params: &Map<String, Value>,
     engine: &E,
+    limits: Limits,
 ) -> Response {
     let Some(Value::Array(raw_texts)) = params.get("texts") else {
         return failure(
@@ -292,6 +377,17 @@ fn embed_batch<E: EmbedEngine>(
             "embed_batch params.texts must be an array",
         );
     };
+    if raw_texts.len() > limits.max_batch_items {
+        return failure(
+            request_id,
+            INVALID_REQUEST,
+            format!(
+                "embed_batch params.texts exceeds max_batch_items ({}): got {}",
+                limits.max_batch_items,
+                raw_texts.len()
+            ),
+        );
+    }
     let mut texts: Vec<String> = Vec::with_capacity(raw_texts.len());
     for value in raw_texts {
         match value {

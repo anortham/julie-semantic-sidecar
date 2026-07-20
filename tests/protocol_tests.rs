@@ -1,6 +1,8 @@
 use julie_semantic_sidecar::engine_trait::{EmbedEngine, EmbedOutput, EngineError, Role};
+use julie_semantic_sidecar::health::{Limits, MAX_BATCH_ITEMS, MAX_REQUEST_BYTES};
 use julie_semantic_sidecar::protocol;
 use serde_json::{json, Value};
+use std::cell::Cell;
 
 const DIMS: usize = 4;
 
@@ -9,6 +11,7 @@ struct FakeEngine {
     fail_with: Option<EngineError>,
     vectors_override: Option<Vec<Vec<f32>>>,
     dims_override: Option<usize>,
+    embed_calls: Cell<usize>,
 }
 
 impl FakeEngine {
@@ -41,6 +44,7 @@ impl FakeEngine {
             fail_with: None,
             vectors_override: None,
             dims_override: None,
+            embed_calls: Cell::new(0),
         }
     }
 
@@ -82,6 +86,7 @@ impl EmbedEngine for FakeEngine {
     }
 
     fn embed(&self, texts: &[String], role: Role) -> Result<EmbedOutput, EngineError> {
+        self.embed_calls.set(self.embed_calls.get() + 1);
         if let Some(error) = &self.fail_with {
             return Err(error.clone());
         }
@@ -554,6 +559,124 @@ fn responses_are_compact_single_line_json() {
     assert_eq!(text.matches('\n').count(), 1);
     assert!(!text.contains(": "), "compact separators");
     assert!(text.starts_with("{\"schema\":\"julie.embedding.sidecar\",\"version\":1,"));
+}
+
+fn responses_with_limits<E: EmbedEngine>(engine: &E, input: &[u8], limits: Limits) -> Vec<Value> {
+    let mut output: Vec<u8> = Vec::new();
+    protocol::run_loop_with_limits(input, &mut output, engine, limits).expect("run_loop io");
+    String::from_utf8(output)
+        .expect("utf-8 output")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("response line is json"))
+        .collect()
+}
+
+fn small_line_limits(max_request_bytes: usize) -> Limits {
+    Limits {
+        max_request_bytes,
+        ..Limits::default()
+    }
+}
+
+/// An `embed_query` request line padded to exactly `total_bytes`, terminator excluded.
+fn request_line_of(total_bytes: usize) -> String {
+    let build = |text: String| {
+        json!({"request_id": "pad", "method": "embed_query", "params": {"text": text}}).to_string()
+    };
+    let padding = total_bytes - build(String::new()).len();
+    let line = build("x".repeat(padding));
+    assert_eq!(line.len(), total_bytes);
+    line
+}
+
+#[test]
+fn a_line_of_exactly_max_request_bytes_is_accepted() {
+    let limits = small_line_limits(256);
+    let input = format!("{}\n", request_line_of(256));
+    let all = responses_with_limits(&FakeEngine::ready(), input.as_bytes(), limits);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0]["request_id"], "pad");
+    assert_eq!(all[0]["result"]["dims"], DIMS);
+}
+
+#[test]
+fn a_line_over_max_request_bytes_is_invalid_request_and_the_loop_continues() {
+    let limits = small_line_limits(256);
+    let input = format!(
+        "{}\n{}\n",
+        request_line_of(257),
+        json!({"request_id": "after", "method": "health"})
+    );
+    let all = responses_with_limits(&FakeEngine::ready(), input.as_bytes(), limits);
+    assert_eq!(all.len(), 2);
+    assert_eq!(error_code(&all[0]), "invalid_request");
+    assert_eq!(all[0]["request_id"], "");
+    assert!(
+        all[0]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("max_request_bytes"),
+        "message names the limit"
+    );
+    assert_eq!(all[1]["request_id"], "after");
+    assert_eq!(all[1]["result"]["ready"], true);
+}
+
+#[test]
+fn an_unterminated_oversized_stream_ends_without_buffering_it() {
+    let limits = small_line_limits(1024);
+    let input = vec![b'x'; 4 * 1024 * 1024];
+    let all = responses_with_limits(&FakeEngine::ready(), input.as_slice(), limits);
+    assert_eq!(all.len(), 1);
+    assert_eq!(error_code(&all[0]), "invalid_request");
+}
+
+#[test]
+fn a_batch_of_exactly_max_batch_items_is_accepted() {
+    let engine = FakeEngine::ready();
+    let texts: Vec<String> = (0..MAX_BATCH_ITEMS)
+        .map(|index| index.to_string())
+        .collect();
+    let response = one(
+        &engine,
+        json!({"method": "embed_batch", "params": {"texts": texts}}),
+    );
+    assert_eq!(
+        response["result"]["vectors"]
+            .as_array()
+            .expect("vectors")
+            .len(),
+        MAX_BATCH_ITEMS
+    );
+    assert_eq!(engine.embed_calls.get(), 1);
+}
+
+#[test]
+fn a_batch_over_max_batch_items_is_invalid_request_without_invoking_the_engine() {
+    let engine = FakeEngine::ready();
+    let texts: Vec<String> = (0..=MAX_BATCH_ITEMS)
+        .map(|index| index.to_string())
+        .collect();
+    let response = one(
+        &engine,
+        json!({"method": "embed_batch", "params": {"texts": texts}}),
+    );
+    assert_eq!(error_code(&response), "invalid_request");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("max_batch_items"),
+        "message names the limit"
+    );
+    assert_eq!(engine.embed_calls.get(), 0);
+}
+
+#[test]
+fn default_limits_are_the_ones_health_advertises() {
+    let limits = Limits::default();
+    assert_eq!(limits.max_batch_items, MAX_BATCH_ITEMS);
+    assert_eq!(limits.max_request_bytes, MAX_REQUEST_BYTES);
 }
 
 #[test]
