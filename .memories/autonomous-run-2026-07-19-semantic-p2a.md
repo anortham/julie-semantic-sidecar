@@ -3,7 +3,7 @@
 **Status:** Complete (PR open; merge pending first-ever CI run)
 **Plan:** docs/plans/2026-07-19-p2a-sidecar-implementation-plan.md
 **Branch:** p2a-implementation
-**PR:** pending — filled in after PR creation
+**PR:** https://github.com/anortham/julie-semantic-sidecar/pull/1
 **Phases:** 3/7 program phases complete (P0, P1, P2a of P0–P6)
 **Tasks:** 8/8 plan tasks + 1 gate-found fix + 7/7 pre-merge review findings fixed
 
