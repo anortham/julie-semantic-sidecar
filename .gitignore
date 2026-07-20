@@ -2,3 +2,5 @@
 .miller/
 .razorback/
 .julieignore
+/models
+*.gguf

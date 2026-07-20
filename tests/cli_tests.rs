@@ -1,0 +1,77 @@
+#[allow(unused_imports)]
+use julie_semantic_sidecar::{
+    engine_trait, health, manifest, prepare, protocol, sanitize, truncate,
+};
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+const BIN: &str = env!("CARGO_BIN_EXE_julie-semantic-sidecar");
+
+#[test]
+fn protocol_constants_come_from_the_library_target() {
+    assert_eq!(protocol::SCHEMA, "julie.embedding.sidecar");
+    assert_eq!(protocol::VERSION, 1);
+}
+
+#[test]
+fn declared_cache_lock_api_is_available_for_prepare() {
+    use fs4::FileExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = std::fs::File::create(dir.path().join("cache.lock")).expect("create");
+    // std::fs::File gained inherent lock/unlock in Rust 1.89, which shadows fs4's
+    // same-named trait methods; call fs4 fully qualified so the crate is actually used.
+    FileExt::lock(&file).expect("lock");
+    FileExt::unlock(&file).expect("unlock");
+}
+
+#[test]
+fn version_flag_prints_name_and_semver() {
+    let out = Command::new(BIN).arg("--version").output().expect("spawn");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let printed = stdout.trim();
+    let semver = printed
+        .strip_prefix("julie-semantic-sidecar ")
+        .unwrap_or_else(|| panic!("unexpected version line: {printed}"));
+    assert_eq!(semver, env!("CARGO_PKG_VERSION"));
+    assert_eq!(semver.split('.').count(), 3);
+}
+
+#[test]
+fn unknown_verb_exits_two_with_usage_on_stderr() {
+    let out = Command::new(BIN).arg("embed").output().expect("spawn");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).expect("utf8");
+    assert!(stderr.contains("unknown verb: embed"), "{stderr}");
+    assert!(stderr.contains("usage:"), "{stderr}");
+}
+
+#[test]
+fn serve_reads_stdin_and_exits_cleanly_on_eof() {
+    let mut child = Command::new(BIN)
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin
+        .write_all(b"{\"method\":\"health\"}\n")
+        .expect("write");
+    drop(stdin);
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty(), "serve stub must not write to stdout");
+}
+
+#[test]
+fn prepare_dispatches_to_the_stub_and_fails_loudly() {
+    let out = Command::new(BIN).arg("prepare").output().expect("spawn");
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8(out.stderr).expect("utf8");
+    assert!(stderr.contains("not implemented"), "{stderr}");
+    assert!(stderr.contains("qwen3-0.6b-f16"), "{stderr}");
+}
