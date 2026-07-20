@@ -176,7 +176,7 @@ mod tests {
     #[cfg(windows)]
     fn raw_fd(file: &std::fs::File) -> i32 {
         unsafe {
-            libc::_open_osfhandle(
+            libc::open_osfhandle(
                 std::os::windows::io::AsRawHandle::as_raw_handle(file) as isize,
                 0,
             )
