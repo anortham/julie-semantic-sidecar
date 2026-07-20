@@ -214,7 +214,8 @@
 **Serialization:** Yes.
 
 **Acceptance criteria:**
-- [x] ci.yml validates (actionlint) and encodes the matrix, the model-cache stage (prepare-driven, sha256-keyed), the pinned Miller fixture checkout, and the Linux packaged Vulkan-load assertion
+- [ ] ci.yml Linux packaged Vulkan-load assertion — DEFERRED with the accelerated-builds follow-up (current leg ships a vulkaninfo diagnostic only; codex pre-merge F7): the CPU-only build has no Vulkan module to assert. Accelerated Metal/Vulkan builds, backend-DL packaging, and this assertion are one follow-up unit.
+- [x] ci.yml validates (actionlint) and encodes the matrix, the model-cache stage (prepare-driven, sha256-keyed), and the pinned Miller fixture checkout
 - [x] Conformance jobs run the FULL Task 7 harness (A+B+C, both models) on every platform leg
 - [x] release.yml has no armed publish; archives + sha256 + packaged smoke only
 - [x] `package.sh`'s frozen file list matches what Task 6's loader expects (one source of truth, cross-referenced)
