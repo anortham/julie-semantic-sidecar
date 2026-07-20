@@ -23,16 +23,42 @@ const INTERNAL_ERROR: &str = "internal_error";
 
 /// Serves the NDJSON protocol on stdin/stdout for `model_id` until EOF or `shutdown`.
 ///
-/// Until Task 5 lands the llama.cpp engine this serves an
-/// [`UnreadyEngine`](crate::engine_trait::UnreadyEngine): the protocol is fully conformant,
-/// `health` reports `ready: false`, and embed calls return `internal_error`.
+/// The model is loaded eagerly: a Qwen3 load costs about a second, and paying that inside
+/// the first `embed` would blow that request's budget.
+///
+/// A model absent from the cache is **not** a startup failure. The contract's row B3 wants
+/// a wire-conformant `health` reporting `ready: false` and the exact reason
+/// `model_not_prepared`, which [`UnreadyEngine`](crate::engine_trait::UnreadyEngine)
+/// renders; `embed` calls answer `internal_error` and the process stays alive. Any other
+/// load failure — a present but unloadable model — fails loud: `serve` returns the error,
+/// `main` prints it to stderr, and the process exits nonzero.
 pub fn serve(model_id: &str) -> std::io::Result<()> {
-    let engine = crate::engine_trait::UnreadyEngine::new(format!(
-        "engine_not_loaded: no embedding backend is compiled in for model '{model_id}'"
-    ));
+    let pin = crate::manifest::by_id(model_id).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "unknown model id '{model_id}'; run `prepare --model`"
+        ))
+    })?;
+    let cache_dir = crate::prepare::cache_dir().map_err(|err| {
+        std::io::Error::other(format!("cannot resolve the model cache: {}", err.message()))
+    })?;
+    if let Err(err) = crate::prepare::clean_stale_partials(&cache_dir) {
+        eprintln!("julie-semantic-sidecar: could not clean stale partial downloads: {err}");
+    }
+
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    run_loop(stdin.lock(), stdout.lock(), &engine)
+    match crate::engine::LlamaEngine::load(pin, &cache_dir) {
+        Ok(engine) => run_loop(stdin.lock(), stdout.lock(), &engine),
+        Err(err) if err.kind == "ModelNotPrepared" => {
+            eprintln!("julie-semantic-sidecar: {err}");
+            let engine = crate::engine_trait::UnreadyEngine::new(crate::health::MODEL_NOT_PREPARED);
+            run_loop(stdin.lock(), stdout.lock(), &engine)
+        }
+        Err(err) => Err(std::io::Error::other(format!(
+            "cannot load model '{model_id}' from {}: {err}",
+            cache_dir.display()
+        ))),
+    }
 }
 
 /// Reads NDJSON requests from `input` until EOF or `shutdown`, writing responses to `output`.

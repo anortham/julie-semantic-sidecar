@@ -19,6 +19,7 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
 use serde_json::Value;
 
+use crate::backend_select::{self, Selection};
 use crate::engine_trait::{EmbedEngine, EmbedOutput, EngineError, Role};
 use crate::health::{self, BackendCapabilities, EngineFacts, Limits, ModelState};
 use crate::manifest::{ModelPin, Pooling};
@@ -60,6 +61,7 @@ pub struct LlamaEngine {
     model: LlamaModel,
     eos_reserve: usize,
     special_token_overhead: usize,
+    selection: Selection,
 }
 
 impl LlamaEngine {
@@ -68,6 +70,11 @@ impl LlamaEngine {
     /// The model file is checked for existence only — never re-hashed. `prepare` owns
     /// digest verification, and re-hashing a multi-gigabyte GGUF on every start would cost
     /// seconds to minutes.
+    ///
+    /// Backend initialisation, weight load, and the tokenizer probe all run inside a
+    /// [`stdio_guard`](crate::stdio_guard) so llama.cpp's native chatter can never reach fd
+    /// 1 — the contract's § Stdout purity obligation. The guard covers the backend
+    /// selection benchmark for the same reason.
     pub fn load(pin: &'static ModelPin, cache_dir: &Path) -> Result<Self, EngineError> {
         let path = cache_dir.join(pin.file);
         if !path.is_file() {
@@ -77,26 +84,30 @@ impl LlamaEngine {
             ));
         }
 
-        let backend =
-            LlamaBackend::init().map_err(|err| EngineError::new("BackendInit", err.to_string()))?;
-        let model = LlamaModel::load_from_file(&backend, &path, &LlamaModelParams::default())
-            .map_err(|err| EngineError::new("ModelLoad", err.to_string()))?;
+        crate::stdio_guard::guarded(|| {
+            let selection = backend_select::select(cache_dir, VERSION, pin.sha256);
+            let backend = LlamaBackend::init()
+                .map_err(|err| EngineError::new("BackendInit", err.to_string()))?;
+            let model = LlamaModel::load_from_file(&backend, &path, &LlamaModelParams::default())
+                .map_err(|err| EngineError::new("ModelLoad", err.to_string()))?;
 
-        let eos_reserve = match pin.eos_marker {
-            Some(marker) => model
-                .str_to_token(marker, AddBos::Never)
-                .map_err(|err| EngineError::new("Tokenize", err.to_string()))?
-                .len(),
-            None => 0,
-        };
-        let special_token_overhead = measure_special_token_overhead(&model)?;
+            let eos_reserve = match pin.eos_marker {
+                Some(marker) => model
+                    .str_to_token(marker, AddBos::Never)
+                    .map_err(|err| EngineError::new("Tokenize", err.to_string()))?
+                    .len(),
+                None => 0,
+            };
+            let special_token_overhead = measure_special_token_overhead(&model)?;
 
-        Ok(Self {
-            pin,
-            backend,
-            model,
-            eos_reserve,
-            special_token_overhead,
+            Ok(Self {
+                pin,
+                backend,
+                model,
+                eos_reserve,
+                special_token_overhead,
+                selection,
+            })
         })
     }
 
@@ -255,14 +266,24 @@ impl LlamaEngine {
         Some(vector)
     }
 
+    /// The backend decision this engine loaded under.
+    pub fn selection(&self) -> &Selection {
+        &self.selection
+    }
+
+    /// Reports the real backend outcome, not a fixed one.
+    ///
+    /// `capabilities` advertises only CPU because this build compiles no accelerated
+    /// backend; the requested/resolved pair and the degradation reason come from the
+    /// cached [`Selection`], so a forced or benchmarked degradation is visible on the wire.
     fn engine_facts(&self) -> EngineFacts {
         EngineFacts {
             runtime: RUNTIME.to_string(),
-            device: "cpu".to_string(),
-            requested_backend: "cpu".to_string(),
-            resolved_backend: "cpu".to_string(),
-            accelerated: false,
-            degraded_reason: None,
+            device: self.selection.resolved.clone(),
+            requested_backend: self.selection.requested.clone(),
+            resolved_backend: self.selection.resolved.clone(),
+            accelerated: self.selection.accelerated,
+            degraded_reason: self.selection.degraded_reason.clone(),
             capabilities: BackendCapabilities {
                 cpu: true,
                 ..BackendCapabilities::default()

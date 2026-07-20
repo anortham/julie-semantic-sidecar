@@ -49,8 +49,12 @@ fn unknown_verb_exits_two_with_usage_on_stderr() {
 
 #[test]
 fn serve_reads_stdin_and_exits_cleanly_on_eof() {
+    // An empty cache dir keeps this about the stdin/EOF lifecycle: no multi-gigabyte load,
+    // and the not-prepared health payload is the same one line either way.
+    let cache = tempfile::tempdir().expect("tempdir");
     let mut child = Command::new(BIN)
         .arg("serve")
+        .env("JULIE_EMBEDDING_CACHE_DIR", cache.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -4,6 +4,7 @@
 //! The library target exists so integration tests exercise the same code paths the
 //! binary runs; `src/main.rs` is only a verb dispatcher.
 
+pub mod backend_select;
 pub mod engine;
 pub mod engine_trait;
 pub mod health;
@@ -11,6 +12,7 @@ pub mod manifest;
 pub mod prepare;
 pub mod protocol;
 pub mod sanitize;
+pub mod stdio_guard;
 pub mod truncate;
 
 /// Manifest id of the model served when no `--model` argument is given.

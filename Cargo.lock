@@ -359,6 +359,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "fs4",
+ "libc",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "serde",
