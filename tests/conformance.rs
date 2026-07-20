@@ -809,10 +809,15 @@ fn group_b5_a_two_hundred_fifty_text_batch_answers_inside_the_request_budget() {
         elapsed.as_millis()
     );
     sidecar.shutdown();
+    let bar = if budget == REQUEST_BUDGET_MS {
+        format!("< {REQUEST_BUDGET_MS} ms contract budget")
+    } else {
+        format!("< {budget} ms CI ceiling — NOT the {REQUEST_BUDGET_MS} ms contract bar, which only the local gate enforces")
+    };
     pass(
         "B5",
         &format!(
-            "{positions}-text batch answered in {} ms (< {REQUEST_BUDGET_MS} ms)",
+            "{positions}-text batch answered in {} ms ({bar})",
             elapsed.as_millis()
         ),
     );
@@ -859,7 +864,7 @@ fn group_b6_a_forced_unavailable_backend_stays_ready_and_degraded() {
     assert!(trailing.trim().is_empty(), "B6 clean exit");
     pass(
         "B6",
-        &format!("forced {requested} resolved {resolved}: ready:true, accelerated:false, reason non-null, exit 0"),
+        &format!("forced {requested} resolved {resolved}: ready:true, accelerated:false, reason non-null, exit 0 (unavailable-backend fallback on a CPU-only build; benchmark-selects-CPU-over-live-GPU is deferred to the accelerated-builds follow-up)"),
     );
 }
 

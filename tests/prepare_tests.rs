@@ -97,10 +97,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn request_for(fixture: &Fixture, body: &[u8]) -> PrepareRequest {
+    request_for_url(&fixture.url, body)
+}
+
+fn request_for_url(url: &str, body: &[u8]) -> PrepareRequest {
     PrepareRequest {
         model_id: "test-model".to_string(),
         file_name: "test-model.gguf".to_string(),
-        source_url: fixture.url.clone(),
+        source_url: url.to_string(),
         sha256: sha256_hex(body),
         size_bytes: body.len() as u64,
     }
@@ -392,7 +396,10 @@ fn clean_stale_partials_removes_partials_and_keeps_the_model_file() {
     assert!(!stale_one.exists());
     assert!(!stale_two.exists());
     assert!(keep.exists());
-    assert!(!lock.exists(), "a free lock file leaves no residue");
+    assert!(
+        lock.exists(),
+        "free lock files are permanent: unlinking one races an open-before-lock prepare into a second download"
+    );
     assert!(partials(cache.path()).is_empty());
 }
 
@@ -445,7 +452,10 @@ fn a_held_lock_protects_only_its_own_model_and_unattributable_partials() {
         legacy.exists(),
         "an unattributable partial must survive while any download is live"
     );
-    assert!(!idle_lock.exists(), "a free lock file leaves no residue");
+    assert!(
+        idle_lock.exists(),
+        "free lock files are permanent: unlinking one races an open-before-lock prepare into a second download"
+    );
 }
 
 #[test]
@@ -467,7 +477,65 @@ fn an_interrupted_download_leaves_a_partial_that_later_cleanup_removes() {
     let removed = prepare::clean_stale_partials(cache.path()).expect("cleanup");
 
     assert_eq!(removed, vec![orphan.clone()], "{removed:?}");
-    assert!(!cache.path().join("named-model.lock").exists());
+    assert!(cache.path().join("named-model.lock").exists());
+}
+
+struct TimeoutEnvGuard;
+
+impl TimeoutEnvGuard {
+    fn set(secs: &str) -> Self {
+        std::env::set_var("JULIE_SIDECAR_DOWNLOAD_TIMEOUT_SECS", secs);
+        TimeoutEnvGuard
+    }
+}
+
+impl Drop for TimeoutEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("JULIE_SIDECAR_DOWNLOAD_TIMEOUT_SECS");
+    }
+}
+
+#[test]
+fn a_stalled_server_fails_the_download_and_releases_the_model_lock() {
+    let body = b"stalled-then-served".to_vec();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let stalled_url = format!("http://{}/model.gguf", listener.local_addr().expect("addr"));
+    // Detached on purpose: accepts one connection and never writes a byte. Joining a
+    // sleeping handler (the Fixture pattern) would hang the test's own teardown.
+    thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            thread::sleep(Duration::from_secs(30));
+            drop(stream);
+        }
+    });
+    let cache = tempfile::tempdir().expect("tempdir");
+    let mut request = request_for_url(&stalled_url, &body);
+    request.model_id = "stall-model".to_string();
+    request.file_name = "stall-model.gguf".to_string();
+    let _env = env_guard();
+    let _guard = TimeoutEnvGuard::set("5");
+    let mut out = Vec::new();
+
+    let started = std::time::Instant::now();
+    let err = prepare::acquire(&request, cache.path(), &mut out).expect_err("stall must not hang");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the deadline must fire long before the 30 s stall"
+    );
+    assert!(
+        err.message()
+            .contains("JULIE_SIDECAR_DOWNLOAD_TIMEOUT_SECS"),
+        "the error must name the slow-link escape hatch: {}",
+        err.message()
+    );
+
+    let healthy = Fixture::start(body.clone(), Duration::ZERO);
+    let mut request = request_for(&healthy, &body);
+    request.model_id = "stall-model".to_string();
+    request.file_name = "stall-model.gguf".to_string();
+    let mut out = Vec::new();
+    prepare::acquire(&request, cache.path(), &mut out)
+        .expect("the stalled attempt must release the model lock");
 }
 
 #[test]

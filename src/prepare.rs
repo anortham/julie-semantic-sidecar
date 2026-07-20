@@ -215,11 +215,11 @@ pub fn cache_dir() -> Result<PathBuf, PrepareError> {
 /// are deleted only when no cache lock in the directory is held at all — i.e. when no download
 /// anywhere could own them.
 ///
-/// Lock files that are free are removed too, so a cache that is not mid-download keeps no
-/// residue. Removing one races a concurrent `prepare` that has opened the lock file but not yet
-/// locked it; the loser then locks an unlinked inode and both may download. That costs a
-/// duplicate fetch, never a corrupt cache: every download is digest-verified and lands by atomic
-/// rename.
+/// Lock files are permanent cache residents — one tiny file per pinned model, never deleted.
+/// Unlinking a "free" lock races a concurrent `prepare` that has opened the file but not yet
+/// locked it: the loser locks the unlinked inode, a third process re-creates the path, and two
+/// processes hold "exclusive" locks on different inodes — both download, violating `acquire`'s
+/// downloads-or-waits guarantee. Cleanup therefore probes locks only to attribute partials.
 ///
 /// A missing cache directory is not an error — nothing has been prepared yet.
 pub fn clean_stale_partials(cache_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -274,10 +274,9 @@ pub fn clean_stale_partials(cache_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         }
     }
 
-    for (path, file) in free_locks {
+    for (_path, file) in free_locks {
         let _ = FileExt::unlock(&file);
         drop(file);
-        let _ = std::fs::remove_file(&path);
     }
 
     removed.sort();
@@ -414,15 +413,42 @@ fn preflight_disk(cache_dir: &Path, size_bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Connection-phase deadlines. ureq 3.3 defaults every timeout to `None`, so without
+/// these a server that accepts and then stalls would block forever while `acquire`
+/// holds the per-model lock — hanging every concurrent prepare instead of failing loud.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Whole-call ceiling, sized for the 1.2 GiB qwen3 pin at roughly 500 KiB/s.
+const DOWNLOAD_TOTAL_TIMEOUT_SECS: u64 = 2_700;
+/// Escape hatch for slower links (and the deadline lever for the stall tests).
+const DOWNLOAD_TIMEOUT_ENV: &str = "JULIE_SIDECAR_DOWNLOAD_TIMEOUT_SECS";
+
+fn download_total_timeout() -> Duration {
+    let secs = std::env::var(DOWNLOAD_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DOWNLOAD_TOTAL_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
 fn download_verified(
     request: &PrepareRequest,
     final_path: &Path,
     cache_dir: &Path,
     events: &mut dyn Write,
 ) -> Result<(), String> {
-    let mut response = ureq::get(&request.source_url)
-        .call()
-        .map_err(|err| format!("cannot fetch {}: {err}", request.source_url))?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(DOWNLOAD_CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(DOWNLOAD_RESPONSE_TIMEOUT))
+        .timeout_global(Some(download_total_timeout()))
+        .build()
+        .into();
+    let mut response = agent.get(&request.source_url).call().map_err(|err| {
+        format!(
+            "cannot fetch {}: {err} (raise {DOWNLOAD_TIMEOUT_ENV} for a slow link)",
+            request.source_url
+        )
+    })?;
     let total_bytes = request.size_bytes;
     if let Some(offered) = response.body_mut().content_length() {
         if offered != total_bytes {
@@ -451,9 +477,12 @@ fn download_verified(
     let mut last_progress = Instant::now();
     emit_progress(events, &request.model_id, received, total_bytes);
     loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|err| format!("cannot read {}: {err}", request.source_url))?;
+        let read = reader.read(&mut buffer).map_err(|err| {
+            format!(
+                "cannot read {}: {err} (raise {DOWNLOAD_TIMEOUT_ENV} for a slow link)",
+                request.source_url
+            )
+        })?;
         if read == 0 {
             break;
         }

@@ -214,7 +214,7 @@
 **Serialization:** Yes.
 
 **Acceptance criteria:**
-- [ ] ci.yml Linux packaged Vulkan-load assertion — DEFERRED with the accelerated-builds follow-up (current leg ships a vulkaninfo diagnostic only; codex pre-merge F7): the CPU-only build has no Vulkan module to assert. Accelerated Metal/Vulkan builds, backend-DL packaging, and this assertion are one follow-up unit.
+- [ ] ci.yml Linux packaged Vulkan-load assertion — DEFERRED with the accelerated-builds follow-up (current leg ships a vulkaninfo diagnostic only; codex pre-merge F7): the CPU-only build has no Vulkan module to assert. Accelerated Metal/Vulkan builds, backend-DL packaging, and this assertion are one follow-up unit. The same follow-up owns B6's title path (codex pre-merge round 2): on a CPU-only build the B6 test can only exercise the unavailable-backend fallback, not "benchmark selects CPU over an available GPU" — the test's pass message says so explicitly until an accelerated build exists.
 - [x] ci.yml validates (actionlint) and encodes the matrix, the model-cache stage (prepare-driven, sha256-keyed), and the pinned Miller fixture checkout
 - [x] Conformance jobs run the FULL Task 7 harness (A+B+C, both models) on every platform leg
 - [x] release.yml has no armed publish; archives + sha256 + packaged smoke only

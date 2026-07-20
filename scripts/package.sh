@@ -49,8 +49,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+host_triple="$(rustc -vV | awk '/^host: /{print $2}')"
 if [[ -z "$target" ]]; then
-  target="$(rustc -vV | awk '/^host: /{print $2}')"
+  target="$host_triple"
+fi
+# The target names the staging directory fed to rm -rf and labels the archive, so an
+# arbitrary value is both a path-traversal hazard and an architecture lie.
+if [[ ! "$target" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "package: --target must be a plain target triple, got: $target" >&2
+  exit 2
 fi
 version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
 
@@ -65,14 +72,22 @@ echo "package: target    $target"
 echo "package: archive   $archive_kind"
 
 echo "package: building release binary (CPU-only feature set)"
-cargo build --release
+if [[ "$target" == "$host_triple" ]]; then
+  cargo build --release
+  built_exe="target/release/$exe"
+else
+  # An explicit non-host target must actually build for that target — staging the
+  # host binary under a cross-target label ships the wrong architecture.
+  cargo build --release --target "$target"
+  built_exe="target/$target/release/$exe"
+fi
 
 stage_root="$repo_root/dist"
 stage="$stage_root/$target"
 rm -rf "$stage"
 mkdir -p "$stage"
 
-cp "target/release/$exe" "$stage/$exe"
+cp "$built_exe" "$stage/$exe"
 cp LICENSE "$stage/LICENSE"
 cp README.md "$stage/README.md"
 chmod +x "$stage/$exe"
