@@ -152,12 +152,20 @@ jobs:
           CONFORMANCE_B5_BUDGET_MS: "600000"
         run: cargo test --release --test conformance -- --ignored --test-threads=1 --nocapture
 
-      # qwen3_embeds_a_budget_length_input_without_error embeds a full 32768-token
-      # input through the decode path; it took 22 min on a 2-core linux runner
-      # (seconds on the reference machine). The cap is sized for that, not for a hang.
+      # Each test gets its own process: a qwen3 engine reserves a 3.5 GB KV cache on
+      # top of the 1.2 GB model, and sharing one process across tests killed the
+      # runner outright twice (2026-07-20). Slow, not hanging — the budget-length
+      # embed alone takes 22 min on a 2-core runner, seconds on the reference machine.
       - name: Model-backed engine tests
-        timeout-minutes: 75
-        run: cargo test --release --test engine_tests -- --ignored --test-threads=1 --nocapture
+        timeout-minutes: 90
+        run: |
+          names=$(cargo test --release --test engine_tests -- --ignored --list \
+                  | sed -n 's/: test$//p')
+          for name in $names; do
+            echo "::group::$name"
+            cargo test --release --test engine_tests -- --ignored --exact "$name" --nocapture
+            echo "::endgroup::"
+          done
 
       - name: Model-backed serve tests
         timeout-minutes: 30
