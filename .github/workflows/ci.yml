@@ -53,16 +53,18 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
+      # CI covers only what the reference machine (macOS arm64) cannot prove locally.
+      # PR pushes run the 1x-billed Linux leg; pushes to main add Windows; the
+      # 10x-billed macOS legs run on workflow_dispatch only — they burned ~1,100
+      # macOS minutes in one day of PR iteration (2026-07-20) re-proving the platform
+      # every local branch gate already covers.
       matrix:
-        include:
-          - name: macos-arm64
-            os: macos-15
-          - name: macos-x64
-            os: macos-15-intel
-          - name: linux-x64
-            os: ubuntu-latest
-          - name: windows-x64
-            os: windows-2025
+        include: >-
+          ${{ github.event_name == 'pull_request'
+              && fromJSON('[{"name":"linux-x64","os":"ubuntu-latest"}]')
+              || github.event_name == 'push'
+              && fromJSON('[{"name":"linux-x64","os":"ubuntu-latest"},{"name":"windows-x64","os":"windows-2025"}]')
+              || fromJSON('[{"name":"macos-arm64","os":"macos-15"},{"name":"macos-x64","os":"macos-15-intel"},{"name":"linux-x64","os":"ubuntu-latest"},{"name":"windows-x64","os":"windows-2025"}]') }}
     env:
       JULIE_EMBEDDING_CACHE_DIR: ${{ github.workspace }}/model-cache
       JULIE_SIDECAR_FORCE_BACKEND: cpu
