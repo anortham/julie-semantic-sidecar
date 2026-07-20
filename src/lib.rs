@@ -4,6 +4,7 @@
 //! The library target exists so integration tests exercise the same code paths the
 //! binary runs; `src/main.rs` is only a verb dispatcher.
 
+pub mod engine;
 pub mod engine_trait;
 pub mod health;
 pub mod manifest;
