@@ -184,6 +184,51 @@ fn bge_over_budget_text_embeds_as_its_own_truncation() {
     );
 }
 
+/// Prose whose bge WordPiece tokenization contains 9- and 11-byte pieces.
+///
+/// Verified against the cached vocabulary: tokens 20785, 27059, 7809, 27425 and 14067
+/// need 9 bytes and token 26520 needs 11. Truncation is the only path that detokenizes,
+/// so a piece longer than the initial buffer guess only surfaces on an over-budget input.
+const MULTI_BYTE_PIECE_PROSE: &str = "The full rebuild path never merges into the live \
+artifact. It extracts into a rebuild database, verifies the artifact metadata, and then \
+atomically promotes the rebuilt file over the served one. Readers keep the write-ahead log \
+from checkpointing. ";
+
+#[test]
+#[ignore = "loads real GGUF weights from the shared cache"]
+fn bge_truncates_prose_whose_pieces_exceed_the_initial_buffer_guess() {
+    let engine = load(BGE);
+    // Long enough to force the truncation detokenize path, which is where a piece
+    // larger than the first buffer guess used to fail the whole request.
+    let text = MULTI_BYTE_PIECE_PROSE.repeat(40);
+
+    let out = engine
+        .embed(std::slice::from_ref(&text), Role::Document)
+        .expect("a multi-byte WordPiece must not fail detokenization during truncation");
+
+    assert_eq!(out.vectors[0].len(), 384);
+    assert!((norm(&out.vectors[0]) - 1.0).abs() <= 1e-3);
+    assert_ne!(
+        out.vectors[0],
+        vec![0.0; 384],
+        "must embed for real, not fall back to a zero vector"
+    );
+}
+
+#[test]
+#[ignore = "loads real GGUF weights from the shared cache"]
+fn qwen3_truncates_prose_whose_pieces_exceed_the_initial_buffer_guess() {
+    let engine = load(QWEN3);
+    let text = MULTI_BYTE_PIECE_PROSE.repeat(1200);
+
+    let out = engine
+        .embed(std::slice::from_ref(&text), Role::Query)
+        .expect("a multi-byte piece must not fail detokenization during truncation");
+
+    assert_eq!(out.vectors[0].len(), 512);
+    assert!((norm(&out.vectors[0]) - 1.0).abs() <= 1e-3);
+}
+
 #[test]
 #[ignore = "loads real GGUF weights from the shared cache"]
 fn a_batch_keeps_count_and_stays_alive_across_degenerate_inputs() {

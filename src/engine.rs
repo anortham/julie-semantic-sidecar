@@ -17,6 +17,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::TokenToStringError;
 use serde_json::Value;
 
 use crate::backend_select::{self, Selection};
@@ -139,13 +140,32 @@ impl LlamaEngine {
     fn detokenize(&self, tokens: &[i32]) -> Result<String, String> {
         let mut bytes: Vec<u8> = Vec::with_capacity(tokens.len() * 4);
         for token in tokens {
-            let piece = self
-                .model
-                .token_to_piece_bytes(LlamaToken(*token), 8, true, None)
-                .map_err(|err| err.to_string())?;
-            bytes.extend_from_slice(&piece);
+            bytes.extend_from_slice(&self.token_piece(LlamaToken(*token))?);
         }
         String::from_utf8(bytes).map_err(|err| err.to_string())
+    }
+
+    /// Renders one token's bytes, growing the buffer when the first guess is too small.
+    ///
+    /// `token_to_piece_bytes` does not retry: it reports the space it needed as a negative
+    /// size and leaves the caller to allocate. `str_to_token` in the same crate handles its
+    /// own overflow this way, and this mirrors that idiom — without it, any piece longer
+    /// than the initial guess is a hard error, which bge's WordPiece vocabulary hits with
+    /// its 9- and 11-byte pieces.
+    fn token_piece(&self, token: LlamaToken) -> Result<Vec<u8>, String> {
+        const FIRST_GUESS: usize = 8;
+        match self
+            .model
+            .token_to_piece_bytes(token, FIRST_GUESS, true, None)
+        {
+            Err(TokenToStringError::InsufficientBufferSpace(needed)) => {
+                let needed = usize::try_from(-needed).map_err(|err| err.to_string())?;
+                self.model
+                    .token_to_piece_bytes(token, needed, true, None)
+                    .map_err(|err| err.to_string())
+            }
+            other => other.map_err(|err| err.to_string()),
+        }
     }
 
     /// Applies the contract's per-input pipeline: sanitize, prefix, fit, append EOS.
