@@ -14,7 +14,7 @@ env:
   CARGO_TERM_COLOR: always
   # Frozen fixture pin: anortham/miller, the commit the protocol contract and the
   # conformance goldens were taken from. Bumping it is a contract decision, not a CI edit.
-  MILLER_PIN: 8edfa14
+  MILLER_PIN: 8edfa14ffb4f0f696d6c4c4aaa572d5967495961
 
 jobs:
   fast:
