@@ -163,6 +163,15 @@ jobs:
         run: |
           names=$(cargo test --release --test engine_tests -- --ignored --list \
                   | sed -n 's/: test$//p')
+          # The long-input qwen3 embeds (24k-32k tokens) take ~15-22 min EACH on a
+          # 2-core runner and seconds in the local branch gate on the reference
+          # machine, which runs them on every branch. CI runs them only on
+          # workflow_dispatch; the conformance gate above still covers the frozen
+          # contract's long-truncation rows end-to-end through the real binary.
+          if [[ "${{ github.event_name }}" != "workflow_dispatch" ]]; then
+            names=$(printf '%s\n' $names | grep -Ev \
+              '^qwen3_(worst_case_prose_saturates_the_whole_token_budget|truncates_prose_whose_pieces_exceed_the_initial_buffer_guess|embeds_a_long_sub_budget_input_without_error)$')
+          fi
           for name in $names; do
             echo "::group::$name"
             cargo test --release --test engine_tests -- --ignored --exact "$name" --nocapture
