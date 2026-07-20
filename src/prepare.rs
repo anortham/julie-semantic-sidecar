@@ -41,6 +41,24 @@ pub const PARTIAL_PREFIX: &str = ".julie-prepare-";
 /// Trailing component of a partial-download file name, matched by [`clean_stale_partials`].
 pub const PARTIAL_SUFFIX: &str = ".partial";
 
+/// File-name prefix a live download uses for `model_id`, so [`clean_stale_partials`] can tell
+/// which cache lock owns a partial instead of deleting a file a running `prepare` still holds.
+///
+/// The full name is `<prefix><random>.partial`; the model id is everything between
+/// [`PARTIAL_PREFIX`] and the last `.` before the random component, so ids containing dots
+/// (`qwen3-0.6b-f16`) round-trip.
+pub fn partial_prefix(model_id: &str) -> String {
+    format!("{PARTIAL_PREFIX}{model_id}.")
+}
+
+fn model_of_partial(name: &str) -> Option<&str> {
+    let inner = name
+        .strip_prefix(PARTIAL_PREFIX)?
+        .strip_suffix(PARTIAL_SUFFIX)?;
+    let (model_id, random) = inner.rsplit_once('.')?;
+    (!model_id.is_empty() && !random.is_empty()).then_some(model_id)
+}
+
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const COPY_CHUNK_BYTES: usize = 64 * 1024;
 const UNKNOWN_MODEL_EXIT: u8 = 2;
@@ -187,6 +205,22 @@ pub fn cache_dir() -> Result<PathBuf, PrepareError> {
 
 /// Removes partial downloads left behind by a killed `prepare`, returning what it deleted.
 ///
+/// Ownership is decided by the cache lock, never by the file's presence alone: `serve` starts
+/// while another process may be mid-download, and deleting that open temp file breaks the
+/// download (the final `persist` fails on Unix, the unlink itself fails on Windows). A model's
+/// partials are deleted only when this call can take `<model_id>.lock` itself — a lock it cannot
+/// take means an active `prepare` owns them.
+///
+/// Partials that predate model-qualified names (see [`partial_prefix`]) carry no model, so they
+/// are deleted only when no cache lock in the directory is held at all — i.e. when no download
+/// anywhere could own them.
+///
+/// Lock files that are free are removed too, so a cache that is not mid-download keeps no
+/// residue. Removing one races a concurrent `prepare` that has opened the lock file but not yet
+/// locked it; the loser then locks an unlinked inode and both may download. That costs a
+/// duplicate fetch, never a corrupt cache: every download is digest-verified and lands by atomic
+/// rename.
+///
 /// A missing cache directory is not an error — nothing has been prepared yet.
 pub fn clean_stale_partials(cache_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(cache_dir) {
@@ -194,22 +228,79 @@ pub fn clean_stale_partials(cache_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err),
     };
-    let mut removed = Vec::new();
+
+    let mut attributed: Vec<(String, PathBuf)> = Vec::new();
+    let mut unattributed: Vec<PathBuf> = Vec::new();
+    let mut lock_paths: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(PARTIAL_PREFIX) && name.ends_with(PARTIAL_SUFFIX) {
-            let path = entry.path();
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed.push(path),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
+        if name.ends_with(".lock") {
+            lock_paths.push(entry.path());
+        } else if name.starts_with(PARTIAL_PREFIX) && name.ends_with(PARTIAL_SUFFIX) {
+            match model_of_partial(&name) {
+                Some(model_id) => attributed.push((model_id.to_string(), entry.path())),
+                None => unattributed.push(entry.path()),
             }
         }
     }
+
+    let mut free_locks: Vec<(PathBuf, File)> = Vec::new();
+    let mut held_models: Vec<String> = Vec::new();
+    let mut any_lock_held = false;
+    for path in lock_paths {
+        match try_hold(&path) {
+            Some(file) => free_locks.push((path, file)),
+            None => {
+                any_lock_held = true;
+                if let Some(model_id) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    held_models.push(model_id.to_string());
+                }
+            }
+        }
+    }
+
+    let mut removed = Vec::new();
+    for (model_id, path) in attributed {
+        if held_models.contains(&model_id) {
+            continue;
+        }
+        remove_partial(&path, &mut removed)?;
+    }
+    if !any_lock_held {
+        for path in unattributed {
+            remove_partial(&path, &mut removed)?;
+        }
+    }
+
+    for (path, file) in free_locks {
+        let _ = FileExt::unlock(&file);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
     removed.sort();
     Ok(removed)
+}
+
+fn remove_partial(path: &Path, removed: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => removed.push(path.to_path_buf()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
+
+/// Takes `path`'s exclusive lock without blocking, yielding `None` when another process holds it
+/// or the file cannot be opened at all.
+fn try_hold(path: &Path) -> Option<File> {
+    let file = OpenOptions::new().read(true).write(true).open(path).ok()?;
+    // std::fs::File gained inherent lock/try_lock in Rust 1.89 and shadows fs4's same-named
+    // trait methods; call fs4 fully qualified.
+    FileExt::try_lock(&file).ok()?;
+    Some(file)
 }
 
 /// Makes the requested model present and verified in `cache_dir`, emitting NDJSON events.
@@ -332,14 +423,19 @@ fn download_verified(
     let mut response = ureq::get(&request.source_url)
         .call()
         .map_err(|err| format!("cannot fetch {}: {err}", request.source_url))?;
-    let total_bytes = response
-        .body_mut()
-        .content_length()
-        .unwrap_or(request.size_bytes);
+    let total_bytes = request.size_bytes;
+    if let Some(offered) = response.body_mut().content_length() {
+        if offered != total_bytes {
+            return Err(format!(
+                "declared size mismatch for {}: the pin declares {total_bytes} bytes, {} offers {offered}",
+                request.model_id, request.source_url
+            ));
+        }
+    }
     let mut reader = response.body_mut().with_config().limit(u64::MAX).reader();
 
     let mut temp = tempfile::Builder::new()
-        .prefix(PARTIAL_PREFIX)
+        .prefix(partial_prefix(&request.model_id).as_str())
         .suffix(PARTIAL_SUFFIX)
         .tempfile_in(cache_dir)
         .map_err(|err| {
@@ -360,6 +456,14 @@ fn download_verified(
             .map_err(|err| format!("cannot read {}: {err}", request.source_url))?;
         if read == 0 {
             break;
+        }
+        // A lying or malicious server would otherwise fill the disk before the digest check.
+        if received + read as u64 > total_bytes {
+            drop(temp);
+            return Err(format!(
+                "oversized response for {}: {} sent more than the pinned {total_bytes} bytes",
+                request.model_id, request.source_url
+            ));
         }
         hasher.update(&buffer[..read]);
         temp.write_all(&buffer[..read])

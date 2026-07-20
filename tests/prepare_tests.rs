@@ -41,6 +41,37 @@ impl Fixture {
         }
     }
 
+    /// Serves `body` with no `Content-Length`, so tiny_http streams it chunked and the client
+    /// learns the real size only by reading it.
+    fn start_chunked(body: Vec<u8>) -> Self {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("bind fixture server"));
+        let url = format!("http://{}/model.gguf", server.server_addr());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let handle = {
+            let server = Arc::clone(&server);
+            let hits = Arc::clone(&hits);
+            thread::spawn(move || {
+                for request in server.incoming_requests() {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let response = tiny_http::Response::new(
+                        tiny_http::StatusCode(200),
+                        Vec::new(),
+                        std::io::Cursor::new(body.clone()),
+                        None,
+                        None,
+                    );
+                    let _ = request.respond(response);
+                }
+            })
+        };
+        Fixture {
+            server,
+            hits,
+            url,
+            handle: Some(handle),
+        }
+    }
+
     fn hits(&self) -> usize {
         self.hits.load(Ordering::SeqCst)
     }
@@ -105,6 +136,22 @@ fn partials(dir: &Path) -> Vec<String> {
         .collect();
     found.sort();
     found
+}
+
+fn partial_prefix() -> String {
+    prepare::partial_prefix("test-model")
+}
+
+fn hold_lock(path: &Path) -> std::fs::File {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .expect("open lock");
+    fs4::FileExt::try_lock(&file).expect("take lock");
+    file
 }
 
 fn env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -334,7 +381,7 @@ fn clean_stale_partials_removes_partials_and_keeps_the_model_file() {
         .join(format!("{PARTIAL_PREFIX}abc123{PARTIAL_SUFFIX}"));
     let stale_two = cache
         .path()
-        .join(format!("{PARTIAL_PREFIX}def456{PARTIAL_SUFFIX}"));
+        .join(format!("{}def456{PARTIAL_SUFFIX}", partial_prefix()));
     for path in [&keep, &lock, &stale_one, &stale_two] {
         std::fs::write(path, b"x").expect("seed file");
     }
@@ -345,7 +392,117 @@ fn clean_stale_partials_removes_partials_and_keeps_the_model_file() {
     assert!(!stale_one.exists());
     assert!(!stale_two.exists());
     assert!(keep.exists());
-    assert!(lock.exists());
+    assert!(!lock.exists(), "a free lock file leaves no residue");
+    assert!(partials(cache.path()).is_empty());
+}
+
+#[test]
+fn a_partial_whose_model_lock_is_held_survives_cleanup() {
+    let cache = tempfile::tempdir().expect("tempdir");
+    let lock_path = cache.path().join("test-model.lock");
+    let in_flight = cache
+        .path()
+        .join(format!("{}live99{PARTIAL_SUFFIX}", partial_prefix()));
+    std::fs::write(&in_flight, b"half a download").expect("seed partial");
+    let _held = hold_lock(&lock_path);
+
+    let removed = prepare::clean_stale_partials(cache.path()).expect("cleanup");
+
+    assert!(removed.is_empty(), "{removed:?}");
+    assert!(
+        in_flight.exists(),
+        "an active download's partial must survive"
+    );
+    assert!(lock_path.exists(), "a held lock file must survive");
+}
+
+#[test]
+fn a_held_lock_protects_only_its_own_model_and_unattributable_partials() {
+    let cache = tempfile::tempdir().expect("tempdir");
+    let live_lock = cache.path().join("busy-model.lock");
+    let idle_lock = cache.path().join("idle-model.lock");
+    std::fs::write(&idle_lock, b"").expect("seed lock");
+    let live = cache
+        .path()
+        .join(format!("{PARTIAL_PREFIX}busy-model.aaa{PARTIAL_SUFFIX}"));
+    let idle = cache
+        .path()
+        .join(format!("{PARTIAL_PREFIX}idle-model.bbb{PARTIAL_SUFFIX}"));
+    let legacy = cache
+        .path()
+        .join(format!("{PARTIAL_PREFIX}nomodel{PARTIAL_SUFFIX}"));
+    for path in [&live, &idle, &legacy] {
+        std::fs::write(path, b"x").expect("seed partial");
+    }
+    let _held = hold_lock(&live_lock);
+
+    let removed = prepare::clean_stale_partials(cache.path()).expect("cleanup");
+
+    assert_eq!(removed, vec![idle.clone()], "{removed:?}");
+    assert!(live.exists(), "the busy model's partial must survive");
+    assert!(!idle.exists(), "the idle model's partial must be removed");
+    assert!(
+        legacy.exists(),
+        "an unattributable partial must survive while any download is live"
+    );
+    assert!(!idle_lock.exists(), "a free lock file leaves no residue");
+}
+
+#[test]
+fn an_interrupted_download_leaves_a_partial_that_later_cleanup_removes() {
+    let body = b"payload-for-the-partial-naming-check".to_vec();
+    let fixture = Fixture::start(body.clone(), Duration::ZERO);
+    let cache = tempfile::tempdir().expect("tempdir");
+    let mut request = request_for(&fixture, &body);
+    request.model_id = "named-model".to_string();
+    request.sha256 = "0".repeat(64);
+    let mut out = Vec::new();
+
+    prepare::acquire(&request, cache.path(), &mut out).expect_err("digest mismatch");
+    let orphan = cache.path().join(format!(
+        "{PARTIAL_PREFIX}named-model.orphaned{PARTIAL_SUFFIX}"
+    ));
+    std::fs::write(&orphan, b"left behind").expect("seed orphan");
+
+    let removed = prepare::clean_stale_partials(cache.path()).expect("cleanup");
+
+    assert_eq!(removed, vec![orphan.clone()], "{removed:?}");
+    assert!(!cache.path().join("named-model.lock").exists());
+}
+
+#[test]
+fn a_content_length_disagreeing_with_the_pin_fails_before_the_body_is_read() {
+    let body = vec![b'x'; 4096];
+    let fixture = Fixture::start(body.clone(), Duration::ZERO);
+    let cache = tempfile::tempdir().expect("tempdir");
+    let mut request = request_for(&fixture, &body);
+    request.size_bytes = 64;
+    let mut out = Vec::new();
+
+    let error = prepare::acquire(&request, cache.path(), &mut out).expect_err("size mismatch");
+
+    assert!(error.to_string().contains("declared size"), "{error}");
+    let events = events(&out);
+    assert_eq!(kinds(&events), vec!["error".to_string()]);
+    assert!(!cache.path().join("test-model.gguf").exists());
+    assert!(partials(cache.path()).is_empty());
+}
+
+#[test]
+fn an_oversized_chunked_response_is_aborted_at_the_cap_and_the_partial_is_deleted() {
+    let body = vec![b'x'; 512 * 1024];
+    let fixture = Fixture::start_chunked(body.clone());
+    let cache = tempfile::tempdir().expect("tempdir");
+    let mut request = request_for(&fixture, &body);
+    request.size_bytes = 1024;
+    let mut out = Vec::new();
+
+    let error = prepare::acquire(&request, cache.path(), &mut out).expect_err("oversized body");
+
+    assert!(error.to_string().contains("oversized"), "{error}");
+    let events = events(&out);
+    assert_eq!(kinds(&events).last().map(String::as_str), Some("error"));
+    assert!(!cache.path().join("test-model.gguf").exists());
     assert!(partials(cache.path()).is_empty());
 }
 
