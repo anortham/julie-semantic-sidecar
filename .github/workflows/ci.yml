@@ -138,11 +138,24 @@ jobs:
 
       # The full Task 7 gate: Group A (wire), Group B (lifecycle + hard budgets),
       # Group C (both models, every fixture text) plus every other ignored test.
-      - name: Full ignored suite + conformance
+      # The ignored targets run as separate bounded steps so a hang names the target
+      # that hung instead of taking the whole leg down opaquely (2026-07-20: the
+      # combined step passed conformance 9/9, then stalled 30 min in a later target
+      # and the runner was reclaimed).
+      - name: Conformance gate (groups A, B, C)
         # B5's 30 s contract budget is the hard bar on end-user hardware and in the
         # local branch gate (reference machine: 7.8 s). Shared 2-3 core CI runners
-        # miss it on raw throughput (70-500 s observed 2026-07-20), so CI raises the
+        # miss it on raw throughput (84-507 s observed 2026-07-20), so CI raises the
         # ceiling; correctness rows are unaffected.
+        timeout-minutes: 45
         env:
           CONFORMANCE_B5_BUDGET_MS: "600000"
-        run: cargo test --release -- --ignored --test-threads=1 --nocapture
+        run: cargo test --release --test conformance -- --ignored --test-threads=1 --nocapture
+
+      - name: Model-backed engine tests
+        timeout-minutes: 30
+        run: cargo test --release --test engine_tests -- --ignored --test-threads=1 --nocapture
+
+      - name: Model-backed serve tests
+        timeout-minutes: 20
+        run: cargo test --release --test serve_tests -- --ignored --test-threads=1 --nocapture
