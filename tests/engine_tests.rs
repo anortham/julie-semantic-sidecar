@@ -136,14 +136,19 @@ fn qwen3_measures_one_eos_token_and_one_special_token() {
     assert_eq!(engine.special_token_overhead(), 1);
 }
 
+/// A long but *sub-budget* input: 24003 tokens against a 32768-token budget.
+///
+/// Despite the historical name this never reached the budget, which is why the peak-memory
+/// worst case went uncovered until CI hit it — see
+/// [`qwen3_worst_case_prose_saturates_the_whole_token_budget`].
 #[test]
 #[ignore = "loads real GGUF weights from the shared cache"]
-fn qwen3_embeds_a_budget_length_input_without_error() {
+fn qwen3_embeds_a_long_sub_budget_input_without_error() {
     let engine = load(QWEN3);
     let text = "let value = compute(input); ".repeat(4000);
     let out = engine
         .embed(&[text], Role::Document)
-        .expect("a budget-length input truncates rather than failing");
+        .expect("a long input truncates rather than failing");
 
     assert_eq!(out.vectors.len(), 1);
     assert!((norm(&out.vectors[0]) - 1.0).abs() <= 1e-3);
@@ -238,6 +243,24 @@ fn bge_truncates_prose_whose_pieces_exceed_the_initial_buffer_guess() {
     );
 }
 
+/// Pins the peak-memory worst case cheaply, without paying for a 32k-token decode.
+///
+/// This input truncates to exactly `max_text_tokens`, so it sizes the context — and with it
+/// the 3584 MiB KV cache — to the largest the contract can ever ask for. That is the row
+/// that overflowed a 7 GB CI runner with `Decode Error -2`, and the number the ubatch
+/// memory math in `engine.rs` is calibrated against. If a tokenizer or instruction change
+/// ever drops it below the budget, the worst case stops being covered silently.
+#[test]
+#[ignore = "loads real GGUF weights from the shared cache"]
+fn qwen3_worst_case_prose_saturates_the_whole_token_budget() {
+    let engine = load(QWEN3);
+    let text = MULTI_BYTE_PIECE_PROSE.repeat(1200);
+    let tokens = engine
+        .input_token_count(&text, Role::Query)
+        .expect("tokenizes");
+    assert_eq!(tokens, pin(QWEN3).max_text_tokens);
+}
+
 #[test]
 #[ignore = "loads real GGUF weights from the shared cache"]
 fn qwen3_truncates_prose_whose_pieces_exceed_the_initial_buffer_guess() {
@@ -250,6 +273,11 @@ fn qwen3_truncates_prose_whose_pieces_exceed_the_initial_buffer_guess() {
 
     assert_eq!(out.vectors[0].len(), 512);
     assert!((norm(&out.vectors[0]) - 1.0).abs() <= 1e-3);
+    assert_ne!(
+        out.vectors[0],
+        vec![0.0; 512],
+        "must embed for real, not fall back to a zero vector"
+    );
 }
 
 #[test]

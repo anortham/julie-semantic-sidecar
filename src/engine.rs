@@ -51,14 +51,39 @@ const MAX_TOKENS_PER_ENCODE: usize = 16_384;
 /// Bytes read per digest chunk when the cached model file is verified at load.
 const DIGEST_CHUNK_BYTES: usize = 1024 * 1024;
 
-/// Ceiling on the physical micro-batch a single encode step processes.
+/// Ceiling on tokens grouped into one `cls`-pooled encode.
 ///
-/// The attention compute buffer grows with the square of the micro-batch, so sizing it to
-/// a whole 32k-token Qwen3 input asks the backend for tens of gigabytes and crashes it.
-/// Both pinned models' sequences are pooled correctly when chunked at this width, and
-/// bge's entire 512-token budget still fits in one micro-batch as its non-causal attention
-/// requires.
-const MAX_UBATCH_TOKENS: usize = 2_048;
+/// A non-causal encoder must hold its whole group in a single micro-batch, so this bounds
+/// the micro-batch too. bge's entire 512-token budget fits well inside it.
+const MAX_CLS_GROUP_TOKENS: usize = 2_048;
+
+/// Ceiling on the physical micro-batch of a `last`-pooled (causal) decode.
+///
+/// Sized by peak resident memory, not by throughput. A worst-case Qwen3 input is exactly
+/// `max_text_tokens` = 32768 tokens, and at that length the context costs, measured on the
+/// f16 pin:
+///
+/// | ubatch | compute buffer | peak RSS with weights + KV |
+/// |--------|---------------|----------------------------|
+/// | 2048   | 1649 MiB      | 6369 MiB                   |
+/// | 1024   |  973 MiB      | 5693 MiB                   |
+/// | 512    |  634 MiB      | 5354 MiB                   |
+/// | 256    |  465 MiB      | 5185 MiB                   |
+///
+/// The other two terms are fixed by the frozen contract and cannot be traded: the weights
+/// are 1136 MiB, and the KV cache is 3584 MiB because `n_ctx` must cover all 32768 tokens
+/// (28 layers x 8 kv heads x 256 f16 K+V bytes x 32768 cells). The compute buffer is
+/// therefore the only lever, and it is `~296 MiB + 0.58 MiB * ubatch`.
+///
+/// 512 is chosen so the worst case (5354 MiB) lands *below* the largest input observed to
+/// pass on a 7 GB CI runner (a 24003-token embed, 5410 MiB). At 2048 the same input needed
+/// 6369 MiB and llama.cpp failed the allocation with `Decode Error -2`. The cost is about
+/// 30% wall clock on a budget-length input; correctness is unaffected, because a causal
+/// model's KV cache makes the micro-batch width a pure chunking choice.
+const MAX_DECODE_UBATCH_TOKENS: usize = 512;
+
+/// Raising the decode micro-batch past 512 puts the worst case back over the CI ceiling.
+const _: () = assert!(MAX_DECODE_UBATCH_TOKENS <= 512);
 
 /// A loaded llama.cpp embedding model serving one manifest pin.
 pub struct LlamaEngine {
@@ -177,6 +202,15 @@ impl LlamaEngine {
         }
     }
 
+    /// Tokens `text` will actually present to the model under `role`, after truncation.
+    ///
+    /// This is the number that sizes the context, and through it the KV cache — the single
+    /// input to the peak-memory math documented on [`MAX_DECODE_UBATCH_TOKENS`]. Exposed so
+    /// a test can pin the worst case without paying for a full embed.
+    pub fn input_token_count(&self, text: &str, role: Role) -> Result<usize, EngineError> {
+        self.build_input(text, role).map(|tokens| tokens.len())
+    }
+
     /// Applies the contract's per-input pipeline: sanitize, prefix, fit, append EOS.
     fn build_input(&self, text: &str, role: Role) -> Result<Vec<LlamaToken>, EngineError> {
         let instruction = match role {
@@ -247,8 +281,17 @@ impl LlamaEngine {
         }
         let n_ubatch = match self.pin.pooling {
             Pooling::Cls => n_tokens,
-            Pooling::Last => u32::try_from(total_tokens.min(MAX_UBATCH_TOKENS))
+            Pooling::Last => u32::try_from(total_tokens.min(MAX_DECODE_UBATCH_TOKENS))
                 .map_err(|_| EncodeFailure::Item)?,
+        };
+        // Named in every failure message: a Decode/Encode error is almost always a
+        // consequence of these numbers, and reconstructing them from a CI log is guesswork.
+        let shape = EncodeShape {
+            total_tokens,
+            n_ctx: n_tokens,
+            n_batch: n_tokens,
+            n_ubatch,
+            n_seq,
         };
 
         let params = LlamaContextParams::default()
@@ -265,7 +308,7 @@ impl LlamaEngine {
         let mut context = self
             .model
             .new_context(&self.backend, params)
-            .map_err(|err| EncodeFailure::systemic("ContextAlloc", err.to_string()))?;
+            .map_err(|err| EncodeFailure::systemic("ContextAlloc", format!("{err} ({shape})")))?;
 
         let mut batch = LlamaBatch::new(total_tokens, n_seq);
         for (seq_id, tokens) in group.iter().enumerate() {
@@ -275,8 +318,12 @@ impl LlamaEngine {
                 .map_err(|_| EncodeFailure::Item)?;
         }
         match self.pin.pooling {
-            Pooling::Cls => context.encode(&mut batch).map_err(encode_failure)?,
-            Pooling::Last => context.decode(&mut batch).map_err(decode_failure)?,
+            Pooling::Cls => context
+                .encode(&mut batch)
+                .map_err(|err| encode_failure(err, &shape))?,
+            Pooling::Last => context
+                .decode(&mut batch)
+                .map_err(|err| decode_failure(err, &shape))?,
         }
 
         let mut vectors = Vec::with_capacity(group.len());
@@ -366,7 +413,7 @@ impl EmbedEngine for LlamaEngine {
         // A cls-pooled encoder must hold its whole group in one micro-batch, so its groups
         // are bounded by the micro-batch ceiling rather than the larger encode ceiling.
         let group_budget = match self.pin.pooling {
-            Pooling::Cls => MAX_UBATCH_TOKENS,
+            Pooling::Cls => MAX_CLS_GROUP_TOKENS,
             Pooling::Last => MAX_TOKENS_PER_ENCODE,
         };
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
@@ -442,23 +489,52 @@ impl EncodeFailure {
     }
 }
 
+/// The context geometry an encode ran under, reported with every failure.
+///
+/// A `Decode Error -2` is an allocation failure, and its cause is always some combination
+/// of these five numbers against the machine's memory ceiling. Carrying them in the message
+/// is the difference between a one-line diagnosis and a log-spelunking session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeShape {
+    /// Tokens submitted across the whole group.
+    pub total_tokens: usize,
+    /// Context size requested, which is the token total.
+    pub n_ctx: u32,
+    /// Logical batch size requested.
+    pub n_batch: u32,
+    /// Physical micro-batch width requested.
+    pub n_ubatch: u32,
+    /// Sequences in the group.
+    pub n_seq: i32,
+}
+
+impl std::fmt::Display for EncodeShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tokens={} n_ctx={} n_batch={} n_ubatch={} n_seq={}",
+            self.total_tokens, self.n_ctx, self.n_batch, self.n_ubatch, self.n_seq
+        )
+    }
+}
+
 /// Classifies a `llama_decode` result per `llama.h`'s documented return codes.
 ///
 /// `1` (no KV slot) explicitly suggests reducing the batch size, and `-1` is an invalid
 /// input batch — both are exactly what bisection isolates. Everything else is `2` (aborted)
 /// or `< -1` (fatal error), where llama.h notes the context's memory state is left dirty.
-fn decode_failure(err: DecodeError) -> EncodeFailure {
+fn decode_failure(err: DecodeError, shape: &EncodeShape) -> EncodeFailure {
     match err {
         DecodeError::NoKvCacheSlot | DecodeError::NTokensZero => EncodeFailure::Item,
-        other => EncodeFailure::systemic("Decode", other.to_string()),
+        other => EncodeFailure::systemic("Decode", format!("{other} ({shape})")),
     }
 }
 
 /// Classifies a `llama_encode` result; `llama.h` documents only `0` and `< 0` here.
-fn encode_failure(err: EncodeError) -> EncodeFailure {
+fn encode_failure(err: EncodeError, shape: &EncodeShape) -> EncodeFailure {
     match err {
         EncodeError::NoKvCacheSlot | EncodeError::NTokensZero => EncodeFailure::Item,
-        other => EncodeFailure::systemic("Encode", other.to_string()),
+        other => EncodeFailure::systemic("Encode", format!("{other} ({shape})")),
     }
 }
 
@@ -687,24 +763,56 @@ mod tests {
             .is_empty());
     }
 
+    fn shape() -> EncodeShape {
+        EncodeShape {
+            total_tokens: 32768,
+            n_ctx: 32768,
+            n_batch: 32768,
+            n_ubatch: 512,
+            n_seq: 1,
+        }
+    }
+
     #[test]
     fn a_no_kv_slot_decode_is_an_item_failure_and_a_fatal_one_is_systemic() {
         assert_eq!(
-            decode_failure(DecodeError::NoKvCacheSlot),
+            decode_failure(DecodeError::NoKvCacheSlot, &shape()),
             EncodeFailure::Item
         );
         assert_eq!(
-            decode_failure(DecodeError::NTokensZero),
+            decode_failure(DecodeError::NTokensZero, &shape()),
             EncodeFailure::Item
         );
         assert!(matches!(
-            decode_failure(DecodeError::Unknown(-2)),
+            decode_failure(DecodeError::Unknown(-2), &shape()),
             EncodeFailure::Systemic(_)
         ));
         assert!(matches!(
-            encode_failure(EncodeError::Unknown(-2)),
+            encode_failure(EncodeError::Unknown(-2), &shape()),
             EncodeFailure::Systemic(_)
         ));
+    }
+
+    #[test]
+    fn a_fatal_decode_names_the_context_geometry_that_caused_it() {
+        let EncodeFailure::Systemic(err) = decode_failure(DecodeError::Unknown(-2), &shape())
+        else {
+            panic!("a fatal decode is systemic");
+        };
+        assert_eq!(err.kind, "Decode");
+        for fact in [
+            "tokens=32768",
+            "n_ctx=32768",
+            "n_batch=32768",
+            "n_ubatch=512",
+            "n_seq=1",
+        ] {
+            assert!(
+                err.message.contains(fact),
+                "{fact} missing: {}",
+                err.message
+            );
+        }
     }
 
     #[test]
