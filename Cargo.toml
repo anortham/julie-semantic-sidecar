@@ -16,6 +16,9 @@ path = "src/lib.rs"
 name = "julie-semantic-sidecar"
 path = "src/main.rs"
 
+[features]
+metal = ["llama-cpp-2/metal", "llama-cpp-sys-2/metal"]
+
 [dependencies]
 dirs = "6.0.0"
 fs4 = "1.1.0"

@@ -7,12 +7,15 @@
 //! benchmark. An accelerated backend losing to CPU is a normal outcome — `ready: true`,
 //! `accelerated: false`, and a `degraded_reason` naming the result.
 //!
-//! **This build compiles no accelerated backend** (`llama-cpp-2` with
-//! `default-features = false`), so the benchmark has exactly one candidate and every
-//! selection resolves to CPU. The cache mechanics, the key, the invalidation rule, and the
-//! degradation shape are all implemented and tested here anyway: an accelerated build
-//! supplies a real [`MachineIdentity`] and a real benchmark to [`select_with`] and needs no
-//! change to the surrounding machinery.
+//! The CPU-only build (`llama-cpp-2` with `default-features = false` and no `metal`
+//! feature) compiles no accelerated backend, so its benchmark has exactly one candidate and
+//! every selection resolves to CPU. The `metal` feature is the accelerated macOS build: it
+//! supplies a real [`MachineIdentity`] (GPU brand + OS build) and resolves `metal` without
+//! probing — on Apple Silicon the unified-memory Metal path has no known CPU-wins case for
+//! the pinned encoders, so a micro-benchmark would only slow the first start. If a real
+//! CPU-wins case appears, wire a probe into [`select_with`]'s benchmark closure; the cache
+//! mechanics, the key, and the degradation shape already support it.
+//! `JULIE_SIDECAR_FORCE_BACKEND=cpu` remains the operator escape hatch in every build.
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +26,9 @@ pub const FORCE_BACKEND_ENV: &str = "JULIE_SIDECAR_FORCE_BACKEND";
 
 /// Canonical name of the backend every build can serve.
 pub const CPU: &str = "cpu";
+
+/// Canonical name of the backend the `metal` feature compiles in.
+pub const METAL: &str = "metal";
 
 /// File the cached benchmark choice is written to, beside the model cache.
 pub const SELECTION_CACHE_FILE: &str = "backend-selection.json";
@@ -70,6 +76,39 @@ impl MachineIdentity for CpuOnlyMachine {
     }
 }
 
+/// [`MachineIdentity`] for the `metal` build: GPU brand plus OS build as the driver proxy.
+///
+/// On Apple platforms the Metal "driver" ships with the OS, so the kernel build string is
+/// the component whose change should invalidate a cached selection. Both lookups fall back
+/// to `unknown` rather than failing a start — an unidentifiable machine still embeds; it
+/// just re-benchmarks when the identity becomes readable again.
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MetalMachine;
+
+#[cfg(feature = "metal")]
+impl MachineIdentity for MetalMachine {
+    fn identify(&self) -> Machine {
+        Machine {
+            gpu: sysctl_string("machdep.cpu.brand_string"),
+            driver: sysctl_string("kern.osversion"),
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+fn sysctl_string(name: &str) -> String {
+    std::process::Command::new("sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// The backend decision, in the shape `health` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
@@ -112,17 +151,37 @@ impl Selection {
 
 /// Resolves the backend for `model_sha256` using this build's identity and benchmark.
 ///
-/// This is the production entry point: the CPU-only build's benchmark has one candidate,
-/// so the first start writes a `cpu` choice that every later start reads back.
+/// This is the production entry point. The CPU-only build's benchmark has one candidate,
+/// so the first start writes a `cpu` choice that every later start reads back; the `metal`
+/// build resolves `metal` (see the module docs for why no probe runs today).
 pub fn select(cache_dir: &Path, sidecar_version: &str, model_sha256: &str) -> Selection {
     select_with(
         cache_dir,
         sidecar_version,
         model_sha256,
-        &CpuOnlyMachine,
+        &build_machine(),
         forced_backend().as_deref(),
-        |_machine| Selection::cpu(),
+        |_machine| build_selection(),
     )
+}
+
+#[cfg(feature = "metal")]
+fn build_machine() -> impl MachineIdentity {
+    MetalMachine
+}
+
+#[cfg(not(feature = "metal"))]
+fn build_machine() -> impl MachineIdentity {
+    CpuOnlyMachine
+}
+
+/// The backend this build serves when nothing is forced and nothing is cached.
+fn build_selection() -> Selection {
+    if cfg!(feature = "metal") {
+        Selection::new(METAL, METAL, None)
+    } else {
+        Selection::cpu()
+    }
 }
 
 /// Resolves the backend from injected identity, override, and benchmark.
@@ -164,14 +223,17 @@ where
 
 /// Applies `JULIE_SIDECAR_FORCE_BACKEND`.
 ///
-/// `cpu` is always honourable. Anything else names a backend this build did not compile,
-/// so CPU answers and the mismatch is reported as a degradation rather than a failure.
+/// `cpu` is always honourable, and so is a backend this build compiled. Anything else
+/// names a backend this build did not compile, so CPU answers and the mismatch is
+/// reported as a degradation rather than a failure.
 fn force(requested: &str) -> Selection {
     if requested.eq_ignore_ascii_case(CPU) {
-        Selection::cpu()
-    } else {
-        Selection::degraded_to_cpu(requested.to_ascii_lowercase(), NO_ACCELERATED_BACKEND)
+        return Selection::cpu();
     }
+    if cfg!(feature = "metal") && requested.eq_ignore_ascii_case(METAL) {
+        return Selection::new(METAL, METAL, None);
+    }
+    Selection::degraded_to_cpu(requested.to_ascii_lowercase(), NO_ACCELERATED_BACKEND)
 }
 
 /// Reads `JULIE_SIDECAR_FORCE_BACKEND`, treating an empty value as unset.
@@ -306,6 +368,50 @@ mod tests {
         assert!(!cache_path(dir.path()).exists());
     }
 
+    #[cfg(not(feature = "metal"))]
+    #[test]
+    fn the_cpu_only_build_defaults_to_cpu() {
+        assert_eq!(build_selection(), Selection::cpu());
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_metal_build_defaults_to_metal_with_no_degradation() {
+        let selection = build_selection();
+        assert_eq!(selection.requested, METAL);
+        assert_eq!(selection.resolved, METAL);
+        assert!(selection.accelerated);
+        assert_eq!(selection.degraded_reason, None);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_forced_metal_backend_is_honoured_in_the_metal_build() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let selection = select_with(
+            dir.path(),
+            "0.1.0",
+            "abc",
+            &machine("gpu", "driver"),
+            Some("Metal"),
+            |_| panic!("a forced backend must not benchmark"),
+        );
+        assert_eq!(selection.resolved, METAL);
+        assert!(selection.accelerated);
+        assert_eq!(selection.degraded_reason, None);
+        assert!(!cache_path(dir.path()).exists());
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_metal_machine_reports_a_non_none_identity() {
+        let identity = MetalMachine.identify();
+        assert_ne!(identity, Machine::none());
+        assert!(!identity.gpu.is_empty());
+        assert!(!identity.driver.is_empty());
+    }
+
+    #[cfg(not(feature = "metal"))]
     #[test]
     fn a_forced_accelerated_backend_degrades_to_cpu_in_this_build() {
         let dir = tempfile::tempdir().expect("tempdir");
