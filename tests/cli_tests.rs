@@ -34,7 +34,8 @@ fn version_flag_prints_name_and_semver() {
         .strip_prefix("julie-semantic-sidecar ")
         .unwrap_or_else(|| panic!("unexpected version line: {printed}"));
     assert_eq!(semver, env!("CARGO_PKG_VERSION"));
-    assert_eq!(semver.split('.').count(), 3);
+    let core = semver.split(['-', '+']).next().expect("semver core");
+    assert_eq!(core.split('.').count(), 3);
 }
 
 #[test]
