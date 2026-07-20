@@ -17,13 +17,14 @@
 #     LICENSE
 #     README.md
 #
-# CURRENT BUILD = CPU-ONLY. `Cargo.toml` pins llama-cpp-2/llama-cpp-sys-2 =0.1.151 with
-# `default-features = false`, which statically links ggml-cpu. That build ships exactly one
-# file plus the docs, so the flat layout is trivially satisfied today.
+# macOS arm64 builds `--features metal` (embedded Metal shaders; verified on an M2 Ultra
+# 2026-07-20 — the CPU-only sidecar shipped 12x under the P0 design floor, see the
+# metal-backend branch). Every other leg is CPU-ONLY today: `Cargo.toml` pins
+# llama-cpp-2/llama-cpp-sys-2 =0.1.151 with `default-features = false`, which statically
+# links ggml-cpu and ships exactly one file plus the docs.
 #
-# TODO — accelerated builds (exact flags from the plan's Global Constraints; NOT enabled
-# here because they cannot be built or tested on this machine/leg):
-#   macOS arm64   : --features metal, embedded Metal shaders, CMake -DGGML_NATIVE=OFF
+# TODO — remaining accelerated builds (exact flags from the plan's Global Constraints; NOT
+# enabled here because they cannot be built or tested on this machine/leg):
 #   Linux/Windows : --features vulkan with backend-DL (GGML_BACKEND_DL), CMake -DGGML_NATIVE=OFF
 #                   → copy the produced ggml backend plugin module next to the executable
 #                     and add it to the per-platform file list below.
@@ -71,14 +72,21 @@ echo "package: version   $version"
 echo "package: target    $target"
 echo "package: archive   $archive_kind"
 
-echo "package: building release binary (CPU-only feature set)"
+features=()
+case "$target" in
+  aarch64-apple-darwin) features=(--features metal) ;;
+esac
+
+# ${features[@]+...} keeps the empty-array expansion safe under `set -u` on bash 3.2
+# (macOS system bash), where a bare "${features[@]}" would abort the script.
+echo "package: building release binary (features: ${features[*]:-cpu-only})"
 if [[ "$target" == "$host_triple" ]]; then
-  cargo build --release
+  cargo build --release ${features[@]+"${features[@]}"}
   built_exe="target/release/$exe"
 else
   # An explicit non-host target must actually build for that target — staging the
   # host binary under a cross-target label ships the wrong architecture.
-  cargo build --release --target "$target"
+  cargo build --release --target "$target" ${features[@]+"${features[@]}"}
   built_exe="target/$target/release/$exe"
 fi
 

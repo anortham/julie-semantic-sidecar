@@ -77,11 +77,15 @@ const MAX_CLS_GROUP_TOKENS: usize = 2_048;
 /// The real term was the output buffer — `logits_all=true` in `encode_group` reserved a
 /// vocab-width row per token (19 GiB at 32768 tokens), which macOS overcommits silently
 /// but a 16 GiB Linux runner refuses. With outputs fixed to one row per sequence, every
-/// row above fits CI with >9 GiB of headroom; 256 stays because it is the verified
-/// setting, not because larger values are known to fail. The micro-batch width is a pure
-/// chunking choice for a causal model — conformance cosines were bit-identical across
-/// the 2048 -> 512 change.
-const MAX_DECODE_UBATCH_TOKENS: usize = 256;
+/// row above fits CI with >9 GiB of headroom. The micro-batch width is a pure chunking
+/// choice for a causal model — conformance cosines were bit-identical across the
+/// 2048 -> 512 change — but it is NOT throughput-neutral on an accelerated backend: at
+/// 256, a symbol-card batch decomposes into dozens of micro-dispatches and Metal spends
+/// more time on launch overhead and CPU<->GPU sync than on math (measured 2026-07-20 on an
+/// M2 Ultra: raising 256 -> 2048 was a large share of recovering the 8x gap between the
+/// shipped sidecar and the P0 llama-server floor). 2048 keeps the worst-case total at
+/// 6369 MiB, inside the 16 GiB CI runner with headroom.
+const MAX_DECODE_UBATCH_TOKENS: usize = 2_048;
 
 /// A loaded llama.cpp embedding model serving one manifest pin.
 pub struct LlamaEngine {
@@ -270,8 +274,20 @@ impl LlamaEngine {
     /// is embeddable without asking the backend for tens of gigabytes.
     fn encode_group(&self, group: &[&Vec<LlamaToken>]) -> Result<Vec<Vec<f32>>, EncodeFailure> {
         let total_tokens: usize = group.iter().map(|t| t.len()).sum();
-        let (Ok(n_tokens), Ok(n_seq)) = (u32::try_from(total_tokens), i32::try_from(group.len()))
-        else {
+        let max_tokens: usize = group.iter().map(|t| t.len()).max().unwrap_or(0);
+        // llama.cpp partitions the context evenly across sequences (`n_ctx_seq =
+        // n_ctx / n_seq_max`), so the context must be sized to the LONGEST member times
+        // the member count — and `n_seq_max` must actually be set. Leaving it at its
+        // default of 1 makes every multi-sequence group fail its KV placement, which
+        // [`isolate`] then silently bisects down to one context per input: correct
+        // output, catastrophic throughput (the 2026-07-20 8x regression).
+        let kv_cells = max_tokens * group.len();
+        let (Ok(n_tokens), Ok(n_seq), Ok(n_seq_max), Ok(n_ctx)) = (
+            u32::try_from(total_tokens),
+            i32::try_from(group.len()),
+            u32::try_from(group.len()),
+            u32::try_from(kv_cells),
+        ) else {
             return Err(EncodeFailure::Item);
         };
         if total_tokens == 0 {
@@ -286,16 +302,17 @@ impl LlamaEngine {
         // consequence of these numbers, and reconstructing them from a CI log is guesswork.
         let shape = EncodeShape {
             total_tokens,
-            n_ctx: n_tokens,
+            n_ctx,
             n_batch: n_tokens,
             n_ubatch,
             n_seq,
         };
 
         let params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(n_tokens))
+            .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
             .with_n_batch(n_tokens)
             .with_n_ubatch(n_ubatch)
+            .with_n_seq_max(n_seq_max)
             .with_embeddings(true)
             .with_pooling_type(match self.pin.pooling {
                 Pooling::Last => LlamaPoolingType::Last,
@@ -366,9 +383,10 @@ impl LlamaEngine {
 
     /// Reports the real backend outcome, not a fixed one.
     ///
-    /// `capabilities` advertises only CPU because this build compiles no accelerated
-    /// backend; the requested/resolved pair and the degradation reason come from the
-    /// cached [`Selection`], so a forced or benchmarked degradation is visible on the wire.
+    /// `capabilities` advertises what this build compiled — CPU always, Metal under the
+    /// `metal` feature; the requested/resolved pair and the degradation reason come from
+    /// the cached [`Selection`], so a forced or benchmarked degradation is visible on the
+    /// wire.
     fn engine_facts(&self) -> EngineFacts {
         EngineFacts {
             runtime: RUNTIME.to_string(),
@@ -379,6 +397,7 @@ impl LlamaEngine {
             degraded_reason: self.selection.degraded_reason.clone(),
             capabilities: BackendCapabilities {
                 cpu: true,
+                metal: cfg!(feature = "metal"),
                 ..BackendCapabilities::default()
             },
             llama_cpp_build: LLAMA_CPP_BUILD.to_string(),
@@ -421,7 +440,7 @@ impl EmbedEngine for LlamaEngine {
             Pooling::Last => MAX_TOKENS_PER_ENCODE,
         };
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
-        for group in group_by_token_budget(&inputs, group_budget) {
+        for group in group_by_cell_budget(&inputs, group_budget) {
             vectors.extend(isolate(&group, dims, &|items| self.encode_group(items))?);
         }
 
@@ -445,25 +464,30 @@ impl EmbedEngine for LlamaEngine {
     }
 }
 
-/// Groups inputs into runs whose token count stays under `budget`.
+/// Groups inputs into runs whose CONTEXT CELLS stay under `budget`.
 ///
-/// An input longer than the budget forms a group of its own rather than being dropped or
-/// split — it is already fitted to the model's own limit.
-pub fn group_by_token_budget<T>(inputs: &[T], budget: usize) -> Vec<Vec<&Vec<LlamaToken>>>
+/// The context a group needs is `longest member x member count`, because llama.cpp
+/// partitions `n_ctx` evenly across sequences — so the budget is applied to that product,
+/// not to the token sum. The product is always >= the sum, so a group under this budget
+/// also fits a same-sized batch/ubatch ceiling. An input longer than the budget forms a
+/// group of its own rather than being dropped or split — it is already fitted to the
+/// model's own limit.
+pub fn group_by_cell_budget<T>(inputs: &[T], budget: usize) -> Vec<Vec<&Vec<LlamaToken>>>
 where
     T: std::borrow::Borrow<Vec<LlamaToken>>,
 {
     let mut groups: Vec<Vec<&Vec<LlamaToken>>> = Vec::new();
     let mut current: Vec<&Vec<LlamaToken>> = Vec::new();
-    let mut current_tokens = 0usize;
+    let mut current_max = 0usize;
 
     for input in inputs {
         let tokens = input.borrow();
-        if !current.is_empty() && current_tokens + tokens.len() > budget {
+        let next_max = current_max.max(tokens.len());
+        if !current.is_empty() && next_max * (current.len() + 1) > budget {
             groups.push(std::mem::take(&mut current));
-            current_tokens = 0;
+            current_max = 0;
         }
-        current_tokens += tokens.len();
+        current_max = current_max.max(tokens.len());
         current.push(tokens);
     }
     if !current.is_empty() {
@@ -863,23 +887,39 @@ mod tests {
     }
 
     #[test]
-    fn group_by_token_budget_packs_inputs_under_the_ceiling() {
+    fn group_by_cell_budget_packs_inputs_under_the_ceiling() {
         let inputs: Vec<Vec<LlamaToken>> = vec![
             vec![LlamaToken(1); 4],
             vec![LlamaToken(1); 4],
             vec![LlamaToken(1); 4],
         ];
-        let groups = group_by_token_budget(&inputs, 8);
+        let groups = group_by_cell_budget(&inputs, 8);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 2);
         assert_eq!(groups[1].len(), 1);
     }
 
     #[test]
-    fn group_by_token_budget_gives_an_oversized_input_its_own_group() {
+    fn group_by_cell_budget_gives_an_oversized_input_its_own_group() {
         let inputs: Vec<Vec<LlamaToken>> = vec![vec![LlamaToken(1); 2], vec![LlamaToken(1); 50]];
-        let groups = group_by_token_budget(&inputs, 8);
+        let groups = group_by_cell_budget(&inputs, 8);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[1][0].len(), 50);
+    }
+
+    #[test]
+    fn group_by_cell_budget_charges_the_longest_member_for_every_seat() {
+        // Sum-budgeting would pack all four (2+2+2+6 = 12 <= 16); cell-budgeting must not,
+        // because the partitioned context costs longest x count = 6 x 4 = 24 cells.
+        let inputs: Vec<Vec<LlamaToken>> = vec![
+            vec![LlamaToken(1); 2],
+            vec![LlamaToken(1); 2],
+            vec![LlamaToken(1); 2],
+            vec![LlamaToken(1); 6],
+        ];
+        let groups = group_by_cell_budget(&inputs, 16);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 3);
+        assert_eq!(groups[1].len(), 1);
     }
 }
