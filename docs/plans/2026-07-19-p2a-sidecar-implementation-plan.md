@@ -156,10 +156,10 @@
 **What to build:** The real engine, CPU-only in tests. `truncate.rs`/`sanitize.rs` are pure (token ops injected via a closure/trait so tests run without a model). Engine integration tests (`#[ignore]`-gated unless the model file is present in cache) load each model from the cache and assert: dims/norm/count invariants, a 2-text embed round trip, the bge truncation cut matching the goldens' 510-content-token point, and zero-vector isolation via a forced-failure seam.
 
 **Acceptance criteria:**
-- [ ] `truncate.rs` reproduces the amended contract algorithm (tests: below-budget no-op, exact-budget, over-budget cut at `max_text_tokens − eos_reserve − special_token_overhead` for both models' constants, stability-loop shrink case)
-- [ ] `sanitize.rs` matches the engine-layer rules only (non-string handling is Task 2's wire rejection, not sanitization)
-- [ ] Model-gated integration tests green locally with cached models; vendored llama.cpp build recorded in the report
-- [ ] `cargo build` remains green with the CPU-default feature set (no Metal/Vulkan features)
+- [x] `truncate.rs` reproduces the amended contract algorithm (tests: below-budget no-op, exact-budget, over-budget cut at `max_text_tokens − eos_reserve − special_token_overhead` for both models' constants, stability-loop shrink case)
+- [x] `sanitize.rs` matches the engine-layer rules only (non-string handling is Task 2's wire rejection, not sanitization)
+- [x] Model-gated integration tests green locally with cached models; vendored llama.cpp build recorded in the report
+- [x] `cargo build` remains green with the CPU-default feature set (no Metal/Vulkan features)
 
 ## Task 6: Backend selection, stdout purity, unready state
 
@@ -175,10 +175,10 @@
 **Serialization:** Yes.
 
 **Acceptance criteria:**
-- [ ] Stdout purity proven by a whole-session test (spawn → load → embed → shutdown, zero non-protocol stdout bytes)
-- [ ] Unready serve path tested end-to-end without any model file (empty temp cache dir)
-- [ ] Selection cache round-trips; invalidation tested for each key component including driver identity; a cached "cpu" choice skips the probe
-- [ ] Backend plugin loading uses an executable-relative path (unit-test the path resolution; packaged proof lands in Task 8)
+- [x] Stdout purity proven by a whole-session test (spawn → load → embed → shutdown, zero non-protocol stdout bytes)
+- [x] Unready serve path tested end-to-end without any model file (empty temp cache dir)
+- [x] Selection cache round-trips; invalidation tested for each key component including driver identity; a cached "cpu" choice skips the probe
+- [x] Backend plugin loading uses an executable-relative path (unit-test the path resolution; packaged proof lands in Task 8)
 
 ## Task 7: Conformance harness — Groups A, B, and C
 
@@ -195,10 +195,10 @@
 **Serialization:** Yes.
 
 **Acceptance criteria:**
-- [ ] Every A/B/C row from the contract appears as a named assertion; B4/B5 budgets enforced as hard failures
-- [ ] Harness green on local macOS arm64 CPU for BOTH models against Miller fixtures at the pinned commit (branch-gate entry)
-- [ ] A deliberately perturbed vector and a deliberately shifted truncation point each fail Group C (negative tests)
-- [ ] A tolerance failure produces the vendored-build diagnostic (recorded `llama_cpp_build` vs goldens' `b10068`) before any escalation
+- [x] Every A/B/C row from the contract appears as a named assertion; B4/B5 budgets enforced as hard failures
+- [x] Harness green on local macOS arm64 CPU for BOTH models against Miller fixtures at the pinned commit (branch-gate entry)
+- [x] A deliberately perturbed vector and a deliberately shifted truncation point each fail Group C (negative tests)
+- [x] A tolerance failure produces the vendored-build diagnostic (recorded `llama_cpp_build` vs goldens' `b10068`) before any escalation
 
 ## Task 8: CI + packaging draft
 
@@ -214,7 +214,7 @@
 **Serialization:** Yes.
 
 **Acceptance criteria:**
-- [ ] ci.yml validates (actionlint) and encodes the matrix, the model-cache stage (prepare-driven, sha256-keyed), the pinned Miller fixture checkout, and the Linux packaged Vulkan-load assertion
-- [ ] Conformance jobs run the FULL Task 7 harness (A+B+C, both models) on every platform leg
-- [ ] release.yml has no armed publish; archives + sha256 + packaged smoke only
-- [ ] `package.sh`'s frozen file list matches what Task 6's loader expects (one source of truth, cross-referenced)
+- [x] ci.yml validates (actionlint) and encodes the matrix, the model-cache stage (prepare-driven, sha256-keyed), the pinned Miller fixture checkout, and the Linux packaged Vulkan-load assertion
+- [x] Conformance jobs run the FULL Task 7 harness (A+B+C, both models) on every platform leg
+- [x] release.yml has no armed publish; archives + sha256 + packaged smoke only
+- [x] `package.sh`'s frozen file list matches what Task 6's loader expects (one source of truth, cross-referenced)
