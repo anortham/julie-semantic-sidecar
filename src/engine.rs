@@ -59,32 +59,29 @@ const MAX_CLS_GROUP_TOKENS: usize = 2_048;
 
 /// Ceiling on the physical micro-batch of a `last`-pooled (causal) decode.
 ///
-/// Sized by peak resident memory, not by throughput. A worst-case Qwen3 input is exactly
-/// `max_text_tokens` = 32768 tokens, and at that length the context costs, measured on the
-/// f16 pin:
+/// Bounds the compute buffer for a worst-case Qwen3 input (`max_text_tokens` = 32768
+/// tokens), measured on the f16 pin:
 ///
-/// | ubatch | compute buffer | peak RSS with weights + KV |
-/// |--------|---------------|----------------------------|
-/// | 2048   | 1649 MiB      | 6369 MiB                   |
-/// | 1024   |  973 MiB      | 5693 MiB                   |
-/// | 512    |  634 MiB      | 5354 MiB                   |
-/// | 256    |  465 MiB      | 5185 MiB                   |
+/// | ubatch | compute buffer | weights + KV + compute |
+/// |--------|---------------|------------------------|
+/// | 2048   | 1649 MiB      | 6369 MiB               |
+/// | 1024   |  973 MiB      | 5693 MiB               |
+/// | 512    |  634 MiB      | 5354 MiB               |
+/// | 256    |  465 MiB      | 5185 MiB               |
 ///
-/// The other two terms are fixed by the frozen contract and cannot be traded: the weights
-/// are 1136 MiB, and the KV cache is 3584 MiB because `n_ctx` must cover all 32768 tokens
-/// (28 layers x 8 kv heads x 256 f16 K+V bytes x 32768 cells). The compute buffer is
-/// therefore the only lever, and it is `~296 MiB + 0.58 MiB * ubatch`.
+/// The weights (1136 MiB) and KV cache (3584 MiB: 28 layers x 8 kv heads x 256 f16 K+V
+/// bytes x 32768 cells) are fixed by the frozen contract; the compute buffer is
+/// `~296 MiB + 0.58 MiB * ubatch`.
 ///
-/// 512 was tried first, sized below the largest input observed to pass on a CI runner (a
-/// 24003-token embed, 5410 MiB); the 32768-token row still failed allocation there in 1.7 s,
-/// so the runner's real ceiling sits under 5354 MiB and 256 is the next documented step.
-/// The cost is wall clock on budget-length inputs; correctness is unaffected, because a
-/// causal model's KV cache makes the micro-batch width a pure chunking choice — the
-/// conformance cosines were bit-identical across the 2048 -> 512 change.
+/// History: the 512 -> 256 step-downs were chasing CI OOMs that this lever never caused.
+/// The real term was the output buffer — `logits_all=true` in `encode_group` reserved a
+/// vocab-width row per token (19 GiB at 32768 tokens), which macOS overcommits silently
+/// but a 16 GiB Linux runner refuses. With outputs fixed to one row per sequence, every
+/// row above fits CI with >9 GiB of headroom; 256 stays because it is the verified
+/// setting, not because larger values are known to fail. The micro-batch width is a pure
+/// chunking choice for a causal model — conformance cosines were bit-identical across
+/// the 2048 -> 512 change.
 const MAX_DECODE_UBATCH_TOKENS: usize = 256;
-
-/// Raising the decode micro-batch past 256 puts the worst case back over the CI ceiling.
-const _: () = assert!(MAX_DECODE_UBATCH_TOKENS <= 256);
 
 /// A loaded llama.cpp embedding model serving one manifest pin.
 pub struct LlamaEngine {
@@ -311,11 +308,17 @@ impl LlamaEngine {
             .new_context(&self.backend, params)
             .map_err(|err| EncodeFailure::systemic("ContextAlloc", format!("{err} ({shape})")))?;
 
+        // `logits_all=true` on the causal decode path makes llama.cpp reserve a
+        // vocab-width output row for EVERY token — 19 GiB for a 32768-token Qwen3 input
+        // (152k vocab x f32), which is what actually OOM'd the 16 GiB CI runner. Last
+        // pooling reads only each sequence's final token, and `add_sequence(.., false)`
+        // still flags that one. The non-causal encoder ignores per-token output flags,
+        // so `false` is correct for both paths.
         let mut batch = LlamaBatch::new(total_tokens, n_seq);
         for (seq_id, tokens) in group.iter().enumerate() {
             let seq_id = i32::try_from(seq_id).map_err(|_| EncodeFailure::Item)?;
             batch
-                .add_sequence(tokens, seq_id, true)
+                .add_sequence(tokens, seq_id, false)
                 .map_err(|_| EncodeFailure::Item)?;
         }
         match self.pin.pooling {
