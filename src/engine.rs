@@ -75,15 +75,16 @@ const MAX_CLS_GROUP_TOKENS: usize = 2_048;
 /// (28 layers x 8 kv heads x 256 f16 K+V bytes x 32768 cells). The compute buffer is
 /// therefore the only lever, and it is `~296 MiB + 0.58 MiB * ubatch`.
 ///
-/// 512 is chosen so the worst case (5354 MiB) lands *below* the largest input observed to
-/// pass on a 7 GB CI runner (a 24003-token embed, 5410 MiB). At 2048 the same input needed
-/// 6369 MiB and llama.cpp failed the allocation with `Decode Error -2`. The cost is about
-/// 30% wall clock on a budget-length input; correctness is unaffected, because a causal
-/// model's KV cache makes the micro-batch width a pure chunking choice.
-const MAX_DECODE_UBATCH_TOKENS: usize = 512;
+/// 512 was tried first, sized below the largest input observed to pass on a CI runner (a
+/// 24003-token embed, 5410 MiB); the 32768-token row still failed allocation there in 1.7 s,
+/// so the runner's real ceiling sits under 5354 MiB and 256 is the next documented step.
+/// The cost is wall clock on budget-length inputs; correctness is unaffected, because a
+/// causal model's KV cache makes the micro-batch width a pure chunking choice — the
+/// conformance cosines were bit-identical across the 2048 -> 512 change.
+const MAX_DECODE_UBATCH_TOKENS: usize = 256;
 
-/// Raising the decode micro-batch past 512 puts the worst case back over the CI ceiling.
-const _: () = assert!(MAX_DECODE_UBATCH_TOKENS <= 512);
+/// Raising the decode micro-batch past 256 puts the worst case back over the CI ceiling.
+const _: () = assert!(MAX_DECODE_UBATCH_TOKENS <= 256);
 
 /// A loaded llama.cpp embedding model serving one manifest pin.
 pub struct LlamaEngine {
