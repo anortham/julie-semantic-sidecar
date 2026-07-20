@@ -1,0 +1,433 @@
+use julie_semantic_sidecar::manifest;
+use julie_semantic_sidecar::prepare::{self, PrepareRequest, PARTIAL_PREFIX, PARTIAL_SUFFIX};
+use sha2::{Digest, Sha256};
+use std::net::TcpListener;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
+
+const BIN: &str = env!("CARGO_BIN_EXE_julie-semantic-sidecar");
+
+struct Fixture {
+    server: Arc<tiny_http::Server>,
+    hits: Arc<AtomicUsize>,
+    url: String,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Fixture {
+    fn start(body: Vec<u8>, delay: Duration) -> Self {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("bind fixture server"));
+        let url = format!("http://{}/model.gguf", server.server_addr());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let handle = {
+            let server = Arc::clone(&server);
+            let hits = Arc::clone(&hits);
+            thread::spawn(move || {
+                for request in server.incoming_requests() {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(delay);
+                    let _ = request.respond(tiny_http::Response::from_data(body.clone()));
+                }
+            })
+        };
+        Fixture {
+            server,
+            hits,
+            url,
+            handle: Some(handle),
+        }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.server.unblock();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn request_for(fixture: &Fixture, body: &[u8]) -> PrepareRequest {
+    PrepareRequest {
+        model_id: "test-model".to_string(),
+        file_name: "test-model.gguf".to_string(),
+        source_url: fixture.url.clone(),
+        sha256: sha256_hex(body),
+        size_bytes: body.len() as u64,
+    }
+}
+
+fn events(raw: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8(raw.to_vec())
+        .expect("utf8 events")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("ndjson event"))
+        .collect()
+}
+
+fn kinds(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| event["event"].as_str().expect("event key").to_string())
+        .collect()
+}
+
+fn partials(dir: &Path) -> Vec<String> {
+    let mut found: Vec<String> = std::fs::read_dir(dir)
+        .expect("read cache dir")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.starts_with(PARTIAL_PREFIX) && name.ends_with(PARTIAL_SUFFIX))
+        .collect();
+    found.sort();
+    found
+}
+
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+fn successful_download_emits_progress_then_done_and_leaves_no_partials() {
+    let body = b"gguf-payload-for-the-happy-path".to_vec();
+    let fixture = Fixture::start(body.clone(), Duration::ZERO);
+    let cache = tempfile::tempdir().expect("tempdir");
+    let request = request_for(&fixture, &body);
+    let mut out = Vec::new();
+
+    let prepared = prepare::acquire(&request, cache.path(), &mut out).expect("prepare succeeds");
+
+    let events = events(&out);
+    let kinds = kinds(&events);
+    assert!(kinds.contains(&"progress".to_string()), "{kinds:?}");
+    assert_eq!(kinds.last().map(String::as_str), Some("done"), "{kinds:?}");
+
+    let done = events.last().expect("done event");
+    assert_eq!(done["model_id"], "test-model");
+    assert_eq!(done["sha256"], request.sha256);
+    assert_eq!(done["path"], prepared.path.to_string_lossy().as_ref());
+
+    let progress = events
+        .iter()
+        .find(|event| event["event"] == "progress")
+        .expect("progress event");
+    assert_eq!(progress["model_id"], "test-model");
+    assert_eq!(progress["total_bytes"], body.len() as u64);
+
+    assert_eq!(prepared.path, cache.path().join("test-model.gguf"));
+    assert_eq!(std::fs::read(&prepared.path).expect("read model"), body);
+    assert!(!prepared.already_cached);
+    assert!(partials(cache.path()).is_empty());
+    assert_eq!(fixture.hits(), 1);
+}
+
+#[test]
+fn sha256_mismatch_deletes_the_partial_and_reports_an_error_event() {
+    let body = b"payload-that-will-not-match".to_vec();
+    let fixture = Fixture::start(body.clone(), Duration::ZERO);
+    let cache = tempfile::tempdir().expect("tempdir");
+    let mut request = request_for(&fixture, &body);
+    request.sha256 = "0".repeat(64);
+    let mut out = Vec::new();
+
+    let error = prepare::acquire(&request, cache.path(), &mut out).expect_err("digest mismatch");
+
+    assert!(error.to_string().contains("sha256"), "{error}");
+    let events = events(&out);
+    let last = events.last().expect("error event");
+    assert_eq!(last["event"], "error");
+    assert_eq!(last["model_id"], "test-model");
+    assert_eq!(last["source_url"], request.source_url);
+    assert_eq!(
+        last["expected_path"],
+        cache
+            .path()
+            .join("test-model.gguf")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert!(
+        last["message"]
+            .as_str()
+            .expect("message")
+            .contains("sha256"),
+        "{last}"
+    );
+
+    assert!(!cache.path().join("test-model.gguf").exists());
+    assert!(partials(cache.path()).is_empty());
+}
+
+#[test]
+fn disk_preflight_fails_before_any_request_when_the_pin_exceeds_free_space() {
+    let body = b"never-served".to_vec();
+    let fixture = Fixture::start(body.clone(), Duration::ZERO);
+    let cache = tempfile::tempdir().expect("tempdir");
+    let mut request = request_for(&fixture, &body);
+    request.size_bytes = u64::MAX / 2;
+    let mut out = Vec::new();
+
+    let error = prepare::acquire(&request, cache.path(), &mut out).expect_err("preflight fails");
+
+    assert!(error.to_string().contains("space"), "{error}");
+    let events = events(&out);
+    assert_eq!(kinds(&events), vec!["error".to_string()]);
+    assert_eq!(events[0]["source_url"], request.source_url);
+    assert_eq!(fixture.hits(), 0);
+    assert!(!cache.path().join("test-model.gguf").exists());
+}
+
+#[test]
+fn concurrent_prepares_download_once_and_the_waiter_reports_waiting() {
+    let body = b"payload-downloaded-exactly-once".to_vec();
+    let fixture = Fixture::start(body.clone(), Duration::from_millis(400));
+    let cache = tempfile::tempdir().expect("tempdir");
+    let request = request_for(&fixture, &body);
+
+    let first = {
+        let request = request.clone();
+        let dir = cache.path().to_path_buf();
+        thread::spawn(move || {
+            let mut out = Vec::new();
+            let result = prepare::acquire(&request, &dir, &mut out);
+            (result.map(|p| p.path), out)
+        })
+    };
+    thread::sleep(Duration::from_millis(150));
+    let second = {
+        let request = request.clone();
+        let dir = cache.path().to_path_buf();
+        thread::spawn(move || {
+            let mut out = Vec::new();
+            let result = prepare::acquire(&request, &dir, &mut out);
+            (result.map(|p| p.path), out)
+        })
+    };
+
+    let (first_result, first_out) = first.join().expect("first thread");
+    let (second_result, second_out) = second.join().expect("second thread");
+    let model = cache.path().join("test-model.gguf");
+    assert_eq!(first_result.expect("first prepared"), model);
+    assert_eq!(second_result.expect("second prepared"), model);
+
+    assert_eq!(fixture.hits(), 1);
+    assert_eq!(std::fs::read(&model).expect("read model"), body);
+    assert!(partials(cache.path()).is_empty());
+
+    let waited: Vec<bool> = [&first_out, &second_out]
+        .iter()
+        .map(|out| kinds(&events(out)).contains(&"waiting".to_string()))
+        .collect();
+    assert_eq!(
+        waited.iter().filter(|w| **w).count(),
+        1,
+        "exactly one waiter"
+    );
+    for out in [&first_out, &second_out] {
+        assert_eq!(kinds(&events(out)).last().map(String::as_str), Some("done"));
+    }
+}
+
+#[test]
+fn already_cached_model_is_served_without_touching_the_network() {
+    let body = b"already-on-disk".to_vec();
+    let fixture = Fixture::start(body.clone(), Duration::ZERO);
+    let cache = tempfile::tempdir().expect("tempdir");
+    let request = request_for(&fixture, &body);
+    std::fs::write(cache.path().join("test-model.gguf"), &body).expect("seed cache");
+    let mut out = Vec::new();
+
+    let prepared = prepare::acquire(&request, cache.path(), &mut out).expect("cached hit");
+
+    assert!(prepared.already_cached);
+    assert_eq!(fixture.hits(), 0);
+    let events = events(&out);
+    assert_eq!(kinds(&events), vec!["done".to_string()]);
+    assert_eq!(events[0]["sha256"], request.sha256);
+}
+
+#[test]
+fn cached_file_with_a_wrong_digest_is_treated_as_stale_and_redownloaded() {
+    let body = b"the-authentic-payload".to_vec();
+    let fixture = Fixture::start(body.clone(), Duration::ZERO);
+    let cache = tempfile::tempdir().expect("tempdir");
+    let request = request_for(&fixture, &body);
+    std::fs::write(cache.path().join("test-model.gguf"), b"stale-garbage").expect("seed cache");
+    let mut out = Vec::new();
+
+    let prepared = prepare::acquire(&request, cache.path(), &mut out).expect("stale replaced");
+
+    assert!(!prepared.already_cached);
+    assert_eq!(fixture.hits(), 1);
+    assert_eq!(std::fs::read(&prepared.path).expect("read model"), body);
+    assert!(partials(cache.path()).is_empty());
+}
+
+#[test]
+fn unreachable_source_reports_the_model_id_expected_path_and_source_url() {
+    let closed = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = closed.local_addr().expect("addr").port();
+    drop(closed);
+    let cache = tempfile::tempdir().expect("tempdir");
+    let request = PrepareRequest {
+        model_id: "test-model".to_string(),
+        file_name: "test-model.gguf".to_string(),
+        source_url: format!("http://127.0.0.1:{port}/model.gguf"),
+        sha256: "0".repeat(64),
+        size_bytes: 16,
+    };
+    let mut out = Vec::new();
+
+    prepare::acquire(&request, cache.path(), &mut out).expect_err("unreachable source");
+
+    let events = events(&out);
+    let error = events.last().expect("error event");
+    assert_eq!(error["event"], "error");
+    assert_eq!(error["model_id"], "test-model");
+    assert_eq!(error["source_url"], request.source_url);
+    assert_eq!(
+        error["expected_path"],
+        cache
+            .path()
+            .join("test-model.gguf")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert!(!cache.path().join("test-model.gguf").exists());
+    assert!(partials(cache.path()).is_empty());
+}
+
+#[test]
+fn clean_stale_partials_removes_partials_and_keeps_the_model_file() {
+    let cache = tempfile::tempdir().expect("tempdir");
+    let keep = cache.path().join("test-model.gguf");
+    let lock = cache.path().join("test-model.lock");
+    let stale_one = cache
+        .path()
+        .join(format!("{PARTIAL_PREFIX}abc123{PARTIAL_SUFFIX}"));
+    let stale_two = cache
+        .path()
+        .join(format!("{PARTIAL_PREFIX}def456{PARTIAL_SUFFIX}"));
+    for path in [&keep, &lock, &stale_one, &stale_two] {
+        std::fs::write(path, b"x").expect("seed file");
+    }
+
+    let removed = prepare::clean_stale_partials(cache.path()).expect("cleanup");
+
+    assert_eq!(removed.len(), 2, "{removed:?}");
+    assert!(!stale_one.exists());
+    assert!(!stale_two.exists());
+    assert!(keep.exists());
+    assert!(lock.exists());
+    assert!(partials(cache.path()).is_empty());
+}
+
+#[test]
+fn clean_stale_partials_on_a_missing_directory_is_not_an_error() {
+    let cache = tempfile::tempdir().expect("tempdir");
+    let missing = cache.path().join("never-created");
+
+    let removed = prepare::clean_stale_partials(&missing).expect("cleanup tolerates absence");
+
+    assert!(removed.is_empty());
+}
+
+#[test]
+fn resolve_defaults_to_the_manifest_default_tier() {
+    let pin = prepare::resolve(None).expect("default pin");
+    assert_eq!(pin.id, manifest::default_model().id);
+}
+
+#[test]
+fn resolve_rejects_an_unknown_id_with_a_message_listing_known_ids() {
+    let message = prepare::resolve(Some("not-a-model")).expect_err("unknown id");
+    assert!(message.contains("not-a-model"), "{message}");
+    for pin in manifest::manifest() {
+        assert!(message.contains(pin.id), "{message}");
+    }
+}
+
+#[test]
+fn cache_dir_honors_the_environment_override() {
+    let _guard = env_guard();
+    let cache = tempfile::tempdir().expect("tempdir");
+    let previous = std::env::var_os("JULIE_EMBEDDING_CACHE_DIR");
+    std::env::set_var("JULIE_EMBEDDING_CACHE_DIR", cache.path());
+
+    let resolved = prepare::cache_dir().expect("cache dir");
+
+    match previous {
+        Some(value) => std::env::set_var("JULIE_EMBEDDING_CACHE_DIR", value),
+        None => std::env::remove_var("JULIE_EMBEDDING_CACHE_DIR"),
+    }
+    assert_eq!(resolved, cache.path());
+}
+
+#[test]
+fn cache_dir_without_an_override_lands_under_the_home_cache() {
+    let _guard = env_guard();
+    let previous = std::env::var_os("JULIE_EMBEDDING_CACHE_DIR");
+    std::env::remove_var("JULIE_EMBEDDING_CACHE_DIR");
+
+    let resolved = prepare::cache_dir().expect("cache dir");
+
+    if let Some(value) = previous {
+        std::env::set_var("JULIE_EMBEDDING_CACHE_DIR", value);
+    }
+    assert!(resolved.ends_with("julie-semantic"), "{resolved:?}");
+    #[cfg(not(windows))]
+    assert!(
+        resolved.starts_with(dirs::home_dir().expect("home").join(".cache")),
+        "{resolved:?}"
+    );
+}
+
+#[test]
+fn unknown_model_exits_two_with_a_single_error_event_on_stdout() {
+    let out = std::process::Command::new(BIN)
+        .args(["prepare", "--model", "not-a-model"])
+        .output()
+        .expect("spawn");
+
+    assert_eq!(out.status.code(), Some(2));
+    let events = events(&out.stdout);
+    assert_eq!(kinds(&events), vec!["error".to_string()]);
+    assert_eq!(events[0]["model_id"], "not-a-model");
+    for pin in manifest::manifest() {
+        assert!(
+            events[0]["message"]
+                .as_str()
+                .expect("message")
+                .contains(pin.id),
+            "{}",
+            events[0]
+        );
+    }
+}

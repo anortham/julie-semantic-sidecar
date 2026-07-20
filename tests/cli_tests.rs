@@ -73,11 +73,23 @@ fn serve_reads_stdin_and_exits_cleanly_on_eof() {
 }
 
 #[test]
-fn prepare_dispatches_to_the_stub_and_fails_loudly() {
-    let out = Command::new(BIN).arg("prepare").output().expect("spawn");
-    assert!(!out.status.success());
-    assert!(out.stdout.is_empty());
-    let stderr = String::from_utf8(out.stderr).expect("utf8");
-    assert!(stderr.contains("not implemented"), "{stderr}");
-    assert!(stderr.contains("qwen3-0.6b-f16"), "{stderr}");
+fn prepare_rejects_unknown_model_offline_with_exit_two() {
+    let out = Command::new(BIN)
+        .args(["prepare", "--model", "not-a-model"])
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "one ndjson event: {stdout}");
+    let event: serde_json::Value = serde_json::from_str(lines[0]).expect("ndjson event");
+    assert_eq!(event["event"], "error");
+    assert_eq!(event["model_id"], "not-a-model");
+    assert!(
+        event["message"]
+            .as_str()
+            .expect("message")
+            .contains("qwen3-0.6b-f16"),
+        "{event}"
+    );
 }
