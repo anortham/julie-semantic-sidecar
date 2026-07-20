@@ -1,0 +1,134 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Frozen fixture pin: anortham/miller, the commit the protocol contract and the
+  # conformance goldens were taken from. Bumping it is a contract decision, not a CI edit.
+  MILLER_PIN: 8edfa14
+
+jobs:
+  fast:
+    name: fast (fmt + clippy + unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add clippy rustfmt
+          rustc --version
+          cargo --version
+
+      # llama-cpp-sys-2 builds vendored llama.cpp with CMake; without it the crate cannot build.
+      - name: Verify cmake is present
+        run: cmake --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Non-ignored tests only: no model weights, no network, no spawned sidecar.
+      - name: cargo test
+        run: cargo test
+
+  conformance:
+    name: conformance (${{ matrix.name }})
+    needs: fast
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-15
+          - name: macos-x64
+            os: macos-15-intel
+          - name: linux-x64
+            os: ubuntu-latest
+          - name: windows-x64
+            os: windows-2025
+    env:
+      JULIE_EMBEDDING_CACHE_DIR: ${{ github.workspace }}/model-cache
+      JULIE_SIDECAR_FORCE_BACKEND: cpu
+      FIXTURES_DIR: ${{ github.workspace }}/miller-fixtures/eval/sidecar-conformance
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout sidecar
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned Miller fixtures
+        uses: actions/checkout@v4
+        with:
+          repository: anortham/miller
+          ref: ${{ env.MILLER_PIN }}
+          path: miller-fixtures
+          sparse-checkout: eval/sidecar-conformance
+          sparse-checkout-cone-mode: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Verify cmake is present
+        run: cmake --version
+
+      - name: Install Vulkan ICD (lavapipe) and tools
+        if: matrix.name == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+
+      # Diagnostic only while the build is CPU-only. When the accelerated (backend-DL)
+      # builds land, this becomes the hard assertion that the packaged Vulkan backend
+      # module actually loads and registers from the executable-relative plugin dir.
+      - name: Vulkan diagnostic
+        if: matrix.name == 'linux-x64'
+        run: vulkaninfo --summary || true
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Key = both manifest sha256 values (src/manifest.rs, qwen3 then bge). A pin bump
+      # changes the key, so the next run re-prepares instead of serving a stale weight file.
+      - name: Restore model cache
+        id: models
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/model-cache
+          key: models-${{ runner.os }}-${{ runner.arch }}-421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340-bf40c42ad7d89382e9ba7376d5c4b73f6b556cb541fab37aaa1da9c320149b65
+
+      # Cache miss doubles as the prepare end-to-end test: real downloads, real
+      # sha256-before-visibility, real cache layout.
+      - name: Prepare pinned models
+        if: steps.models.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$JULIE_EMBEDDING_CACHE_DIR"
+          cargo run --release -- prepare
+          cargo run --release -- prepare --model bge-small-en-v1.5-f32
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # The full Task 7 gate: Group A (wire), Group B (lifecycle + hard budgets),
+      # Group C (both models, every fixture text) plus every other ignored test.
+      - name: Full ignored suite + conformance
+        run: cargo test --release -- --ignored --test-threads=1 --nocapture
