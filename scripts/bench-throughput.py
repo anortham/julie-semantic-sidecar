@@ -60,9 +60,12 @@ def rpc(request_id, method, params):
 
 
 class Sidecar:
-    def __init__(self, binary, stderr_file):
+    def __init__(self, binary, stderr_file, model=None):
+        command = [binary, "serve"]
+        if model:
+            command += ["--model", model]
         self._proc = subprocess.Popen(
-            [binary, "serve"],
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_file,
@@ -96,6 +99,10 @@ class Sidecar:
             )
         return elapsed, reply.get("result", {})
 
+    @property
+    def pid(self):
+        return self._proc.pid
+
     def close(self):
         proc = self._proc
         try:
@@ -106,12 +113,26 @@ class Sidecar:
             proc.kill()
 
 
-def run_bench(binary, batch, rounds, floor):
+def sidecar_rss_bytes(pid):
+    """Resident set of the live sidecar in bytes via ps (macOS/Linux); None where unavailable."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return int(out.stdout.strip()) * 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def run_bench(binary, batch, rounds, floor, model=None):
     with tempfile.NamedTemporaryFile(
         mode="w+", suffix=".sidecar-bench-stderr.log", delete=False
     ) as stderr_file:
         stderr_path = stderr_file.name
-        sidecar = Sidecar(binary, stderr_file)
+        sidecar = Sidecar(binary, stderr_file, model)
         try:
             _, health = sidecar.call("bench-health", "health", {})
             if not health.get("ready", False):
@@ -139,12 +160,15 @@ def run_bench(binary, batch, rounds, floor):
                 if elapsed <= 0:
                     raise BenchError(f"round {r}: non-positive elapsed time")
                 rates.append(n / elapsed)
+
+            rss_bytes = sidecar_rss_bytes(sidecar.pid)
         finally:
             sidecar.close()
 
     steady = sum(rates) / len(rates)
     return {
         "binary": binary,
+        "sidecar_rss_bytes": rss_bytes,
         "batch": batch,
         "rounds": rounds,
         "warmup_rounds": 1,
@@ -188,6 +212,11 @@ def parse_args(argv):
         help=f"PASS/FAIL floor in units/s (default {DEFAULT_FLOOR})",
     )
     parser.add_argument(
+        "--model",
+        default=None,
+        help="model id passed through to `serve --model` (default: the sidecar's default model)",
+    )
+    parser.add_argument(
         "--json", action="store_true", help="emit the result as a single JSON object"
     )
     args = parser.parse_args(argv)
@@ -207,7 +236,7 @@ def parse_args(argv):
 def main(argv):
     args = parse_args(argv)
     try:
-        report = run_bench(args.binary, args.batch, args.rounds, args.floor)
+        report = run_bench(args.binary, args.batch, args.rounds, args.floor, args.model)
     except BenchError as exc:
         if args.json:
             print(json.dumps({"error": str(exc), "pass": False}))
