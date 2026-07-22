@@ -245,9 +245,9 @@ Metal remains compiled into the Apple Silicon executable, so its manifest declar
 
 **Acceptance:**
 
-- [ ] The exact archive passes all protocol and applicable golden vectors on CPU and Metal.
-- [ ] Health truthfully matches the selected winner and fallback result.
-- [ ] The findings record is sufficient to reproduce the evidence.
+- [x] The exact archive passes all protocol and applicable golden vectors on CPU and Metal.
+- [x] Health truthfully matches the selected winner and fallback result.
+- [x] The findings record is sufficient to reproduce the evidence.
 
 ## Task 7: Prove Windows/Linux portable and vendor lanes
 
