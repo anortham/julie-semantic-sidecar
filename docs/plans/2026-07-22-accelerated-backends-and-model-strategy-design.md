@@ -1,8 +1,8 @@
 # Accelerated Backends and Model Strategy
 
-**Date:** 2026-07-22  
-**Status:** Approved design; implementation has not started  
-**Primary repo:** `/Users/murphy/source/julie-semantic-sidecar`  
+**Date:** 2026-07-22
+**Status:** Approved design; implementation has not started
+**Primary repo:** `/Users/murphy/source/julie-semantic-sidecar`
 **Consumers:** Miller now; Julie only if it remains a product and adopts the frozen protocol later
 
 ## Decision
@@ -303,7 +303,7 @@ workflow, semantic scale tests, and release documentation.
 
 ### Phase 6 — Run the BGE versus CodeRankEmbed decision
 
-**Primary owner:** Miller evaluation harness.  
+**Primary owner:** Miller evaluation harness.
 **Sidecar owner:** only protocol/model adapter work required to produce comparable vectors.
 
 - Freeze a paired task corpus containing identifier, prose, documentation, configuration, ambiguous
@@ -387,4 +387,3 @@ cargo fmt --check
    separate evidence-gated plans.
 5. Start with Phase 0 and Phase 1. Do not publish, change the wire contract locally, or begin the .NET
    spike.
-
