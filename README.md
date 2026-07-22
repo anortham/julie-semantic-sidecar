@@ -27,7 +27,7 @@ standalone-default change.
 | Variable | Effect |
 |---|---|
 | `JULIE_EMBEDDING_CACHE_DIR` | Model cache root. Defaults to `~/.cache/julie-semantic` (macOS and Linux), `%LOCALAPPDATA%`-rooted on Windows. Shared with Julie by construction. |
-| `JULIE_SIDECAR_FORCE_BACKEND=cpu` | Forces the CPU backend, skipping the device probe and micro-benchmark. A diagnostic and CI surface — never required for normal operation. |
+| `JULIE_SIDECAR_FORCE_BACKEND=cpu\|metal\|vulkan\|cuda` | CPU skips discovery and benchmarking. Accelerator values probe only that backend, but still resolve to ready CPU when unavailable, failing, tied, or slower. A diagnostic and CI surface — never required for normal operation. |
 
 ## Build and test
 
