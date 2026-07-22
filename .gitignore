@@ -4,3 +4,4 @@
 .julieignore
 /models
 *.gguf
+.worktrees/
