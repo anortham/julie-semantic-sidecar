@@ -161,18 +161,13 @@ jobs:
       - name: Model-backed engine tests
         timeout-minutes: 90
         run: |
-          names=$(cargo test --release --test engine_tests -- --ignored --list \
-                  | sed -n 's/: test$//p')
-          # The long-input qwen3 embeds (24k-32k tokens) take ~15-22 min EACH on a
-          # 2-core runner and seconds in the local branch gate on the reference
-          # machine, which runs them on every branch. CI runs them only on
-          # workflow_dispatch; the conformance gate above still covers the frozen
-          # contract's long-truncation rows end-to-end through the real binary.
-          if [[ "${{ github.event_name }}" != "workflow_dispatch" ]]; then
-            names=$(printf '%s\n' $names | grep -Ev \
-              '^qwen3_(worst_case_prose_saturates_the_whole_token_budget|truncates_prose_whose_pieces_exceed_the_initial_buffer_guess|embeds_a_long_sub_budget_input_without_error)$')
-          fi
-          for name in $names; do
+          cargo test --release --test engine_tests -- --ignored --list \
+            | sed -n 's/: test$//p' \
+            | while IFS= read -r name; do
+            if [[ "${{ github.event_name }}" != "workflow_dispatch" \
+                  && "$name" =~ ^qwen3_(worst_case_prose_saturates_the_whole_token_budget|truncates_prose_whose_pieces_exceed_the_initial_buffer_guess|embeds_a_long_sub_budget_input_without_error)$ ]]; then
+              continue
+            fi
             echo "::group::$name"
             cargo test --release --test engine_tests -- --ignored --exact "$name" --nocapture
             echo "::endgroup::"
@@ -181,3 +176,99 @@ jobs:
       - name: Model-backed serve tests
         timeout-minutes: 30
         run: cargo test --release --test serve_tests -- --ignored --test-threads=1 --nocapture
+
+  artifact-validation:
+    name: artifact validation (${{ matrix.name }}) — compile/package only, not support evidence
+    needs: fast
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: apple-arm64-metal-portable
+            os: macos-15
+            profile: apple-arm64-metal-portable
+            backend: metal
+            package_shell: bash
+          - name: linux-x64-vulkan-portable
+            os: ubuntu-24.04
+            profile: linux-x64-vulkan-portable
+            backend: vulkan
+            package_shell: bash
+          - name: windows-x64-vulkan-portable
+            os: windows-2025
+            profile: windows-x64-vulkan-portable
+            backend: vulkan
+            package_shell: pwsh
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Prepare Vulkan SDK for compile proof
+        if: matrix.backend == 'vulkan'
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.4.304.1
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang
+          vulkan-use-cache: true
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compile and package portable profile with Bash
+        if: matrix.package_shell == 'bash'
+        run: bash scripts/package.sh --profile "${{ matrix.profile }}" | tee package.log
+
+      - name: Compile and package portable profile with PowerShell
+        if: matrix.package_shell == 'pwsh'
+        shell: pwsh
+        run: '& ./scripts/package.ps1 -Profile "${{ matrix.profile }}" *>&1 | Tee-Object package.log'
+
+      - name: Validate newly unpacked archive with Bash without claiming hardware support
+        if: matrix.package_shell == 'bash'
+        run: |
+          archive="$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print -quit)"
+          expected="$(awk '{print $1}' "$archive.sha256")"
+          bash scripts/hardware-smoke.sh \
+            --archive "$archive" \
+            --sha256 "$expected" \
+            --backend "${{ matrix.backend }}" \
+            --lane "${{ matrix.profile }}" \
+            --artifact-validation \
+            --evidence-dir "artifact-validation/${{ matrix.profile }}"
+
+      - name: Validate newly unpacked archive with PowerShell without claiming hardware support
+        if: matrix.package_shell == 'pwsh'
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem dist -File -Filter '*.zip' | Select-Object -First 1
+          if ($null -eq $archive) { throw 'packaging produced no zip archive' }
+          $expected = ((Get-Content "$($archive.FullName).sha256") -split '\s+')[0]
+          & ./scripts/hardware-smoke.ps1 `
+            -Archive $archive.FullName `
+            -Sha256 $expected `
+            -Backend "${{ matrix.backend }}" `
+            -Lane "${{ matrix.profile }}" `
+            -ArtifactValidation `
+            -EvidenceDir "artifact-validation/${{ matrix.profile }}"
+
+      - name: Upload archive validation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-validation-${{ matrix.profile }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/${{ matrix.profile }}/package-manifest.json
+            artifact-validation/${{ matrix.profile }}/**
+            package.log
+          if-no-files-found: error

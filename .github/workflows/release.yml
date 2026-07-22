@@ -1,11 +1,27 @@
-name: release (artifacts only)
+name: artifact candidates (manual and approval gated)
 
-# workflow_dispatch ONLY, and there is deliberately NO publish step: no `gh release`,
-# no softprops/action-gh-release, no tag creation. This workflow builds the platform
-# archives and uploads them as workflow artifacts so they can be inspected. Publishing a
-# release requires explicit user approval and a separate, deliberately armed workflow.
 on:
   workflow_dispatch:
+    inputs:
+      hardware_lane:
+        description: Exact package profile whose archive checksum must match
+        required: true
+        type: choice
+        options:
+          - apple-arm64-metal-portable
+          - linux-x64-vulkan-portable
+          - windows-x64-vulkan-portable
+          - linux-x64-cuda-vendor
+          - windows-x64-cuda-vendor
+      expected_archive_sha256:
+        description: Lowercase SHA-256 expected for the selected hardware lane
+        required: true
+        type: string
+      include_cuda_candidates:
+        description: Build optional CUDA vendor candidates
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -14,22 +30,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  approval:
+    name: approve private artifact candidates
+    runs-on: ubuntu-latest
+    environment: artifact-release-approval
+    steps:
+      - name: Validate checksum-bound lane request
+        env:
+          HARDWARE_LANE: ${{ inputs.hardware_lane }}
+          EXPECTED_ARCHIVE_SHA256: ${{ inputs.expected_archive_sha256 }}
+          INCLUDE_CUDA_CANDIDATES: ${{ inputs.include_cuda_candidates }}
+        run: |
+          [[ "$EXPECTED_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "expected_archive_sha256 must be 64 lowercase hexadecimal characters" >&2
+            exit 2
+          }
+          if [[ "$HARDWARE_LANE" == *-cuda-vendor && "$INCLUDE_CUDA_CANDIDATES" != "true" ]]; then
+            echo "the selected CUDA lane requires include_cuda_candidates" >&2
+            exit 2
+          fi
+          printf 'lane=%s\nsha256=%s\n' "$HARDWARE_LANE" "$EXPECTED_ARCHIVE_SHA256"
+
   package:
-    name: package (${{ matrix.name }})
+    name: private artifact candidate (${{ matrix.profile }})
+    needs: approval
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: macos-arm64
-            os: macos-15
-          - name: macos-x64
-            os: macos-15-intel
-          - name: linux-x64
-            os: ubuntu-latest
-          - name: windows-x64
-            os: windows-2025
+        include: >-
+          ${{ inputs.include_cuda_candidates
+              && fromJSON('[{"os":"macos-15","profile":"apple-arm64-metal-portable","backend":"metal","package_shell":"bash"},{"os":"ubuntu-24.04","profile":"linux-x64-vulkan-portable","backend":"vulkan","package_shell":"bash"},{"os":"windows-2025","profile":"windows-x64-vulkan-portable","backend":"vulkan","package_shell":"pwsh"},{"os":"ubuntu-24.04","profile":"linux-x64-cuda-vendor","backend":"cuda","package_shell":"bash"},{"os":"windows-2025","profile":"windows-x64-cuda-vendor","backend":"cuda","package_shell":"pwsh"}]')
+              || fromJSON('[{"os":"macos-15","profile":"apple-arm64-metal-portable","backend":"metal","package_shell":"bash"},{"os":"ubuntu-24.04","profile":"linux-x64-vulkan-portable","backend":"vulkan","package_shell":"bash"},{"os":"windows-2025","profile":"windows-x64-vulkan-portable","backend":"vulkan","package_shell":"pwsh"}]') }}
     defaults:
       run:
         shell: bash
@@ -42,23 +75,84 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Verify cmake is present
-        run: cmake --version
+      - name: Prepare Vulkan SDK for artifact build
+        if: matrix.backend == 'vulkan'
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.4.304.1
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang
+          vulkan-use-cache: true
+
+      - name: Prepare CUDA toolkit for optional candidate build
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: 13.2.0
+          log-file-suffix: ${{ matrix.profile }}.txt
 
       - uses: Swatinem/rust-cache@v2
 
-      # package.sh --smoke runs the packaged binary's `--version` and an offline
-      # not-ready health round trip (empty JULIE_EMBEDDING_CACHE_DIR, no model needed)
-      # against the staged layout BEFORE the archive is written.
-      - name: Build, smoke, and archive the packaged layout
-        run: bash scripts/package.sh --smoke
+      - name: Package candidate with Bash
+        if: matrix.package_shell == 'bash'
+        run: bash scripts/package.sh --profile "${{ matrix.profile }}" | tee package.log
 
-      - name: Upload archive and sha256 sidecar
+      - name: Package candidate with PowerShell
+        if: matrix.package_shell == 'pwsh'
+        shell: pwsh
+        run: '& ./scripts/package.ps1 -Profile "${{ matrix.profile }}" *>&1 | Tee-Object package.log'
+
+      - name: Verify selected lane checksum and newly unpacked archive with Bash
+        if: matrix.package_shell == 'bash'
+        env:
+          SELECTED_LANE: ${{ inputs.hardware_lane }}
+          SELECTED_SHA256: ${{ inputs.expected_archive_sha256 }}
+        run: |
+          archive="$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print -quit)"
+          generated_sha256="$(awk '{print $1}' "$archive.sha256")"
+          expected_sha256="$generated_sha256"
+          if [[ "${{ matrix.profile }}" == "$SELECTED_LANE" ]]; then
+            expected_sha256="$SELECTED_SHA256"
+          fi
+          bash scripts/hardware-smoke.sh \
+            --archive "$archive" \
+            --sha256 "$expected_sha256" \
+            --backend "${{ matrix.backend }}" \
+            --lane "${{ matrix.profile }}" \
+            --artifact-validation \
+            --evidence-dir "artifact-validation/${{ matrix.profile }}"
+
+      - name: Verify selected lane checksum and newly unpacked archive with PowerShell
+        if: matrix.package_shell == 'pwsh'
+        shell: pwsh
+        env:
+          SELECTED_LANE: ${{ inputs.hardware_lane }}
+          SELECTED_SHA256: ${{ inputs.expected_archive_sha256 }}
+        run: |
+          $archive = Get-ChildItem dist -File -Filter '*.zip' | Select-Object -First 1
+          if ($null -eq $archive) { throw 'packaging produced no zip archive' }
+          $generatedSha256 = ((Get-Content "$($archive.FullName).sha256") -split '\s+')[0]
+          $expectedSha256 = $generatedSha256
+          if ("${{ matrix.profile }}" -eq $env:SELECTED_LANE) { $expectedSha256 = $env:SELECTED_SHA256 }
+          & ./scripts/hardware-smoke.ps1 `
+            -Archive $archive.FullName `
+            -Sha256 $expectedSha256 `
+            -Backend "${{ matrix.backend }}" `
+            -Lane "${{ matrix.profile }}" `
+            -ArtifactValidation `
+            -EvidenceDir "artifact-validation/${{ matrix.profile }}"
+
+      - name: Upload private archive, manifest, checksum, and raw logs
         uses: actions/upload-artifact@v4
         with:
-          name: julie-semantic-sidecar-${{ matrix.name }}
+          name: artifact-candidate-${{ matrix.profile }}
           path: |
             dist/*.tar.gz
             dist/*.zip
             dist/*.sha256
+            dist/${{ matrix.profile }}/package-manifest.json
+            artifact-validation/${{ matrix.profile }}/raw-logs/**
+            artifact-validation/${{ matrix.profile }}/archive.sha256
+            artifact-validation/${{ matrix.profile }}/identity.txt
+            artifact-validation/${{ matrix.profile }}/package-manifest.json
+            package.log
           if-no-files-found: error

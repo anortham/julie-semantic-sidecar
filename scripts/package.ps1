@@ -7,8 +7,7 @@ param(
         "linux-x64-cuda-vendor",
         "windows-x64-cuda-vendor"
     )]
-    [string]$Profile,
-    [switch]$Smoke
+    [string]$Profile
 )
 
 $ErrorActionPreference = "Stop"
@@ -97,29 +96,6 @@ if ($settings.Target.Contains("linux") -and $settings.Features.Contains("dynamic
     $dynamic = & readelf -d (Join-Path $stage $exe)
     if (($dynamic -join "`n") -notmatch '(RPATH|RUNPATH).*\$ORIGIN') {
         throw "Linux dynamic executable lacks an `$ORIGIN runpath"
-    }
-}
-
-if ($Smoke) {
-    & (Join-Path $stage $exe) --version
-    if ($LASTEXITCODE -ne 0) { throw "package version smoke failed" }
-    $smokeCache = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Path $smokeCache | Out-Null
-    $oldCache = $env:JULIE_EMBEDDING_CACHE_DIR
-    try {
-        $env:JULIE_EMBEDDING_CACHE_DIR = $smokeCache
-        $requests = @(
-            '{"schema":"julie.embedding.sidecar","version":1,"request_id":"health","method":"health","params":{}}',
-            '{"schema":"julie.embedding.sidecar","version":1,"request_id":"stop","method":"shutdown","params":{}}'
-        )
-        $smokeOutput = $requests | & (Join-Path $stage $exe) serve
-        if (($smokeOutput -join "`n") -notmatch '"ready":false' -or ($smokeOutput -join "`n") -notmatch '"stopping":true') {
-            throw "package protocol smoke failed"
-        }
-    }
-    finally {
-        $env:JULIE_EMBEDDING_CACHE_DIR = $oldCache
-        Remove-Item -Recurse -Force $smokeCache
     }
 }
 

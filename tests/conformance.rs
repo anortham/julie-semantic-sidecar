@@ -13,6 +13,7 @@
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -21,6 +22,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_julie-semantic-sidecar");
+const CONFORMANCE_BIN_ENV: &str = "JULIE_CONFORMANCE_BIN";
+const CONFORMANCE_UNAVAILABLE_BACKEND_ENV: &str = "JULIE_CONFORMANCE_UNAVAILABLE_BACKEND";
 
 /// Frozen tolerance policy — these three numbers are the bar.
 const NORM_TOLERANCE: f64 = 1e-3;
@@ -233,25 +236,28 @@ struct Spawn<'a> {
 
 impl Sidecar {
     fn spawn(options: Spawn<'_>) -> Self {
-        let mut command = Command::new(BIN);
+        let binary = runtime_binary_path(std::env::var_os(CONFORMANCE_BIN_ENV));
+        let mut command = Command::new(&binary);
         command.arg("serve");
         if let Some(model) = options.model {
             command.arg("--model").arg(model);
         }
+        let backend = options
+            .force_backend
+            .map(str::to_owned)
+            .or_else(|| std::env::var("JULIE_SIDECAR_FORCE_BACKEND").ok())
+            .unwrap_or_else(|| "cpu".to_string());
         command
-            .env(
-                "JULIE_SIDECAR_FORCE_BACKEND",
-                options.force_backend.unwrap_or("cpu"),
-            )
+            .env("JULIE_SIDECAR_FORCE_BACKEND", backend)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Discarded rather than piped: a long group C session logs enough to fill a
-            // pipe buffer, and a full stderr pipe with no reader deadlocks the child.
             .stderr(Stdio::null());
         if let Some(dir) = options.cache_dir {
             command.env("JULIE_EMBEDDING_CACHE_DIR", dir);
         }
-        let mut child = command.spawn().expect("spawn the release sidecar");
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn {}: {error}", binary.display()));
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         let watchdog_done = arm_watchdog(child.id());
@@ -347,6 +353,12 @@ impl Sidecar {
     }
 }
 
+fn runtime_binary_path(override_path: Option<OsString>) -> PathBuf {
+    override_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(BIN))
+}
+
 impl Drop for Sidecar {
     fn drop(&mut self) {
         self.watchdog_done.store(true, Ordering::SeqCst);
@@ -422,12 +434,27 @@ fn pass(row: &str, detail: &str) {
     println!("PASS {row:<4} {detail}");
 }
 
+fn requested_backend_violation(health: &Value, requested: &str) -> Option<String> {
+    let resolved = health["resolved_backend"].as_str().unwrap_or("<missing>");
+    let accelerated = health["accelerated"].as_bool().unwrap_or(false);
+    let matches = if requested == "cpu" {
+        resolved == "cpu" && !accelerated
+    } else {
+        resolved == requested && accelerated
+    };
+    (!matches).then(|| {
+        format!(
+            "requested backend did not resolve: requested={requested} resolved={resolved} accelerated={accelerated}"
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Group A — envelope and method conformance
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "spawns the real sidecar with the prepared qwen3 model"]
+#[ignore = "spawns the real sidecar with the prepared default BGE model"]
 fn group_a_envelope_and_method_rows() {
     let mut sidecar = Sidecar::spawn(Spawn::default());
 
@@ -436,6 +463,13 @@ fn group_a_envelope_and_method_rows() {
     let result = &health["result"];
     let ready = result["ready"].as_bool().expect("A7 ready boolean");
     assert!(ready, "A7 the prepared model must serve ready: {health}");
+    let requested = std::env::var("JULIE_SIDECAR_FORCE_BACKEND")
+        .ok()
+        .filter(|backend| !backend.is_empty())
+        .unwrap_or_else(|| "cpu".to_string());
+    if let Some(violation) = requested_backend_violation(result, &requested) {
+        panic!("A7 {violation}: {health}");
+    }
     let dims = result["dims"].as_u64().expect("A7 dims when ready") as usize;
     pass("A7", &format!("ready=true dims={dims}"));
 
@@ -681,7 +715,7 @@ fn group_a_envelope_and_method_rows() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "spawns the real sidecar with the prepared qwen3 model"]
+#[ignore = "spawns the real sidecar with the prepared default BGE model"]
 fn group_b1_stdin_eof_exits_the_process() {
     let mut sidecar = Sidecar::spawn(Spawn::default());
     sidecar.request("h1", "health", json!({}));
@@ -693,7 +727,7 @@ fn group_b1_stdin_eof_exits_the_process() {
 }
 
 #[test]
-#[ignore = "spawns the real sidecar with the prepared qwen3 model"]
+#[ignore = "spawns the real sidecar with the prepared default BGE model"]
 fn group_b2_sigkill_leaves_no_orphan_or_lock_residue() {
     let cache = default_cache_dir();
     let before = cache_entries(&cache);
@@ -754,7 +788,7 @@ fn group_b3_an_empty_cache_reports_exactly_model_not_prepared() {
 }
 
 #[test]
-#[ignore = "spawns the real sidecar with the prepared qwen3 model"]
+#[ignore = "spawns the real sidecar with the prepared default BGE model"]
 fn group_b4_cold_start_answers_health_inside_the_init_budget() {
     let started = Instant::now();
     let mut sidecar = Sidecar::spawn(Spawn::default());
@@ -781,7 +815,7 @@ fn group_b4_cold_start_answers_health_inside_the_init_budget() {
 }
 
 #[test]
-#[ignore = "spawns the real sidecar with the prepared qwen3 model"]
+#[ignore = "spawns the real sidecar with the prepared default BGE model"]
 fn group_b5_a_two_hundred_fifty_text_batch_answers_inside_the_request_budget() {
     let corpus: Vec<CorpusRow> = read_jsonl(&fixtures_dir().join("corpus.jsonl"));
     let probe = corpus
@@ -824,10 +858,11 @@ fn group_b5_a_two_hundred_fifty_text_batch_answers_inside_the_request_budget() {
 }
 
 #[test]
-#[ignore = "spawns the real sidecar with the prepared qwen3 model"]
+#[ignore = "spawns the real sidecar with the prepared default BGE model"]
 fn group_b6_a_forced_unavailable_backend_stays_ready_and_degraded() {
+    let unavailable = unavailable_backend();
     let mut sidecar = Sidecar::spawn(Spawn {
-        force_backend: Some("vulkan"),
+        force_backend: Some(&unavailable),
         ..Spawn::default()
     });
     let health = sidecar.request("h1", "health", json!({}));
@@ -866,6 +901,16 @@ fn group_b6_a_forced_unavailable_backend_stays_ready_and_degraded() {
         "B6",
         &format!("forced {requested} resolved {resolved}: ready:true, accelerated:false, reason non-null, exit 0 (unavailable-backend fallback on a CPU-only build; benchmark-selects-CPU-over-live-GPU is deferred to the accelerated-builds follow-up)"),
     );
+}
+
+fn unavailable_backend() -> String {
+    if let Ok(backend) = std::env::var(CONFORMANCE_UNAVAILABLE_BACKEND_ENV) {
+        return backend;
+    }
+    match std::env::var("JULIE_SIDECAR_FORCE_BACKEND").as_deref() {
+        Ok("vulkan") | Ok("cuda") => "metal".to_string(),
+        _ => "vulkan".to_string(),
+    }
 }
 
 fn default_cache_dir() -> PathBuf {
@@ -1191,4 +1236,109 @@ fn the_lane_reconstruction_recovers_the_golden_direction() {
         check_vector(&vector, &reconstructed, 512).is_empty(),
         "int8 reconstruction must stay inside the cosine bar"
     );
+}
+
+fn repository_file(path: &str) -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+        .unwrap_or_else(|error| panic!("read {path}: {error}"))
+}
+
+#[test]
+fn conformance_entry_points_accept_an_archive_binary_and_requested_backend() {
+    let script = repository_file("scripts/conformance.sh");
+
+    assert!(script.contains("--binary"));
+    assert!(script.contains("--backend"));
+    assert!(script.contains("JULIE_CONFORMANCE_BIN"));
+    assert!(!script.contains("cargo build --release"));
+}
+
+#[test]
+fn binary_path_override_precedes_the_cargo_built_binary() {
+    assert_eq!(
+        runtime_binary_path(Some(OsString::from("/tmp/unpacked-sidecar"))),
+        PathBuf::from("/tmp/unpacked-sidecar")
+    );
+    assert_eq!(runtime_binary_path(None), PathBuf::from(BIN));
+}
+
+#[test]
+fn accelerator_conformance_rejects_cpu_fallback() {
+    let health = json!({
+        "resolved_backend": "cpu",
+        "accelerated": false,
+    });
+
+    let violation = requested_backend_violation(&health, "metal");
+    assert_eq!(
+        violation.as_deref(),
+        Some("requested backend did not resolve: requested=metal resolved=cpu accelerated=false")
+    );
+}
+
+#[test]
+fn hardware_smoke_entry_points_require_an_exact_unpacked_archive() {
+    for path in ["scripts/hardware-smoke.sh", "scripts/hardware-smoke.ps1"] {
+        let script = repository_file(path);
+
+        assert!(script.contains("archive"), "{path}");
+        assert!(script.contains("sha256"), "{path}");
+        assert!(script.contains("package-manifest.json"), "{path}");
+        assert!(script.contains("backend-selection.json"), "{path}");
+        assert!(script.contains("software"), "{path}");
+        assert!(script.contains("conformance"), "{path}");
+        assert!(script.contains("--batch 1"), "{path}");
+        assert!(script.contains("--batch 16"), "{path}");
+        assert!(
+            script.contains("archive member is not flat and safe"),
+            "{path}"
+        );
+    }
+
+    let bash = repository_file("scripts/hardware-smoke.sh");
+    assert!(bash.contains("smoke_env+=(-u JULIE_SIDECAR_FORCE_BACKEND)"));
+    assert!(bash.contains(
+        "JULIE_EMBEDDING_CACHE_DIR=\"$cache_dir\" JULIE_CONFORMANCE_UNAVAILABLE_BACKEND"
+    ));
+    assert!(bash.contains("JULIE_CONFORMANCE_UNAVAILABLE_BACKEND=\"$fallback_backend\""));
+}
+
+#[test]
+fn packaging_adapters_do_not_smoke_staged_layouts() {
+    let bash = repository_file("scripts/package.sh");
+    let powershell = repository_file("scripts/package.ps1");
+
+    assert!(!bash.contains("--smoke"));
+    assert!(!bash.contains("run_smoke"));
+    assert!(!powershell.contains("[switch]$Smoke"));
+    assert!(!powershell.contains("if ($Smoke)"));
+}
+
+#[test]
+fn ci_names_portable_packages_as_artifact_validation_not_support_evidence() {
+    let workflow = repository_file(".github/workflows/ci.yml");
+
+    assert!(workflow.contains("artifact validation"));
+    assert!(workflow.contains("apple-arm64-metal-portable"));
+    assert!(workflow.contains("linux-x64-vulkan-portable"));
+    assert!(workflow.contains("windows-x64-vulkan-portable"));
+    assert!(workflow.contains("not support evidence"));
+    assert!(workflow.contains("hardware-smoke.ps1"));
+}
+
+#[test]
+fn release_is_checksum_bound_approval_gated_and_artifact_only() {
+    let workflow = repository_file(".github/workflows/release.yml");
+
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("expected_archive_sha256"));
+    assert!(workflow.contains("hardware_lane"));
+    assert!(workflow.contains("environment: artifact-release-approval"));
+    assert!(workflow.contains("package-manifest.json"));
+    assert!(workflow.contains("raw-logs"));
+    assert!(workflow.contains("hardware-smoke.ps1"));
+    assert!(!workflow.contains("macos-15-intel"));
+    assert!(!workflow.contains("gh release"));
+    assert!(!workflow.contains("action-gh-release"));
+    assert!(!workflow.contains("git tag"));
 }

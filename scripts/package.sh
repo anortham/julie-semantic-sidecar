@@ -5,11 +5,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 profile=""
-run_smoke=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile) profile="${2:?--profile needs a value}"; shift 2 ;;
-    --smoke) run_smoke=1; shift ;;
     *) echo "package: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -132,17 +130,6 @@ if [[ "$target" == *linux* && "$features" == *dynamic-backends* ]]; then
     echo "package: Linux dynamic executable lacks an \$ORIGIN runpath" >&2
     exit 1
   fi
-fi
-
-if [[ "$run_smoke" == "1" ]]; then
-  "$stage/$exe" --version
-  smoke_cache="$(mktemp -d)"
-  smoke_out="$({ printf '%s\n' \
-    '{"schema":"julie.embedding.sidecar","version":1,"request_id":"health","method":"health","params":{}}' \
-    '{"schema":"julie.embedding.sidecar","version":1,"request_id":"stop","method":"shutdown","params":{}}'; } \
-    | JULIE_EMBEDDING_CACHE_DIR="$smoke_cache" "$stage/$exe" serve)"
-  rm -rf "$smoke_cache"
-  [[ "$smoke_out" == *'"ready":false'* && "$smoke_out" == *'"stopping":true'* ]]
 fi
 
 archive_base="julie-semantic-sidecar-${version}-${target}-${backend}-${tier}"

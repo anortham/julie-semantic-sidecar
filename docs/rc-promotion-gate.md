@@ -7,8 +7,9 @@ target hardware against the exact archive checksum under consideration before pr
 
 ## Gate items
 
-1. **Protocol conformance suite** — `scripts/conformance.sh` passes (groups A, B, C of
-   `semantic-sidecar-protocol-v1.md` § Conformance). No changes to its pass rule.
+1. **Protocol conformance suite** — `scripts/conformance.sh --binary <unpacked-binary> --backend
+   <cpu|metal|vulkan|cuda>` passes groups A, B, and C of `semantic-sidecar-protocol-v1.md` for CPU
+   and the advertised accelerator. Both runs use the same Rust harness and BGE/Qwen golden vectors.
 2. **Unit tests, both feature sets** — `cargo test` and `cargo test --features metal` both green.
    Every added supported build profile also runs its profile-specific tests; the existing assertions
    are not weakened.
@@ -16,23 +17,66 @@ target hardware against the exact archive checksum under consideration before pr
    manifest: target, portability tier, advertised backend, sidecar version, native build identity,
    file inventory, per-file checksums, and archive SHA-256. The archive contains no model weights,
    development paths, or undeclared native libraries.
-4. **Packaged smoke** — the release archive built by `scripts/package.sh --smoke` unpacks, its
-   bundled binary answers `--version`, and an offline `health` probe against an empty cache dir
-   reports `ready: false` / `degraded_reason: "model_not_prepared"` (the archive ships no model,
-   so the smoke proves the fail-loud path — a `ready: false` here is the expected pass).
-5. **Real-device archive proof** — the exact archive SHA-256 passes ready `health`, `embed_query`,
-   `embed_batch`, shutdown, and every applicable golden vector on a real compatible GPU. Record the
-   GPU model, driver, runtime, selected backend, raw results, and package manifest. Compilation,
-   archive creation, and software rendering do not satisfy this item.
+4. **Unpacked artifact validation** — `scripts/hardware-smoke.sh --artifact-validation` or
+   `scripts/hardware-smoke.ps1 -ArtifactValidation` verifies the supplied SHA-256, extracts into a
+   new temporary directory, validates the flat manifest inventory, runs that extracted binary's
+   `--version`, and proves absent-model health plus clean shutdown and stdout purity. This compile
+   and package proof is explicitly not support evidence.
+5. **Real-device archive proof** — the same command without artifact-validation prepares BGE and
+   Qwen, passes ready `health`, `embed_query`, `embed_batch`, shutdown, stdout purity, and both models'
+   complete conformance vectors on CPU and the advertised accelerator. It rejects software renderers
+   and records the GPU, driver, runtime, exact archive SHA-256, manifest, and raw logs.
 6. **CPU fallback from the same archive** — the exact archive SHA-256 remains ready and reports CPU
    with a non-null degradation reason when its accelerator is forced unavailable or fails to load.
    Run this for every supported portable and vendor-specific archive.
-7. **Throughput floor (this document)** — the packaged binary sustains
+7. **Selection and measurements** — remove and rebuild `backend-selection.json`, prove a second start
+   reuses the same selection, and record fixed batch-1 and 16-text indexing-batch measurements for CPU
+   and accelerator. The accelerator may resolve by default only when the first-start benchmark wins.
+8. **Throughput floor (this document)** — the packaged binary sustains
    **≥ 40 units/s steady-state on the M2 Ultra reference machine (64-text batches, warm model)**,
    measured by `scripts/bench-throughput.py`.
 
 Items defined by scripts retain their script-level pass rules. This document adds the checksum-bound
 package, hardware, fallback, and throughput promotion rules.
+
+## Archive proof commands
+
+The scripts accept only an archive plus its exact expected checksum. They never execute a binary from
+`target/` or the package staging directory.
+
+```bash
+scripts/hardware-smoke.sh \
+  --archive /path/to/julie-semantic-sidecar-archive.tar.gz \
+  --sha256 <64-lowercase-hex> \
+  --backend metal \
+  --lane apple-arm64-metal-portable \
+  --cache-dir /path/to/proof-cache \
+  --fixtures /path/to/miller/eval/sidecar-conformance \
+  --evidence-dir /path/to/evidence
+```
+
+```powershell
+scripts/hardware-smoke.ps1 `
+  -Archive C:\path\to\julie-semantic-sidecar-archive.zip `
+  -Sha256 <64-lowercase-hex> `
+  -Backend vulkan `
+  -Lane windows-x64-vulkan-portable `
+  -CacheDir C:\path\to\proof-cache `
+  -FixturesDir C:\path\to\miller\eval\sidecar-conformance `
+  -EvidenceDir C:\path\to\evidence
+```
+
+The evidence directory contains the package manifest, checksum, device/runtime identities, selection
+cache, protocol smoke output, CPU and accelerator conformance logs, and batch-1/indexing-batch results.
+Review this evidence before changing support status; script success does not promote a backend.
+
+## Artifact workflow boundary
+
+The manual artifact workflow requires the protected `artifact-release-approval` environment plus an
+exact `hardware_lane` and `expected_archive_sha256`. It always builds the three portable candidates
+and optionally builds CUDA candidates. Outputs remain workflow artifacts containing archives,
+checksums, manifests, and raw validation logs. The workflow does not publish, tag, promote a backend,
+change the Miller pin, or create public assets.
 
 ## Portable and vendor-specific lanes
 

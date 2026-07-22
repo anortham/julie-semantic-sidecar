@@ -224,10 +224,10 @@ Metal remains compiled into the Apple Silicon executable, so its manifest declar
 
 **Acceptance:**
 
-- [ ] Package smokes execute only from an unpacked archive.
-- [ ] CPU and advertised accelerators use the same protocol and golden-vector surface.
-- [ ] Workflow names and findings distinguish compile proof from real-device proof.
-- [ ] No workflow creates a tag, GitHub release, public asset, or Miller pin automatically.
+- [x] Package smokes execute only from an unpacked archive.
+- [x] CPU and advertised accelerators use the same protocol and golden-vector surface.
+- [x] Workflow names and findings distinguish compile proof from real-device proof.
+- [x] No workflow creates a tag, GitHub release, public asset, or Miller pin automatically.
 
 ## Task 6: Prove the exact Apple Silicon Metal archive
 
