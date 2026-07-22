@@ -9,6 +9,7 @@
 //! testable without a model — the engine supplies the real closure.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -136,6 +137,7 @@ where
 {
     let batch_1 = [BACKEND_PROBE_TEXTS[0].to_string()];
     let batch_16 = BACKEND_PROBE_TEXTS.map(str::to_string);
+    probe(candidate, &batch_1)?;
     Ok(backend_select::ProbeTiming {
         batch_1: probe(candidate, &batch_1)?,
         batch_16: probe(candidate, &batch_16)?,
@@ -152,7 +154,7 @@ fn forced_cpu_runtime_with<M, D, B>(
 ) -> Result<backend_select::RuntimeSelection, EngineError>
 where
     M: FnOnce(&Path) -> Result<(), String>,
-    D: FnOnce() -> Result<backend_select::Discovery, String>,
+    D: FnOnce() -> backend_select::Discovery,
     B: FnMut(&backend_select::BackendCandidate) -> Result<backend_select::ProbeTiming, String>,
 {
     load_modules(executable).map_err(|reason| EngineError::new("BackendDiscovery", reason))?;
@@ -237,7 +239,7 @@ impl LlamaEngine {
                 LlamaBackend::init()
                     .map_err(|err| EngineError::new("BackendInit", err.to_string()))?,
             );
-            return Self::load_final(pin, path, backend, runtime);
+            return Self::load_final(pin, cache_dir, path, backend, runtime);
         }
 
         let executable = std::env::current_exe().map_err(|err| {
@@ -253,16 +255,16 @@ impl LlamaEngine {
             native_build_identity: backend_select::NATIVE_BUILD_IDENTITY,
             packaged_backend_identity: &package_identity,
         };
-        let module_result = backend_select::load_packaged_modules_from_executable(&executable);
+        let module_report = backend_select::load_packaged_modules_from_executable(&executable)
+            .map_err(|reason| EngineError::new("BackendDiscovery", reason))?;
         let backend = Rc::new(
             LlamaBackend::init().map_err(|err| EngineError::new("BackendInit", err.to_string()))?,
         );
-        let discovery = module_result.map(|()| {
-            backend_select::discover_candidates(
-                &backend_select::DeclaredBackends::build(),
-                &runtime_devices(),
-            )
-        });
+        let mut discovery = backend_select::discover_candidates(
+            &backend_select::DeclaredBackends::build(),
+            &runtime_devices(),
+        );
+        discovery.accelerator_failures = module_report.accelerator_failures;
         let runtime = backend_select::select_runtime_with(
             cache_dir,
             context,
@@ -271,11 +273,12 @@ impl LlamaEngine {
             |candidate| Self::benchmark_candidate(pin, path, &backend, candidate),
         )
         .map_err(|reason| EngineError::new("BackendProbe", reason))?;
-        Self::load_final(pin, path, backend, runtime)
+        Self::load_final(pin, cache_dir, path, backend, runtime)
     }
 
     fn load_final(
         pin: &'static ModelPin,
+        cache_dir: &Path,
         path: &Path,
         backend: Rc<LlamaBackend>,
         runtime: backend_select::RuntimeSelection,
@@ -294,6 +297,7 @@ impl LlamaEngine {
         ) {
             Ok(engine) => Ok(engine),
             Err(error) if candidate.backend != backend_select::CPU => {
+                backend_select::invalidate_cached_selection(cache_dir, &runtime);
                 let mut capabilities = runtime.capabilities;
                 disable_capability(&mut capabilities, &candidate.backend);
                 let fallback = Selection::degraded_to_cpu(
@@ -865,25 +869,68 @@ fn model_params_for_candidate(
     Ok(params)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DriverIdentity {
+    value: String,
+    cacheable: bool,
+}
+
 fn runtime_devices() -> Vec<backend_select::RuntimeDevice> {
+    let mut identities = HashMap::new();
     list_llama_ggml_backend_devices()
         .into_iter()
-        .map(|device| backend_select::RuntimeDevice {
-            driver: driver_identity(&device.backend, &device.name, &device.description),
-            backend: device.backend,
-            index: device.index,
-            name: device.name,
-            description: device.description,
-            memory_total: device.memory_total,
+        .map(|device| {
+            let identity = cached_driver_identity_with(
+                &mut identities,
+                &device.backend,
+                &device.name,
+                &device.description,
+                &mut command_output,
+            );
+            backend_select::RuntimeDevice {
+                driver: identity.value,
+                driver_cacheable: identity.cacheable,
+                backend: device.backend,
+                index: device.index,
+                name: device.name,
+                description: device.description,
+                memory_total: device.memory_total,
+            }
         })
         .collect()
 }
 
-fn driver_identity(backend: &str, name: &str, description: &str) -> String {
-    driver_identity_with(backend, name, description, command_output)
+fn cached_driver_identity_with<F>(
+    identities: &mut HashMap<String, DriverIdentity>,
+    backend: &str,
+    name: &str,
+    description: &str,
+    output: &mut F,
+) -> DriverIdentity
+where
+    F: FnMut(&str, &[&str]) -> Option<String>,
+{
+    if backend.eq_ignore_ascii_case(backend_select::CPU) {
+        return DriverIdentity {
+            value: backend_select::CPU.to_string(),
+            cacheable: true,
+        };
+    }
+    let key = backend.to_ascii_lowercase();
+    if let Some(identity) = identities.get(&key) {
+        return identity.clone();
+    }
+    let identity = driver_identity_with(backend, name, description, output);
+    identities.insert(key, identity.clone());
+    identity
 }
 
-fn driver_identity_with<F>(backend: &str, name: &str, description: &str, mut output: F) -> String
+fn driver_identity_with<F>(
+    backend: &str,
+    name: &str,
+    description: &str,
+    mut output: F,
+) -> DriverIdentity
 where
     F: FnMut(&str, &[&str]) -> Option<String>,
 {
@@ -892,12 +939,18 @@ where
             "nvidia-smi",
             &["--query-gpu=driver_version", "--format=csv,noheader"],
         ) {
-            return format!("cuda:{value}");
+            return DriverIdentity {
+                value: format!("cuda:{value}"),
+                cacheable: true,
+            };
         }
     }
     if backend.eq_ignore_ascii_case(backend_select::VULKAN) {
         if let Some(value) = output("vulkaninfo", &["--summary"]) {
-            return format!("vulkan:{value}");
+            return DriverIdentity {
+                value: format!("vulkan:{value}"),
+                cacheable: true,
+            };
         }
     }
     if cfg!(target_os = "windows") {
@@ -909,7 +962,21 @@ where
                 "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion | ConvertTo-Json -Compress",
             ],
         ) {
-            return format!("windows-gpu:{value}");
+            return DriverIdentity {
+                value: format!("windows-gpu:{value}"),
+                cacheable: true,
+            };
+        }
+    }
+    if cfg!(target_os = "macos")
+        && (backend.eq_ignore_ascii_case(backend_select::METAL)
+            || backend.eq_ignore_ascii_case("MTL"))
+    {
+        if let Some(value) = output("sysctl", &["-n", "kern.osversion"]) {
+            return DriverIdentity {
+                value: format!("metal:{value}"),
+                cacheable: true,
+            };
         }
     }
     let platform = if cfg!(target_os = "macos") {
@@ -922,7 +989,12 @@ where
         None
     }
     .unwrap_or_else(|| "unknown".to_string());
-    format!("backend={backend};name={name};description={description};platform={platform}")
+    DriverIdentity {
+        value: format!(
+            "backend={backend};name={name};description={description};platform={platform};driver=unverified"
+        ),
+        cacheable: false,
+    }
 }
 
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
@@ -1298,7 +1370,11 @@ mod tests {
 
         assert_eq!(
             calls.into_inner(),
-            vec![(candidate.clone(), 1), (candidate, 16)]
+            vec![
+                (candidate.clone(), 1),
+                (candidate.clone(), 1),
+                (candidate, 16),
+            ]
         );
         assert_eq!(timing.batch_1, std::time::Duration::from_millis(1));
         assert_eq!(timing.batch_16, std::time::Duration::from_millis(16));
@@ -1310,6 +1386,7 @@ mod tests {
             driver_identity_with("Vulkan", "GPU 0", "Discrete GPU", |program, _| {
                 (program == "vulkaninfo").then(|| driver.to_string())
             })
+            .value
         };
         let discovery = |driver: String| {
             backend_select::discover_candidates(
@@ -1327,6 +1404,7 @@ mod tests {
                     description: "Discrete GPU".to_string(),
                     memory_total: 1024,
                     driver,
+                    driver_cacheable: true,
                 }],
             )
         };
@@ -1335,6 +1413,39 @@ mod tests {
             discovery(identity("driverVersion = 1")).machine,
             discovery(identity("driverVersion = 2")).machine
         );
+    }
+
+    #[test]
+    fn driver_lookup_is_cached_per_backend_and_skips_cpu() {
+        let calls = std::cell::Cell::new(0);
+        let mut cache = std::collections::HashMap::new();
+        let mut output = |program: &str, _: &[&str]| {
+            calls.set(calls.get() + 1);
+            (program == "vulkaninfo").then(|| "driverVersion = 1".to_string())
+        };
+
+        let cpu = cached_driver_identity_with(&mut cache, "CPU", "CPU", "Host CPU", &mut output);
+        let first = cached_driver_identity_with(
+            &mut cache,
+            "Vulkan",
+            "GPU 0",
+            "Integrated GPU",
+            &mut output,
+        );
+        let second =
+            cached_driver_identity_with(&mut cache, "Vulkan", "GPU 1", "Discrete GPU", &mut output);
+
+        assert_eq!(cpu.value, "cpu");
+        assert_eq!(first, second);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn missing_vulkan_driver_tool_marks_the_identity_uncacheable() {
+        let identity = driver_identity_with("Vulkan", "GPU 0", "Discrete GPU", |_, _| None);
+
+        assert!(!identity.cacheable);
+        assert!(identity.value.contains("driver=unverified"));
     }
 
     #[test]
@@ -1356,7 +1467,7 @@ mod tests {
                 packaged_backend_identity: "package-a",
             },
             None,
-            || Ok(backend_select::discover_candidates(&declared, &[])),
+            || backend_select::discover_candidates(&declared, &[]),
             |candidate| {
                 run_fixed_probes_with(candidate, |_, _| Err("inference failed".to_string()))
             },

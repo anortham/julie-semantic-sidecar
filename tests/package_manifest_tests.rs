@@ -1,3 +1,4 @@
+use julie_semantic_sidecar::backend_select;
 use julie_semantic_sidecar::package_manifest::{
     self, AdvertisedBackend, PackageFileRole, PackageManifest, PackageProfile, PackageTier,
     MANIFEST_FILE,
@@ -74,6 +75,22 @@ fn create_is_deterministic_and_records_sorted_verified_payloads_and_model_policy
         .files
         .iter()
         .all(|file| file.sha256.len() == 64 && file.size > 0));
+}
+
+#[test]
+fn packaged_backend_identity_includes_core_runtime_replacements() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    dynamic_stage(dir.path());
+    package_manifest::write(dir.path(), &vulkan_profile()).expect("write manifest");
+    let executable = dir.path().join("julie-semantic-sidecar");
+    let before = backend_select::packaged_backend_identity(&executable);
+
+    write(dir.path(), "libllama.so", b"replacement-llama-runtime");
+
+    assert_ne!(
+        backend_select::packaged_backend_identity(&executable),
+        before
+    );
 }
 
 #[test]

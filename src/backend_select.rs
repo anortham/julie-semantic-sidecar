@@ -6,8 +6,9 @@
 //! faster accelerator wins. Verdicts are cached per complete build, package, model, GPU,
 //! and driver identity, while forced CPU bypasses discovery, timing, and cache entirely.
 
-use std::collections::BTreeMap;
-use std::io::Write;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,8 +16,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::health::BackendCapabilities;
+use crate::package_manifest;
 
-/// Environment variable that pins the backend, bypassing benchmark and cache entirely.
+/// Environment variable that requests one backend and bypasses cached selection.
+///
+/// CPU also bypasses discovery and timing. Accelerators are still timed against CPU and
+/// resolve to CPU when unavailable, failing, tied, or slower.
 pub const FORCE_BACKEND_ENV: &str = "JULIE_SIDECAR_FORCE_BACKEND";
 
 /// Canonical name of the backend every build can serve.
@@ -33,9 +38,6 @@ pub const CUDA: &str = "cuda";
 
 /// File the cached benchmark choice is written to, beside the model cache.
 pub const SELECTION_CACHE_FILE: &str = "backend-selection.json";
-
-/// Reason reported when an accelerated backend was asked for and this build has none.
-pub const NO_ACCELERATED_BACKEND: &str = "cpu (no accelerated backend compiled)";
 
 /// Reproducible identity emitted by this crate's build script.
 pub const NATIVE_BUILD_IDENTITY: &str = env!("JULIE_NATIVE_BUILD_IDENTITY");
@@ -99,6 +101,7 @@ pub struct RuntimeDevice {
     pub description: String,
     pub memory_total: usize,
     pub driver: String,
+    pub driver_cacheable: bool,
 }
 
 /// A backend that can be placed explicitly for a probe or final model load.
@@ -114,7 +117,13 @@ pub struct Discovery {
     pub candidates: Vec<BackendCandidate>,
     pub capabilities: BackendCapabilities,
     pub machine: Machine,
+    pub accelerator_failures: Vec<String>,
     declared_accelerators: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModuleLoadReport {
+    pub accelerator_failures: Vec<String>,
 }
 
 /// Cache-key components known before runtime device discovery.
@@ -145,6 +154,7 @@ pub struct RuntimeSelection {
     pub selection: Selection,
     pub capabilities: BackendCapabilities,
     pub device_index: Option<usize>,
+    cache_key: Option<String>,
 }
 
 /// Identity of the machine's accelerator, as two cache-key components.
@@ -157,6 +167,7 @@ pub struct Machine {
     pub gpu: String,
     /// Driver identity, or `none` when the build sees no accelerator.
     pub driver: String,
+    pub cacheable: bool,
 }
 
 impl Machine {
@@ -165,6 +176,7 @@ impl Machine {
         Self {
             gpu: "none".to_string(),
             driver: "none".to_string(),
+            cacheable: true,
         }
     }
 }
@@ -221,27 +233,28 @@ pub fn discover_candidates(
     let mut capabilities = BackendCapabilities::cpu_only();
     let mut identity_parts = Vec::new();
     let mut driver_parts = Vec::new();
+    let mut cacheable = true;
 
     for backend in [METAL, VULKAN, CUDA] {
         if !declared.supports(backend) {
             continue;
         }
-        let Some(device) = runtime_devices
+        for device in runtime_devices
             .iter()
-            .find(|device| normalize_backend(&device.backend) == Some(backend))
-        else {
-            continue;
-        };
-        candidates.push(BackendCandidate {
-            backend: backend.to_string(),
-            device_index: Some(device.index),
-        });
-        set_capability(&mut capabilities, backend, true);
-        identity_parts.push(format!(
-            "{backend}:{}:{}:{}",
-            device.name, device.description, device.memory_total
-        ));
-        driver_parts.push(format!("{backend}:{}", device.driver));
+            .filter(|device| normalize_backend(&device.backend) == Some(backend))
+        {
+            candidates.push(BackendCandidate {
+                backend: backend.to_string(),
+                device_index: Some(device.index),
+            });
+            set_capability(&mut capabilities, backend, true);
+            identity_parts.push(format!(
+                "{backend}:{}:{}:{}:{}",
+                device.index, device.name, device.description, device.memory_total
+            ));
+            driver_parts.push(format!("{backend}:{}:{}", device.index, device.driver));
+            cacheable &= device.driver_cacheable;
+        }
     }
 
     Discovery {
@@ -253,8 +266,10 @@ pub fn discover_candidates(
             Machine {
                 gpu: identity_parts.join(","),
                 driver: driver_parts.join(","),
+                cacheable,
             }
         },
+        accelerator_failures: Vec::new(),
         declared_accelerators: declared.stable_accelerators().map(str::to_string).collect(),
     }
 }
@@ -268,7 +283,7 @@ pub fn select_runtime_with<D, B>(
     mut benchmark: B,
 ) -> Result<RuntimeSelection, String>
 where
-    D: FnOnce() -> Result<Discovery, String>,
+    D: FnOnce() -> Discovery,
     B: FnMut(&BackendCandidate) -> Result<ProbeTiming, String>,
 {
     let forced = forced.map(|value| value.trim().to_ascii_lowercase());
@@ -277,19 +292,11 @@ where
             selection: Selection::cpu(),
             capabilities: BackendCapabilities::cpu_only(),
             device_index: None,
+            cache_key: None,
         });
     }
 
-    let discovery = match discover() {
-        Ok(discovery) => discovery,
-        Err(reason) => {
-            return Ok(RuntimeSelection {
-                selection: Selection::new(forced.as_deref().unwrap_or(CPU), CPU, Some(reason)),
-                capabilities: BackendCapabilities::cpu_only(),
-                device_index: None,
-            });
-        }
-    };
+    let discovery = discover();
 
     if let Some(requested) = forced.as_deref() {
         if !matches!(requested, METAL | VULKAN | CUDA) {
@@ -300,26 +307,27 @@ where
             .iter()
             .any(|candidate| candidate.backend == requested)
         {
-            return Ok(degraded_runtime(
-                requested,
-                "requested backend is unavailable",
-            ));
+            let reason = if discovery.accelerator_failures.is_empty() {
+                "requested backend is unavailable".to_string()
+            } else {
+                discovery.accelerator_failures.join("; ")
+            };
+            return Ok(degraded_runtime(requested, &reason));
         }
     }
 
     let key = runtime_cache_key(context, &discovery.machine);
-    if forced.is_none() {
-        if let Some(cached) = read_runtime_cache(cache_dir, &key) {
-            let device_index = discovery
-                .candidates
-                .iter()
-                .find(|candidate| candidate.backend == cached.selection.resolved)
-                .and_then(|candidate| candidate.device_index);
-            return Ok(RuntimeSelection {
-                selection: cached.selection,
-                capabilities: cached.capabilities,
-                device_index,
-            });
+    if forced.is_none() && discovery.machine.cacheable && discovery.accelerator_failures.is_empty()
+    {
+        if let Some(mut cached) = read_runtime_cache(cache_dir, &key) {
+            if cached.device_index.is_none() && cached.selection.resolved != CPU {
+                cached.device_index = discovery
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.backend == cached.selection.resolved)
+                    .and_then(|candidate| candidate.device_index);
+            }
+            return Ok(cached);
         }
     }
 
@@ -351,10 +359,13 @@ where
         .or_else(|| discovery.declared_accelerators.first().cloned());
 
     let mut fastest: Option<(&BackendCandidate, ProbeTiming)> = None;
-    let mut failures = Vec::new();
+    let mut failures = discovery.accelerator_failures;
+    let mut usable_backends = BTreeSet::new();
+    let mut failed_backends = BTreeSet::new();
     for candidate in accelerated_candidates {
         match benchmark(candidate) {
             Ok(timing) => {
+                usable_backends.insert(candidate.backend.clone());
                 if fastest
                     .as_ref()
                     .is_none_or(|(_, current)| timing.total() < current.total())
@@ -363,10 +374,13 @@ where
                 }
             }
             Err(reason) => {
-                set_capability(&mut capabilities, &candidate.backend, false);
+                failed_backends.insert(candidate.backend.clone());
                 failures.push(format!("{} probe failed: {reason}", candidate.backend));
             }
         }
+    }
+    for backend in failed_backends.difference(&usable_backends) {
+        set_capability(&mut capabilities, backend, false);
     }
 
     let result = if let Some((winner, timing)) = fastest {
@@ -375,6 +389,7 @@ where
                 selection: Selection::new(&winner.backend, &winner.backend, None),
                 capabilities,
                 device_index: winner.device_index,
+                cache_key: None,
             }
         } else {
             RuntimeSelection {
@@ -384,6 +399,7 @@ where
                 ),
                 capabilities,
                 device_index: None,
+                cache_key: None,
             }
         }
     } else if let Some(requested) = requested {
@@ -398,16 +414,20 @@ where
             ),
             capabilities,
             device_index: None,
+            cache_key: None,
         }
     } else {
         RuntimeSelection {
             selection: Selection::cpu(),
             capabilities,
             device_index: None,
+            cache_key: None,
         }
     };
 
-    if forced.is_none() {
+    let mut result = result;
+    if forced.is_none() && discovery.machine.cacheable && failures.is_empty() {
+        result.cache_key = Some(key.clone());
         write_runtime_cache(cache_dir, &key, &result);
     }
     Ok(result)
@@ -418,6 +438,7 @@ fn degraded_runtime(requested: &str, reason: &str) -> RuntimeSelection {
         selection: Selection::degraded_to_cpu(requested, reason),
         capabilities: BackendCapabilities::cpu_only(),
         device_index: None,
+        cache_key: None,
     }
 }
 
@@ -441,11 +462,21 @@ pub fn packaged_backend_identity(executable: &Path) -> String {
     let mut hash = Sha256::new();
     hash.update(declared.identity());
     if let Some(directory) = executable.parent() {
+        if let Ok(identity) = package_manifest::runtime_identity(directory) {
+            hash.update(identity);
+            return format!("{:x}", hash.finalize());
+        }
         if let Ok(paths) = packaged_module_paths(directory, &declared) {
             for path in paths {
                 hash.update(path.file_name().unwrap_or_default().as_encoded_bytes());
-                if let Ok(bytes) = std::fs::read(path) {
-                    hash.update(bytes);
+                if let Ok(mut file) = File::open(path) {
+                    let mut buffer = [0u8; 64 * 1024];
+                    while let Ok(read) = file.read(&mut buffer) {
+                        if read == 0 {
+                            break;
+                        }
+                        hash.update(&buffer[..read]);
+                    }
                 }
             }
         }
@@ -486,6 +517,8 @@ struct RuntimeCachedChoice {
     cuda: bool,
     metal: bool,
     vulkan: bool,
+    #[serde(default)]
+    device_index: Option<usize>,
 }
 
 impl RuntimeCachedChoice {
@@ -497,6 +530,7 @@ impl RuntimeCachedChoice {
             cuda: selection.capabilities.cuda,
             metal: selection.capabilities.metal,
             vulkan: selection.capabilities.vulkan,
+            device_index: selection.device_index,
         }
     }
 
@@ -510,7 +544,8 @@ impl RuntimeCachedChoice {
                 vulkan: self.vulkan,
                 ..Default::default()
             },
-            device_index: None,
+            device_index: self.device_index,
+            cache_key: None,
         }
     }
 }
@@ -539,13 +574,33 @@ fn read_runtime_store(cache_dir: &Path) -> RuntimeCache {
 }
 
 fn read_runtime_cache(cache_dir: &Path, key: &str) -> Option<RuntimeSelection> {
-    read_runtime_store(cache_dir)
+    let mut selection = read_runtime_store(cache_dir)
         .entries
         .remove(key)
-        .map(RuntimeCachedChoice::into_runtime)
+        .map(RuntimeCachedChoice::into_runtime)?;
+    selection.cache_key = Some(key.to_string());
+    Some(selection)
 }
 
 fn write_runtime_cache(cache_dir: &Path, key: &str, selection: &RuntimeSelection) {
+    mutate_runtime_cache(cache_dir, |store| {
+        store.entries.insert(
+            key.to_string(),
+            RuntimeCachedChoice::from_runtime(selection),
+        );
+    });
+}
+
+pub fn invalidate_cached_selection(cache_dir: &Path, selection: &RuntimeSelection) {
+    let Some(key) = selection.cache_key.as_deref() else {
+        return;
+    };
+    mutate_runtime_cache(cache_dir, |store| {
+        store.entries.remove(key);
+    });
+}
+
+fn mutate_runtime_cache(cache_dir: &Path, mutate: impl FnOnce(&mut RuntimeCache)) {
     if std::fs::create_dir_all(cache_dir).is_err() {
         return;
     }
@@ -562,10 +617,7 @@ fn write_runtime_cache(cache_dir: &Path, key: &str, selection: &RuntimeSelection
         return;
     }
     let mut store = read_runtime_store(cache_dir);
-    store.entries.insert(
-        key.to_string(),
-        RuntimeCachedChoice::from_runtime(selection),
-    );
+    mutate(&mut store);
     let Ok(encoded) = serde_json::to_vec(&store) else {
         return;
     };
@@ -671,11 +723,12 @@ fn load_packaged_modules_with<S, L>(
     include_accelerators: bool,
     mut score_cpu_variant: S,
     mut loader: L,
-) -> Result<(), String>
+) -> Result<ModuleLoadReport, String>
 where
     S: FnMut(&Path) -> Result<i32, String>,
     L: FnMut(&Path) -> Result<(), String>,
 {
+    let mut report = ModuleLoadReport::default();
     load_modules_from_executable_with(executable, |directory| {
         let paths = packaged_module_paths_for_scope(directory, declared, include_accelerators)?;
         let cpu_base_name = module_file_name(CPU);
@@ -720,11 +773,17 @@ where
                 name != Some(cpu_base_name.as_str())
                     && !name.is_some_and(|name| name.starts_with(&cpu_variant_prefix))
             }) {
-                let _ = loader(path);
+                if let Err(reason) = loader(path) {
+                    report.accelerator_failures.push(format!(
+                        "llama.cpp could not load packaged accelerator backend module {}: {reason}",
+                        path.display()
+                    ));
+                }
             }
         }
         Ok(())
-    })
+    })?;
+    Ok(report)
 }
 
 /// Loads only packaged CPU sibling modules through an injected native loader.
@@ -744,6 +803,7 @@ where
         score_cpu_variant,
         loader,
     )
+    .map(|_| ())
 }
 
 #[cfg(feature = "dynamic-backends")]
@@ -775,7 +835,9 @@ fn load_native_module(path: &Path) -> Result<(), String> {
 
 /// Loads only explicitly declared sibling modules and never consults loader search paths.
 #[cfg(feature = "dynamic-backends")]
-pub fn load_packaged_modules_from_executable(executable: &Path) -> Result<(), String> {
+pub fn load_packaged_modules_from_executable(
+    executable: &Path,
+) -> Result<ModuleLoadReport, String> {
     let declared = DeclaredBackends::build();
     load_packaged_modules_with(
         executable,
@@ -798,8 +860,10 @@ pub fn load_packaged_cpu_modules_from_executable(executable: &Path) -> Result<()
 
 /// Static builds have no sibling modules to load.
 #[cfg(not(feature = "dynamic-backends"))]
-pub fn load_packaged_modules_from_executable(_executable: &Path) -> Result<(), String> {
-    Ok(())
+pub fn load_packaged_modules_from_executable(
+    _executable: &Path,
+) -> Result<ModuleLoadReport, String> {
+    Ok(ModuleLoadReport::default())
 }
 
 /// Static builds link their CPU backend and have no sibling module to load.
@@ -841,6 +905,7 @@ mod task3_tests {
             description: description.to_string(),
             memory_total: 1024,
             driver: "driver-a".to_string(),
+            driver_cacheable: true,
         }
     }
 
@@ -891,6 +956,40 @@ mod task3_tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn discovery_keeps_every_declared_device_for_timed_selection() {
+        let found = discover_candidates(
+            &declared(),
+            &[
+                device("Vulkan", 2, "Integrated GPU"),
+                RuntimeDevice {
+                    memory_total: 8192,
+                    ..device("Vulkan", 7, "Discrete GPU")
+                },
+            ],
+        );
+
+        assert_eq!(
+            found.candidates,
+            vec![
+                BackendCandidate {
+                    backend: CPU.to_string(),
+                    device_index: None,
+                },
+                BackendCandidate {
+                    backend: VULKAN.to_string(),
+                    device_index: Some(2),
+                },
+                BackendCandidate {
+                    backend: VULKAN.to_string(),
+                    device_index: Some(7),
+                },
+            ]
+        );
+        assert!(found.machine.gpu.contains("Integrated GPU"));
+        assert!(found.machine.gpu.contains("Discrete GPU"));
     }
 
     #[test]
@@ -955,10 +1054,10 @@ mod task3_tests {
             context(),
             Some("VULKAN"),
             || {
-                Ok(discovery(&[
+                discovery(&[
                     device("Metal", 1, "Apple GPU"),
                     device("Vulkan", 2, "Vulkan GPU"),
-                ]))
+                ])
             },
             |candidate| {
                 seen.borrow_mut().push(candidate.backend.clone());
@@ -984,7 +1083,7 @@ mod task3_tests {
                 dir.path(),
                 context(),
                 Some(forced),
-                || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+                || discovery(&[device("Vulkan", 2, "Vulkan GPU")]),
                 |candidate| {
                     assert_eq!(candidate.backend, CPU);
                     Ok(timing(20, 200))
@@ -995,6 +1094,54 @@ mod task3_tests {
             assert_eq!(selected.selection.resolved, CPU);
             assert!(selected.selection.degraded_reason.is_some());
         }
+    }
+
+    #[test]
+    fn accelerator_load_failures_are_reported_and_not_cached() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declared = DeclaredBackends {
+            metal: false,
+            vulkan: true,
+            cuda: false,
+            rocm: false,
+            dynamic_backends: true,
+        };
+        let mut found = discover_candidates(&declared, &[]);
+        found.accelerator_failures = vec!["vulkan module: missing loader".to_string()];
+        let selected = select_runtime_with(
+            dir.path(),
+            context(),
+            None,
+            || found,
+            |candidate| {
+                assert_eq!(candidate.backend, CPU);
+                Ok(timing(20, 200))
+            },
+        )
+        .expect("selection");
+
+        assert_eq!(selected.selection.requested, VULKAN);
+        assert_eq!(selected.selection.resolved, CPU);
+        assert_eq!(
+            selected.selection.degraded_reason.as_deref(),
+            Some("vulkan module: missing loader")
+        );
+        assert!(!dir.path().join(SELECTION_CACHE_FILE).exists());
+
+        let mut forced = discover_candidates(&declared, &[]);
+        forced.accelerator_failures = vec!["vulkan module: missing loader".to_string()];
+        let selected = select_runtime_with(
+            dir.path(),
+            context(),
+            Some(VULKAN),
+            || forced,
+            |_| panic!("unavailable forced backend must not benchmark"),
+        )
+        .expect("forced fallback");
+        assert_eq!(
+            selected.selection.degraded_reason.as_deref(),
+            Some("vulkan module: missing loader")
+        );
     }
 
     #[test]
@@ -1009,7 +1156,7 @@ mod task3_tests {
                 dir.path(),
                 context(),
                 None,
-                || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+                || discovery(&[device("Vulkan", 2, "Vulkan GPU")]),
                 |candidate| {
                     if candidate.backend == CPU {
                         Ok(timing(20, 200))
@@ -1023,6 +1170,10 @@ mod task3_tests {
             assert!(!selected.selection.accelerated);
             assert!(selected.selection.degraded_reason.is_some());
             assert!(!selected.capabilities.vulkan || accelerator.is_ok());
+            assert_eq!(
+                dir.path().join(SELECTION_CACHE_FILE).exists(),
+                accelerator.is_ok()
+            );
         }
     }
 
@@ -1033,7 +1184,7 @@ mod task3_tests {
             dir.path(),
             context(),
             None,
-            || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+            || discovery(&[device("Vulkan", 2, "Vulkan GPU")]),
             |candidate| {
                 if candidate.backend == CPU {
                     Err("cpu inference failed".to_string())
@@ -1076,7 +1227,7 @@ mod task3_tests {
                     dir.path(),
                     current,
                     None,
-                    || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+                    || discovery(&[device("Vulkan", 2, "Vulkan GPU")]),
                     |candidate| {
                         probes.set(probes.get() + 1);
                         Ok(if candidate.backend == CPU {
@@ -1109,7 +1260,7 @@ mod task3_tests {
                     dir.path(),
                     context(),
                     None,
-                    || Ok(discovery(&[gpu])),
+                    || discovery(&[gpu]),
                     |candidate| {
                         probes.set(probes.get() + 1);
                         Ok(if candidate.backend == CPU {
@@ -1126,6 +1277,37 @@ mod task3_tests {
     }
 
     #[test]
+    fn unverified_driver_identity_disables_cache_reuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probes = Cell::new(0);
+        let gpu = RuntimeDevice {
+            driver_cacheable: false,
+            ..device("Vulkan", 2, "Vulkan GPU")
+        };
+
+        for _ in 0..2 {
+            select_runtime_with(
+                dir.path(),
+                context(),
+                None,
+                || discovery(std::slice::from_ref(&gpu)),
+                |candidate| {
+                    probes.set(probes.get() + 1);
+                    Ok(if candidate.backend == CPU {
+                        timing(20, 200)
+                    } else {
+                        timing(10, 100)
+                    })
+                },
+            )
+            .expect("selection");
+        }
+
+        assert_eq!(probes.get(), 4);
+        assert!(!dir.path().join(SELECTION_CACHE_FILE).exists());
+    }
+
+    #[test]
     fn alternating_models_keep_both_cached_verdicts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let probes = Cell::new(0);
@@ -1137,7 +1319,7 @@ mod task3_tests {
                     ..context()
                 },
                 None,
-                || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+                || discovery(&[device("Vulkan", 2, "Vulkan GPU")]),
                 |candidate| {
                     probes.set(probes.get() + 1);
                     Ok(if candidate.backend == CPU {
@@ -1153,6 +1335,65 @@ mod task3_tests {
     }
 
     #[test]
+    fn cached_selection_reuses_the_exact_winning_device() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probes = Cell::new(0);
+        let devices = [
+            device("Vulkan", 2, "Integrated GPU"),
+            device("Vulkan", 7, "Discrete GPU"),
+        ];
+
+        for expected_probes in [3, 3] {
+            let selected = select_runtime_with(
+                dir.path(),
+                context(),
+                None,
+                || discovery(&devices),
+                |candidate| {
+                    probes.set(probes.get() + 1);
+                    Ok(match candidate.device_index {
+                        None => timing(20, 200),
+                        Some(2) => timing(15, 150),
+                        Some(7) => timing(5, 50),
+                        Some(index) => panic!("unexpected device {index}"),
+                    })
+                },
+            )
+            .expect("selection");
+
+            assert_eq!(selected.device_index, Some(7));
+            assert_eq!(probes.get(), expected_probes);
+        }
+    }
+
+    #[test]
+    fn one_failed_device_does_not_hide_a_usable_device_on_the_same_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let selected = select_runtime_with(
+            dir.path(),
+            context(),
+            None,
+            || {
+                discovery(&[
+                    device("Vulkan", 2, "Integrated GPU"),
+                    device("Vulkan", 7, "Discrete GPU"),
+                ])
+            },
+            |candidate| match candidate.device_index {
+                None => Ok(timing(20, 200)),
+                Some(2) => Err("device lost".to_string()),
+                Some(7) => Ok(timing(5, 50)),
+                Some(index) => panic!("unexpected device {index}"),
+            },
+        )
+        .expect("selection");
+
+        assert_eq!(selected.device_index, Some(7));
+        assert!(selected.capabilities.vulkan);
+        assert!(!dir.path().join(SELECTION_CACHE_FILE).exists());
+    }
+
+    #[test]
     fn corrupt_cache_recovers_by_probing_and_rewriting() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(SELECTION_CACHE_FILE), "not json").expect("seed");
@@ -1161,7 +1402,7 @@ mod task3_tests {
             dir.path(),
             context(),
             None,
-            || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+            || discovery(&[device("Vulkan", 2, "Vulkan GPU")]),
             |candidate| {
                 probes.set(probes.get() + 1);
                 Ok(if candidate.backend == CPU {
@@ -1178,6 +1419,37 @@ mod task3_tests {
             &std::fs::read(dir.path().join(SELECTION_CACHE_FILE)).expect("cache")
         )
         .is_ok());
+    }
+
+    #[test]
+    fn invalidating_a_cached_winner_forces_the_next_start_to_probe_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probes = Cell::new(0);
+        let select = || {
+            select_runtime_with(
+                dir.path(),
+                context(),
+                None,
+                || discovery(&[device("Vulkan", 2, "Vulkan GPU")]),
+                |candidate| {
+                    probes.set(probes.get() + 1);
+                    Ok(if candidate.backend == CPU {
+                        timing(20, 200)
+                    } else {
+                        timing(10, 100)
+                    })
+                },
+            )
+            .expect("selection")
+        };
+
+        let selected = select();
+        assert_eq!(probes.get(), 2);
+        invalidate_cached_selection(dir.path(), &selected);
+        let selected = select();
+
+        assert_eq!(selected.selection.resolved, VULKAN);
+        assert_eq!(probes.get(), 4);
     }
 
     #[test]
@@ -1315,6 +1587,42 @@ mod task3_tests {
                 module_file_name(METAL),
             ]
         );
+    }
+
+    #[test]
+    fn full_loader_reports_accelerator_module_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executable = dir.path().join("julie-semantic-sidecar");
+        std::fs::write(&executable, b"").expect("executable");
+        for backend in [CPU, VULKAN] {
+            std::fs::write(dir.path().join(module_file_name(backend)), b"module").expect("module");
+        }
+        let declared = DeclaredBackends {
+            metal: false,
+            vulkan: true,
+            cuda: false,
+            rocm: false,
+            dynamic_backends: true,
+        };
+
+        let report = load_packaged_modules_with(
+            &executable,
+            &declared,
+            true,
+            |_| Ok(1),
+            |path| {
+                if path.ends_with(module_file_name(VULKAN)) {
+                    Err("missing Vulkan loader".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect("CPU runtime remains usable");
+
+        assert_eq!(report.accelerator_failures.len(), 1);
+        assert!(report.accelerator_failures[0].contains(&module_file_name(VULKAN)));
+        assert!(report.accelerator_failures[0].contains("missing Vulkan loader"));
     }
 
     #[cfg(not(target_os = "windows"))]

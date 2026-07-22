@@ -7,6 +7,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path};
+use std::time::UNIX_EPOCH;
 
 use crate::{manifest, DEFAULT_MODEL_ID, VERSION};
 
@@ -202,6 +203,47 @@ pub fn verify(root: &Path) -> Result<PackageManifest, PackageError> {
         }
     }
     Ok(package)
+}
+
+pub fn runtime_identity(root: &Path) -> Result<String, PackageError> {
+    let manifest_path = root.join(MANIFEST_FILE);
+    let raw = std::fs::read(&manifest_path).map_err(|error| {
+        PackageError::new(format!("cannot read {}: {error}", manifest_path.display()))
+    })?;
+    let package: PackageManifest = serde_json::from_slice(&raw)
+        .map_err(|error| PackageError::new(format!("invalid package manifest JSON: {error}")))?;
+    for file in &package.files {
+        validate_relative_path(&file.path)?;
+    }
+    validate_manifest_metadata(&package)?;
+    validate_shape(&package)?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&raw);
+    for file in package.files.iter().filter(|file| {
+        matches!(
+            file.role,
+            PackageFileRole::CoreRuntime
+                | PackageFileRole::CpuBackend
+                | PackageFileRole::AcceleratorBackend
+        )
+    }) {
+        let path = root.join(&file.path);
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            PackageError::new(format!("cannot inspect {}: {error}", path.display()))
+        })?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        hasher.update(file.path.len().to_le_bytes());
+        hasher.update(file.path.as_bytes());
+        hasher.update(metadata.len().to_le_bytes());
+        hasher.update(modified.to_le_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn validate_manifest_metadata(package: &PackageManifest) -> Result<(), PackageError> {
