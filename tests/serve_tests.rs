@@ -1,3 +1,4 @@
+use julie_semantic_sidecar::manifest;
 use julie_semantic_sidecar::prepare::{PARTIAL_PREFIX, PARTIAL_SUFFIX};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -149,7 +150,7 @@ fn startup_removes_stale_partial_downloads() {
 
 #[test]
 #[ignore = "requires the prepared model in the shared cache"]
-fn a_whole_served_session_writes_only_protocol_lines_to_stdout() {
+fn discovery_benchmark_model_load_and_inference_write_only_protocol_lines_to_stdout() {
     let mut served = Served::spawn(None);
 
     let health = served.request("h1", "health", serde_json::json!({}));
@@ -190,7 +191,7 @@ fn a_whole_served_session_writes_only_protocol_lines_to_stdout() {
     let (trailing_stdout, _stderr) = served.shutdown();
     assert!(
         trailing_stdout.trim().is_empty(),
-        "model load chatter must never reach stdout: {trailing_stdout:?}"
+        "native discovery, benchmark, model load, and inference chatter must never reach stdout: {trailing_stdout:?}"
     );
 }
 
@@ -277,14 +278,13 @@ fn a_forced_cpu_backend_offloads_no_layers_to_the_gpu() {
 #[ignore = "requires the prepared model in the shared cache"]
 fn a_corrupt_cached_model_serves_not_ready_rather_than_loading_it() {
     let cache = tempfile::tempdir().expect("tempdir");
-    let real = dirs_cache().join("Qwen3-Embedding-0.6B-f16.gguf");
+    let model_file = manifest::default_model().file;
+    let real = dirs_cache().join(model_file);
     assert!(
         real.is_file(),
         "the pinned model must be prepared: {real:?}"
     );
-    let corrupt = cache.path().join("Qwen3-Embedding-0.6B-f16.gguf");
-    // Real GGUF header bytes, wrong contents: existence and file-type checks both pass, so
-    // only the digest can tell this from the pinned weights.
+    let corrupt = cache.path().join(model_file);
     let mut bytes = std::fs::read(&real).expect("read model")[..4096].to_vec();
     bytes[4095] ^= 0xff;
     std::fs::write(&corrupt, &bytes).expect("seed corrupt model");

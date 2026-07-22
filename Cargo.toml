@@ -17,12 +17,17 @@ name = "julie-semantic-sidecar"
 path = "src/main.rs"
 
 [features]
-metal = ["llama-cpp-2/metal", "llama-cpp-sys-2/metal"]
+metal = ["llama-cpp-2/metal"]
+vulkan = ["llama-cpp-2/vulkan"]
+cuda = ["llama-cpp-2/cuda"]
+rocm = ["llama-cpp-2/rocm"]
+dynamic-backends = ["llama-cpp-2/dynamic-backends"]
 
 [dependencies]
 dirs = "6.0.0"
 fs4 = "1.1.0"
 libc = "0.2.186"
+libloading = "0.8.9"
 llama-cpp-2 = { version = "=0.1.151", default-features = false }
 llama-cpp-sys-2 = { version = "=0.1.151", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -11,6 +11,7 @@
 use std::cell::RefCell;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -18,7 +19,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
-use llama_cpp_2::{DecodeError, EncodeError, TokenToStringError};
+use llama_cpp_2::{list_llama_ggml_backend_devices, DecodeError, EncodeError, TokenToStringError};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -87,14 +88,93 @@ const MAX_CLS_GROUP_TOKENS: usize = 2_048;
 /// 6369 MiB, inside the 16 GiB CI runner with headroom.
 const MAX_DECODE_UBATCH_TOKENS: usize = 2_048;
 
+const BACKEND_PROBE_TEXTS: [&str; 16] = [
+    "FullRebuildPromotion",
+    "WorkspaceIndexProvider.OpenReadOnly",
+    "l2_normalize_vector",
+    "IHostedService::StartAsync",
+    "public sealed record LeadershipEligibility(bool CanClaim, string? Reason)",
+    "pub fn cosine(a: &[f32], b: &[f32]) -> f32",
+    "def slice_renormalize(vec, dims): return vec[:dims]",
+    "CREATE VIRTUAL TABLE vectors USING vec0(embedding int8[512]);",
+    "how does the indexer decide which process holds the write lock",
+    "where do we atomically swap the rebuilt database over the live artifact",
+    "A force scan extracts into a rebuild database and atomically promotes it.",
+    "Semantic retrieval is optional, local-first, and off by default.",
+    "## Restore the cache\n\nRun the download and verify stages.",
+    "# Tolerance policy\n\n| check | bar |\n|---|---|\n| cosine | >= 0.999 |",
+    "```rust\nfn main() {}\n```",
+    "该函数以原子方式将重建后的索引数据库替换为线上的工件文件。",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelPlacement {
+    n_gpu_layers: Option<u32>,
+    device_indexes: Vec<usize>,
+}
+
+fn placement_for_candidate(candidate: &backend_select::BackendCandidate) -> ModelPlacement {
+    if candidate.backend == backend_select::CPU {
+        ModelPlacement {
+            n_gpu_layers: Some(0),
+            device_indexes: Vec::new(),
+        }
+    } else {
+        ModelPlacement {
+            n_gpu_layers: None,
+            device_indexes: candidate.device_index.into_iter().collect(),
+        }
+    }
+}
+
+fn run_fixed_probes_with<F>(
+    candidate: &backend_select::BackendCandidate,
+    mut probe: F,
+) -> Result<backend_select::ProbeTiming, String>
+where
+    F: FnMut(&backend_select::BackendCandidate, &[String]) -> Result<std::time::Duration, String>,
+{
+    let batch_1 = [BACKEND_PROBE_TEXTS[0].to_string()];
+    let batch_16 = BACKEND_PROBE_TEXTS.map(str::to_string);
+    Ok(backend_select::ProbeTiming {
+        batch_1: probe(candidate, &batch_1)?,
+        batch_16: probe(candidate, &batch_16)?,
+    })
+}
+
+fn forced_cpu_runtime_with<M, D, B>(
+    cache_dir: &Path,
+    executable: &Path,
+    context: backend_select::SelectionContext<'_>,
+    load_modules: M,
+    discover: D,
+    benchmark: B,
+) -> Result<backend_select::RuntimeSelection, EngineError>
+where
+    M: FnOnce(&Path) -> Result<(), String>,
+    D: FnOnce() -> Result<backend_select::Discovery, String>,
+    B: FnMut(&backend_select::BackendCandidate) -> Result<backend_select::ProbeTiming, String>,
+{
+    load_modules(executable).map_err(|reason| EngineError::new("BackendDiscovery", reason))?;
+    backend_select::select_runtime_with(
+        cache_dir,
+        context,
+        Some(backend_select::CPU),
+        discover,
+        benchmark,
+    )
+    .map_err(|reason| EngineError::new("BackendProbe", reason))
+}
+
 /// A loaded llama.cpp embedding model serving one manifest pin.
 pub struct LlamaEngine {
     pin: &'static ModelPin,
-    backend: LlamaBackend,
+    backend: Rc<LlamaBackend>,
     model: LlamaModel,
     eos_reserve: usize,
     special_token_overhead: usize,
     selection: Selection,
+    capabilities: BackendCapabilities,
 }
 
 impl LlamaEngine {
@@ -121,30 +201,173 @@ impl LlamaEngine {
         }
         verify_cached_digest(&path, pin.sha256)?;
 
-        crate::stdio_guard::guarded(|| {
-            let selection = backend_select::select(cache_dir, VERSION, pin.sha256);
-            let backend = LlamaBackend::init()
-                .map_err(|err| EngineError::new("BackendInit", err.to_string()))?;
-            let model = LlamaModel::load_from_file(&backend, &path, &model_params(&selection))
-                .map_err(|err| EngineError::new("ModelLoad", err.to_string()))?;
+        crate::stdio_guard::guarded(|| Self::load_guarded(pin, cache_dir, &path))
+    }
 
-            let eos_reserve = match pin.eos_marker {
-                Some(marker) => model
-                    .str_to_token(marker, AddBos::Never)
-                    .map_err(|err| EngineError::new("Tokenize", err.to_string()))?
-                    .len(),
-                None => 0,
-            };
-            let special_token_overhead = measure_special_token_overhead(&model)?;
+    fn load_guarded(
+        pin: &'static ModelPin,
+        cache_dir: &Path,
+        path: &Path,
+    ) -> Result<Self, EngineError> {
+        let forced = backend_select::forced_backend();
+        if forced
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(backend_select::CPU))
+        {
+            let executable = std::env::current_exe().map_err(|err| {
+                EngineError::new(
+                    "BackendDiscovery",
+                    format!("cannot resolve executable: {err}"),
+                )
+            })?;
+            let runtime = forced_cpu_runtime_with(
+                cache_dir,
+                &executable,
+                backend_select::SelectionContext {
+                    sidecar_version: VERSION,
+                    model_sha256: pin.sha256,
+                    native_build_identity: backend_select::NATIVE_BUILD_IDENTITY,
+                    packaged_backend_identity: "forced-cpu",
+                },
+                backend_select::load_packaged_cpu_modules_from_executable,
+                || panic!("forced cpu must skip discovery"),
+                |_| panic!("forced cpu must skip benchmarks"),
+            )?;
+            let backend = Rc::new(
+                LlamaBackend::init()
+                    .map_err(|err| EngineError::new("BackendInit", err.to_string()))?,
+            );
+            return Self::load_final(pin, path, backend, runtime);
+        }
 
-            Ok(Self {
-                pin,
-                backend,
-                model,
-                eos_reserve,
-                special_token_overhead,
-                selection,
-            })
+        let executable = std::env::current_exe().map_err(|err| {
+            EngineError::new(
+                "BackendDiscovery",
+                format!("cannot resolve executable: {err}"),
+            )
+        })?;
+        let package_identity = backend_select::packaged_backend_identity(&executable);
+        let context = backend_select::SelectionContext {
+            sidecar_version: VERSION,
+            model_sha256: pin.sha256,
+            native_build_identity: backend_select::NATIVE_BUILD_IDENTITY,
+            packaged_backend_identity: &package_identity,
+        };
+        let module_result = backend_select::load_packaged_modules_from_executable(&executable);
+        let backend = Rc::new(
+            LlamaBackend::init().map_err(|err| EngineError::new("BackendInit", err.to_string()))?,
+        );
+        let discovery = module_result.map(|()| {
+            backend_select::discover_candidates(
+                &backend_select::DeclaredBackends::build(),
+                &runtime_devices(),
+            )
+        });
+        let runtime = backend_select::select_runtime_with(
+            cache_dir,
+            context,
+            forced.as_deref(),
+            || discovery,
+            |candidate| Self::benchmark_candidate(pin, path, &backend, candidate),
+        )
+        .map_err(|reason| EngineError::new("BackendProbe", reason))?;
+        Self::load_final(pin, path, backend, runtime)
+    }
+
+    fn load_final(
+        pin: &'static ModelPin,
+        path: &Path,
+        backend: Rc<LlamaBackend>,
+        runtime: backend_select::RuntimeSelection,
+    ) -> Result<Self, EngineError> {
+        let candidate = backend_select::BackendCandidate {
+            backend: runtime.selection.resolved.clone(),
+            device_index: runtime.device_index,
+        };
+        match Self::load_candidate(
+            pin,
+            path,
+            &backend,
+            &candidate,
+            runtime.selection.clone(),
+            runtime.capabilities,
+        ) {
+            Ok(engine) => Ok(engine),
+            Err(error) if candidate.backend != backend_select::CPU => {
+                let mut capabilities = runtime.capabilities;
+                disable_capability(&mut capabilities, &candidate.backend);
+                let fallback = Selection::degraded_to_cpu(
+                    &candidate.backend,
+                    format!("{} final load failed: {}", candidate.backend, error.message),
+                );
+                Self::load_candidate(
+                    pin,
+                    path,
+                    &backend,
+                    &backend_select::BackendCandidate {
+                        backend: backend_select::CPU.to_string(),
+                        device_index: None,
+                    },
+                    fallback,
+                    capabilities,
+                )
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn load_candidate(
+        pin: &'static ModelPin,
+        path: &Path,
+        backend: &Rc<LlamaBackend>,
+        candidate: &backend_select::BackendCandidate,
+        selection: Selection,
+        capabilities: BackendCapabilities,
+    ) -> Result<Self, EngineError> {
+        let params = model_params_for_candidate(candidate)?;
+        let model = LlamaModel::load_from_file(backend, path, &params)
+            .map_err(|err| EngineError::new("ModelLoad", err.to_string()))?;
+        let eos_reserve = match pin.eos_marker {
+            Some(marker) => model
+                .str_to_token(marker, AddBos::Never)
+                .map_err(|err| EngineError::new("Tokenize", err.to_string()))?
+                .len(),
+            None => 0,
+        };
+        let special_token_overhead = measure_special_token_overhead(&model)?;
+        Ok(Self {
+            pin,
+            backend: Rc::clone(backend),
+            model,
+            eos_reserve,
+            special_token_overhead,
+            selection,
+            capabilities,
+        })
+    }
+
+    fn benchmark_candidate(
+        pin: &'static ModelPin,
+        path: &Path,
+        backend: &Rc<LlamaBackend>,
+        candidate: &backend_select::BackendCandidate,
+    ) -> Result<backend_select::ProbeTiming, String> {
+        let selection = Selection::new(&candidate.backend, &candidate.backend, None);
+        let engine = Self::load_candidate(
+            pin,
+            path,
+            backend,
+            candidate,
+            selection,
+            BackendCapabilities::cpu_only(),
+        )
+        .map_err(|err| err.to_string())?;
+        run_fixed_probes_with(candidate, |_, texts| {
+            let started = std::time::Instant::now();
+            engine
+                .embed(texts, Role::Document)
+                .map_err(|err| err.to_string())?;
+            Ok(started.elapsed())
         })
     }
 
@@ -395,11 +618,7 @@ impl LlamaEngine {
             resolved_backend: self.selection.resolved.clone(),
             accelerated: self.selection.accelerated,
             degraded_reason: self.selection.degraded_reason.clone(),
-            capabilities: BackendCapabilities {
-                cpu: true,
-                metal: cfg!(feature = "metal"),
-                ..BackendCapabilities::default()
-            },
+            capabilities: self.capabilities,
             llama_cpp_build: LLAMA_CPP_BUILD.to_string(),
         }
     }
@@ -630,12 +849,99 @@ fn measure_special_token_overhead(model: &LlamaModel) -> Result<usize, EngineErr
 /// anyway while `health` reported `cpu`. Pinning zero offloaded layers makes the reported
 /// device the applied one, which is what `JULIE_SIDECAR_FORCE_BACKEND=cpu` and the
 /// CPU-generated conformance goldens both depend on.
-fn model_params(selection: &Selection) -> LlamaModelParams {
-    let params = LlamaModelParams::default();
-    if selection.resolved == backend_select::CPU {
-        params.with_n_gpu_layers(0)
+fn model_params_for_candidate(
+    candidate: &backend_select::BackendCandidate,
+) -> Result<LlamaModelParams, EngineError> {
+    let placement = placement_for_candidate(candidate);
+    let mut params = LlamaModelParams::default();
+    if let Some(layers) = placement.n_gpu_layers {
+        params = params.with_n_gpu_layers(layers);
+    }
+    if !placement.device_indexes.is_empty() {
+        params = params
+            .with_devices(&placement.device_indexes)
+            .map_err(|err| EngineError::new("BackendPlacement", err.to_string()))?;
+    }
+    Ok(params)
+}
+
+fn runtime_devices() -> Vec<backend_select::RuntimeDevice> {
+    list_llama_ggml_backend_devices()
+        .into_iter()
+        .map(|device| backend_select::RuntimeDevice {
+            driver: driver_identity(&device.backend, &device.name, &device.description),
+            backend: device.backend,
+            index: device.index,
+            name: device.name,
+            description: device.description,
+            memory_total: device.memory_total,
+        })
+        .collect()
+}
+
+fn driver_identity(backend: &str, name: &str, description: &str) -> String {
+    driver_identity_with(backend, name, description, command_output)
+}
+
+fn driver_identity_with<F>(backend: &str, name: &str, description: &str, mut output: F) -> String
+where
+    F: FnMut(&str, &[&str]) -> Option<String>,
+{
+    if backend.eq_ignore_ascii_case(backend_select::CUDA) {
+        if let Some(value) = output(
+            "nvidia-smi",
+            &["--query-gpu=driver_version", "--format=csv,noheader"],
+        ) {
+            return format!("cuda:{value}");
+        }
+    }
+    if backend.eq_ignore_ascii_case(backend_select::VULKAN) {
+        if let Some(value) = output("vulkaninfo", &["--summary"]) {
+            return format!("vulkan:{value}");
+        }
+    }
+    if cfg!(target_os = "windows") {
+        if let Some(value) = output(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion | ConvertTo-Json -Compress",
+            ],
+        ) {
+            return format!("windows-gpu:{value}");
+        }
+    }
+    let platform = if cfg!(target_os = "macos") {
+        output("sysctl", &["-n", "kern.osversion"])
+    } else if cfg!(unix) {
+        output("uname", &["-r"])
+    } else if cfg!(target_os = "windows") {
+        output("cmd", &["/C", "ver"])
     } else {
-        params
+        None
+    }
+    .unwrap_or_else(|| "unknown".to_string());
+    format!("backend={backend};name={name};description={description};platform={platform}")
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|output| output.trim().to_string())
+        .filter(|output| !output.is_empty())
+}
+
+fn disable_capability(capabilities: &mut BackendCapabilities, backend: &str) {
+    match backend {
+        backend_select::METAL => capabilities.metal = false,
+        backend_select::VULKAN => capabilities.vulkan = false,
+        backend_select::CUDA => capabilities.cuda = false,
+        _ => {}
     }
 }
 
@@ -845,7 +1151,12 @@ mod tests {
 
     #[test]
     fn a_cpu_resolution_pins_zero_offloaded_layers() {
-        assert_eq!(model_params(&Selection::cpu()).n_gpu_layers(), 0);
+        let params = model_params_for_candidate(&backend_select::BackendCandidate {
+            backend: backend_select::CPU.to_string(),
+            device_index: None,
+        })
+        .expect("cpu placement");
+        assert_eq!(params.n_gpu_layers(), 0);
     }
 
     #[test]
@@ -921,5 +1232,154 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 3);
         assert_eq!(groups[1].len(), 1);
+    }
+
+    #[test]
+    fn candidate_placement_pins_cpu_and_uses_the_enumerated_accelerator_index() {
+        let cpu = placement_for_candidate(&backend_select::BackendCandidate {
+            backend: backend_select::CPU.to_string(),
+            device_index: None,
+        });
+        let vulkan = placement_for_candidate(&backend_select::BackendCandidate {
+            backend: backend_select::VULKAN.to_string(),
+            device_index: Some(7),
+        });
+
+        assert_eq!(cpu.n_gpu_layers, Some(0));
+        assert!(cpu.device_indexes.is_empty());
+        assert_eq!(vulkan.n_gpu_layers, None);
+        assert_eq!(vulkan.device_indexes, vec![7]);
+    }
+
+    #[test]
+    fn forced_cpu_loads_runtime_modules_before_short_circuiting_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executable = dir.path().join("julie-semantic-sidecar");
+        let module_loads = std::cell::Cell::new(0);
+        let selected = forced_cpu_runtime_with(
+            dir.path(),
+            &executable,
+            backend_select::SelectionContext {
+                sidecar_version: VERSION,
+                model_sha256: "model-a",
+                native_build_identity: "native-a",
+                packaged_backend_identity: "forced-cpu",
+            },
+            |path| {
+                assert_eq!(path, executable);
+                module_loads.set(module_loads.get() + 1);
+                Ok(())
+            },
+            || panic!("forced cpu must skip discovery"),
+            |_| panic!("forced cpu must skip benchmarks"),
+        )
+        .expect("forced cpu runtime");
+
+        assert_eq!(module_loads.get(), 1);
+        assert_eq!(selected.selection, Selection::cpu());
+        assert!(!dir
+            .path()
+            .join(backend_select::SELECTION_CACHE_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn fixed_probes_time_batch_one_and_the_sixteen_text_indexing_batch() {
+        let candidate = backend_select::BackendCandidate {
+            backend: backend_select::METAL.to_string(),
+            device_index: Some(3),
+        };
+        let calls = std::cell::RefCell::new(Vec::new());
+        let timing = run_fixed_probes_with(&candidate, |placed, texts| {
+            calls.borrow_mut().push((placed.clone(), texts.len()));
+            Ok(std::time::Duration::from_millis(texts.len() as u64))
+        })
+        .expect("probes");
+
+        assert_eq!(
+            calls.into_inner(),
+            vec![(candidate.clone(), 1), (candidate, 16)]
+        );
+        assert_eq!(timing.batch_1, std::time::Duration::from_millis(1));
+        assert_eq!(timing.batch_16, std::time::Duration::from_millis(16));
+    }
+
+    #[test]
+    fn vulkan_driver_output_changes_runtime_machine_identity() {
+        let identity = |driver: &str| {
+            driver_identity_with("Vulkan", "GPU 0", "Discrete GPU", |program, _| {
+                (program == "vulkaninfo").then(|| driver.to_string())
+            })
+        };
+        let discovery = |driver: String| {
+            backend_select::discover_candidates(
+                &backend_select::DeclaredBackends {
+                    metal: false,
+                    vulkan: true,
+                    cuda: false,
+                    rocm: false,
+                    dynamic_backends: true,
+                },
+                &[backend_select::RuntimeDevice {
+                    backend: "Vulkan".to_string(),
+                    index: 1,
+                    name: "GPU 0".to_string(),
+                    description: "Discrete GPU".to_string(),
+                    memory_total: 1024,
+                    driver,
+                }],
+            )
+        };
+
+        assert_ne!(
+            discovery(identity("driverVersion = 1")).machine,
+            discovery(identity("driverVersion = 2")).machine
+        );
+    }
+
+    #[test]
+    fn failed_cpu_inference_probe_aborts_backend_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declared = backend_select::DeclaredBackends {
+            metal: false,
+            vulkan: false,
+            cuda: false,
+            rocm: false,
+            dynamic_backends: false,
+        };
+        let error = backend_select::select_runtime_with(
+            dir.path(),
+            backend_select::SelectionContext {
+                sidecar_version: VERSION,
+                model_sha256: "model-a",
+                native_build_identity: "native-a",
+                packaged_backend_identity: "package-a",
+            },
+            None,
+            || Ok(backend_select::discover_candidates(&declared, &[])),
+            |candidate| {
+                run_fixed_probes_with(candidate, |_, _| Err("inference failed".to_string()))
+            },
+        )
+        .expect_err("cpu probe failure");
+
+        assert!(error.contains("cpu probe failed"));
+    }
+
+    #[test]
+    fn a_failed_fixed_probe_rejects_the_candidate() {
+        let candidate = backend_select::BackendCandidate {
+            backend: backend_select::CUDA.to_string(),
+            device_index: Some(4),
+        };
+        let calls = std::cell::Cell::new(0);
+        let error = run_fixed_probes_with(&candidate, |_, _| {
+            calls.set(calls.get() + 1);
+            Err("encode failed".to_string())
+        })
+        .expect_err("failed probe");
+
+        assert_eq!(error, "encode failed");
+        assert_eq!(calls.get(), 1);
     }
 }

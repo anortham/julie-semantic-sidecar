@@ -1,25 +1,20 @@
 //! Backend selection: which llama.cpp device the sidecar loads on, and why.
 //!
-//! `semantic-sidecar-protocol-v1.md` § Backend selection. CPU is the floor in every build
-//! and is never unavailable. On the first start for a given cache key the sidecar
-//! micro-benchmarks the available backends and caches the winner, keyed by shim version +
-//! model sha256 + GPU identity + driver identity; any component changing re-runs the
-//! benchmark. An accelerated backend losing to CPU is a normal outcome — `ready: true`,
-//! `accelerated: false`, and a `degraded_reason` naming the result.
-//!
-//! The CPU-only build (`llama-cpp-2` with `default-features = false` and no `metal`
-//! feature) compiles no accelerated backend, so its benchmark has exactly one candidate and
-//! every selection resolves to CPU. The `metal` feature is the accelerated macOS build: it
-//! supplies a real [`MachineIdentity`] (GPU brand + OS build) and resolves `metal` without
-//! probing — on Apple Silicon the unified-memory Metal path has no known CPU-wins case for
-//! the pinned encoders, so a micro-benchmark would only slow the first start. If a real
-//! CPU-wins case appears, wire a probe into [`select_with`]'s benchmark closure; the cache
-//! mechanics, the key, and the degradation shape already support it.
-//! `JULIE_SIDECAR_FORCE_BACKEND=cpu` remains the operator escape hatch in every build.
+//! CPU is the floor in every build. Accelerators become candidates only when the sidecar
+//! declares them and llama.cpp enumerates a matching device after packaged modules load.
+//! The first start times fixed single-item and indexing-batch probes against CPU; only a
+//! faster accelerator wins. Verdicts are cached per complete build, package, model, GPU,
+//! and driver identity, while forced CPU bypasses discovery, timing, and cache entirely.
 
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::health::BackendCapabilities;
 
 /// Environment variable that pins the backend, bypassing benchmark and cache entirely.
 pub const FORCE_BACKEND_ENV: &str = "JULIE_SIDECAR_FORCE_BACKEND";
@@ -30,11 +25,127 @@ pub const CPU: &str = "cpu";
 /// Canonical name of the backend the `metal` feature compiles in.
 pub const METAL: &str = "metal";
 
+/// Canonical name of the Vulkan backend.
+pub const VULKAN: &str = "vulkan";
+
+/// Canonical name of the CUDA backend.
+pub const CUDA: &str = "cuda";
+
 /// File the cached benchmark choice is written to, beside the model cache.
 pub const SELECTION_CACHE_FILE: &str = "backend-selection.json";
 
 /// Reason reported when an accelerated backend was asked for and this build has none.
 pub const NO_ACCELERATED_BACKEND: &str = "cpu (no accelerated backend compiled)";
+
+/// Reproducible identity emitted by this crate's build script.
+pub const NATIVE_BUILD_IDENTITY: &str = env!("JULIE_NATIVE_BUILD_IDENTITY");
+
+/// Backends the sidecar package declares, independent of upstream transitive features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclaredBackends {
+    pub metal: bool,
+    pub vulkan: bool,
+    pub cuda: bool,
+    pub rocm: bool,
+    pub dynamic_backends: bool,
+}
+
+impl DeclaredBackends {
+    /// The features explicitly selected on this package.
+    pub fn build() -> Self {
+        Self {
+            metal: cfg!(feature = "metal"),
+            vulkan: cfg!(feature = "vulkan"),
+            cuda: cfg!(feature = "cuda"),
+            rocm: cfg!(feature = "rocm"),
+            dynamic_backends: cfg!(feature = "dynamic-backends"),
+        }
+    }
+
+    /// Stable cache identity for the package's native backend surface.
+    pub fn identity(self) -> String {
+        format!(
+            "metal={};vulkan={};cuda={};rocm={};dynamic={}",
+            self.metal, self.vulkan, self.cuda, self.rocm, self.dynamic_backends
+        )
+    }
+
+    fn supports(self, backend: &str) -> bool {
+        match backend {
+            METAL => self.metal,
+            VULKAN => self.vulkan,
+            CUDA => self.cuda,
+            _ => backend == CPU,
+        }
+    }
+
+    fn stable_accelerators(self) -> impl Iterator<Item = &'static str> {
+        [
+            (METAL, self.metal),
+            (VULKAN, self.vulkan),
+            (CUDA, self.cuda),
+        ]
+        .into_iter()
+        .filter_map(|(backend, enabled)| enabled.then_some(backend))
+    }
+}
+
+/// Runtime device facts returned by llama.cpp after backend modules are loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeDevice {
+    pub backend: String,
+    pub index: usize,
+    pub name: String,
+    pub description: String,
+    pub memory_total: usize,
+    pub driver: String,
+}
+
+/// A backend that can be placed explicitly for a probe or final model load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendCandidate {
+    pub backend: String,
+    pub device_index: Option<usize>,
+}
+
+/// Runtime candidates and the machine identity that makes their verdict cacheable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovery {
+    pub candidates: Vec<BackendCandidate>,
+    pub capabilities: BackendCapabilities,
+    pub machine: Machine,
+    declared_accelerators: Vec<String>,
+}
+
+/// Cache-key components known before runtime device discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionContext<'a> {
+    pub sidecar_version: &'a str,
+    pub model_sha256: &'a str,
+    pub native_build_identity: &'a str,
+    pub packaged_backend_identity: &'a str,
+}
+
+/// Comparable inference measurements for the fixed single-item and indexing probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeTiming {
+    pub batch_1: Duration,
+    pub batch_16: Duration,
+}
+
+impl ProbeTiming {
+    fn total(self) -> Duration {
+        self.batch_1.saturating_add(self.batch_16)
+    }
+}
+
+/// Selection plus the exact placement and capabilities proven by runtime probing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSelection {
+    pub selection: Selection,
+    pub capabilities: BackendCapabilities,
+    pub device_index: Option<usize>,
+}
 
 /// Identity of the machine's accelerator, as two cache-key components.
 ///
@@ -56,57 +167,6 @@ impl Machine {
             driver: "none".to_string(),
         }
     }
-}
-
-/// Supplies the GPU and driver identity that key the selection cache.
-///
-/// The CPU-only build answers `none`/`none`; an accelerated build queries its backend.
-pub trait MachineIdentity {
-    /// Reports the current machine's accelerator identity.
-    fn identify(&self) -> Machine;
-}
-
-/// [`MachineIdentity`] for a build with no accelerated backend compiled in.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CpuOnlyMachine;
-
-impl MachineIdentity for CpuOnlyMachine {
-    fn identify(&self) -> Machine {
-        Machine::none()
-    }
-}
-
-/// [`MachineIdentity`] for the `metal` build: GPU brand plus OS build as the driver proxy.
-///
-/// On Apple platforms the Metal "driver" ships with the OS, so the kernel build string is
-/// the component whose change should invalidate a cached selection. Both lookups fall back
-/// to `unknown` rather than failing a start — an unidentifiable machine still embeds; it
-/// just re-benchmarks when the identity becomes readable again.
-#[cfg(feature = "metal")]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MetalMachine;
-
-#[cfg(feature = "metal")]
-impl MachineIdentity for MetalMachine {
-    fn identify(&self) -> Machine {
-        Machine {
-            gpu: sysctl_string("machdep.cpu.brand_string"),
-            driver: sysctl_string("kern.osversion"),
-        }
-    }
-}
-
-#[cfg(feature = "metal")]
-fn sysctl_string(name: &str) -> String {
-    std::process::Command::new("sysctl")
-        .args(["-n", name])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// The backend decision, in the shape `health` reports it.
@@ -149,91 +209,257 @@ impl Selection {
     }
 }
 
-/// Resolves the backend for `model_sha256` using this build's identity and benchmark.
-///
-/// This is the production entry point. The CPU-only build's benchmark has one candidate,
-/// so the first start writes a `cpu` choice that every later start reads back; the `metal`
-/// build resolves `metal` (see the module docs for why no probe runs today).
-pub fn select(cache_dir: &Path, sidecar_version: &str, model_sha256: &str) -> Selection {
-    select_with(
-        cache_dir,
-        sidecar_version,
-        model_sha256,
-        &build_machine(),
-        forced_backend().as_deref(),
-        |_machine| build_selection(),
-    )
-}
+/// Intersects explicitly declared package backends with enumerated llama.cpp devices.
+pub fn discover_candidates(
+    declared: &DeclaredBackends,
+    runtime_devices: &[RuntimeDevice],
+) -> Discovery {
+    let mut candidates = vec![BackendCandidate {
+        backend: CPU.to_string(),
+        device_index: None,
+    }];
+    let mut capabilities = BackendCapabilities::cpu_only();
+    let mut identity_parts = Vec::new();
+    let mut driver_parts = Vec::new();
 
-#[cfg(feature = "metal")]
-fn build_machine() -> impl MachineIdentity {
-    MetalMachine
-}
+    for backend in [METAL, VULKAN, CUDA] {
+        if !declared.supports(backend) {
+            continue;
+        }
+        let Some(device) = runtime_devices
+            .iter()
+            .find(|device| normalize_backend(&device.backend) == Some(backend))
+        else {
+            continue;
+        };
+        candidates.push(BackendCandidate {
+            backend: backend.to_string(),
+            device_index: Some(device.index),
+        });
+        set_capability(&mut capabilities, backend, true);
+        identity_parts.push(format!(
+            "{backend}:{}:{}:{}",
+            device.name, device.description, device.memory_total
+        ));
+        driver_parts.push(format!("{backend}:{}", device.driver));
+    }
 
-#[cfg(not(feature = "metal"))]
-fn build_machine() -> impl MachineIdentity {
-    CpuOnlyMachine
-}
-
-/// The backend this build serves when nothing is forced and nothing is cached.
-fn build_selection() -> Selection {
-    if cfg!(feature = "metal") {
-        Selection::new(METAL, METAL, None)
-    } else {
-        Selection::cpu()
+    Discovery {
+        candidates,
+        capabilities,
+        machine: if identity_parts.is_empty() {
+            Machine::none()
+        } else {
+            Machine {
+                gpu: identity_parts.join(","),
+                driver: driver_parts.join(","),
+            }
+        },
+        declared_accelerators: declared.stable_accelerators().map(str::to_string).collect(),
     }
 }
 
-/// Resolves the backend from injected identity, override, and benchmark.
-///
-/// Order of authority: a forced backend short-circuits everything; otherwise a cache entry
-/// whose key matches every component is returned without probing; otherwise `benchmark`
-/// runs and its verdict is cached.
-///
-/// A forced choice is never cached and never reads the cache — it is an operator override,
-/// not a benchmark result, and must not outlive the environment variable that set it.
-pub fn select_with<M, B>(
+/// Resolves a backend from injected discovery and inference probes.
+pub fn select_runtime_with<D, B>(
     cache_dir: &Path,
-    sidecar_version: &str,
-    model_sha256: &str,
-    machine: &M,
+    context: SelectionContext<'_>,
     forced: Option<&str>,
-    benchmark: B,
-) -> Selection
+    discover: D,
+    mut benchmark: B,
+) -> Result<RuntimeSelection, String>
 where
-    M: MachineIdentity,
-    B: FnOnce(&Machine) -> Selection,
+    D: FnOnce() -> Result<Discovery, String>,
+    B: FnMut(&BackendCandidate) -> Result<ProbeTiming, String>,
 {
-    if let Some(forced) = forced {
-        return force(forced);
+    let forced = forced.map(|value| value.trim().to_ascii_lowercase());
+    if forced.as_deref() == Some(CPU) {
+        return Ok(RuntimeSelection {
+            selection: Selection::cpu(),
+            capabilities: BackendCapabilities::cpu_only(),
+            device_index: None,
+        });
     }
 
-    let machine = machine.identify();
-    let key = cache_key(sidecar_version, model_sha256, &machine);
-    if let Some(cached) = read_cached(cache_dir) {
-        if cached.key == key {
-            return cached.into_selection();
+    let discovery = match discover() {
+        Ok(discovery) => discovery,
+        Err(reason) => {
+            return Ok(RuntimeSelection {
+                selection: Selection::new(forced.as_deref().unwrap_or(CPU), CPU, Some(reason)),
+                capabilities: BackendCapabilities::cpu_only(),
+                device_index: None,
+            });
+        }
+    };
+
+    if let Some(requested) = forced.as_deref() {
+        if !matches!(requested, METAL | VULKAN | CUDA) {
+            return Ok(degraded_runtime(requested, "unknown forced backend"));
+        }
+        if !discovery
+            .candidates
+            .iter()
+            .any(|candidate| candidate.backend == requested)
+        {
+            return Ok(degraded_runtime(
+                requested,
+                "requested backend is unavailable",
+            ));
         }
     }
 
-    let selection = benchmark(&machine);
-    write_cached(cache_dir, &key, &selection);
-    selection
+    let key = runtime_cache_key(context, &discovery.machine);
+    if forced.is_none() {
+        if let Some(cached) = read_runtime_cache(cache_dir, &key) {
+            let device_index = discovery
+                .candidates
+                .iter()
+                .find(|candidate| candidate.backend == cached.selection.resolved)
+                .and_then(|candidate| candidate.device_index);
+            return Ok(RuntimeSelection {
+                selection: cached.selection,
+                capabilities: cached.capabilities,
+                device_index,
+            });
+        }
+    }
+
+    let cpu = &discovery.candidates[0];
+    let cpu_timing = match benchmark(cpu) {
+        Ok(timing) => timing,
+        Err(reason) => return Err(format!("cpu probe failed: {reason}")),
+    };
+
+    let mut capabilities = discovery.capabilities;
+    let accelerated_candidates: Vec<&BackendCandidate> = discovery
+        .candidates
+        .iter()
+        .skip(1)
+        .filter(|candidate| {
+            forced
+                .as_deref()
+                .is_none_or(|requested| candidate.backend == requested)
+        })
+        .collect();
+
+    let requested = forced
+        .clone()
+        .or_else(|| {
+            accelerated_candidates
+                .first()
+                .map(|candidate| candidate.backend.clone())
+        })
+        .or_else(|| discovery.declared_accelerators.first().cloned());
+
+    let mut fastest: Option<(&BackendCandidate, ProbeTiming)> = None;
+    let mut failures = Vec::new();
+    for candidate in accelerated_candidates {
+        match benchmark(candidate) {
+            Ok(timing) => {
+                if fastest
+                    .as_ref()
+                    .is_none_or(|(_, current)| timing.total() < current.total())
+                {
+                    fastest = Some((candidate, timing));
+                }
+            }
+            Err(reason) => {
+                set_capability(&mut capabilities, &candidate.backend, false);
+                failures.push(format!("{} probe failed: {reason}", candidate.backend));
+            }
+        }
+    }
+
+    let result = if let Some((winner, timing)) = fastest {
+        if timing.total() < cpu_timing.total() {
+            RuntimeSelection {
+                selection: Selection::new(&winner.backend, &winner.backend, None),
+                capabilities,
+                device_index: winner.device_index,
+            }
+        } else {
+            RuntimeSelection {
+                selection: Selection::degraded_to_cpu(
+                    requested.as_deref().unwrap_or(CPU),
+                    "accelerated backend did not beat cpu",
+                ),
+                capabilities,
+                device_index: None,
+            }
+        }
+    } else if let Some(requested) = requested {
+        RuntimeSelection {
+            selection: Selection::degraded_to_cpu(
+                requested,
+                if failures.is_empty() {
+                    "requested backend is unavailable".to_string()
+                } else {
+                    failures.join("; ")
+                },
+            ),
+            capabilities,
+            device_index: None,
+        }
+    } else {
+        RuntimeSelection {
+            selection: Selection::cpu(),
+            capabilities,
+            device_index: None,
+        }
+    };
+
+    if forced.is_none() {
+        write_runtime_cache(cache_dir, &key, &result);
+    }
+    Ok(result)
 }
 
-/// Applies `JULIE_SIDECAR_FORCE_BACKEND`.
-///
-/// `cpu` is always honourable, and so is a backend this build compiled. Anything else
-/// names a backend this build did not compile, so CPU answers and the mismatch is
-/// reported as a degradation rather than a failure.
-fn force(requested: &str) -> Selection {
-    if requested.eq_ignore_ascii_case(CPU) {
-        return Selection::cpu();
+fn degraded_runtime(requested: &str, reason: &str) -> RuntimeSelection {
+    RuntimeSelection {
+        selection: Selection::degraded_to_cpu(requested, reason),
+        capabilities: BackendCapabilities::cpu_only(),
+        device_index: None,
     }
-    if cfg!(feature = "metal") && requested.eq_ignore_ascii_case(METAL) {
-        return Selection::new(METAL, METAL, None);
+}
+
+fn normalize_backend(backend: &str) -> Option<&'static str> {
+    if backend.eq_ignore_ascii_case(CPU) {
+        Some(CPU)
+    } else if backend.eq_ignore_ascii_case(METAL) || backend.eq_ignore_ascii_case("MTL") {
+        Some(METAL)
+    } else if backend.eq_ignore_ascii_case(VULKAN) {
+        Some(VULKAN)
+    } else if backend.eq_ignore_ascii_case(CUDA) {
+        Some(CUDA)
+    } else {
+        None
     }
-    Selection::degraded_to_cpu(requested.to_ascii_lowercase(), NO_ACCELERATED_BACKEND)
+}
+
+/// Hashes the exact declared sibling modules into the package cache identity.
+pub fn packaged_backend_identity(executable: &Path) -> String {
+    let declared = DeclaredBackends::build();
+    let mut hash = Sha256::new();
+    hash.update(declared.identity());
+    if let Some(directory) = executable.parent() {
+        if let Ok(paths) = packaged_module_paths(directory, &declared) {
+            for path in paths {
+                hash.update(path.file_name().unwrap_or_default().as_encoded_bytes());
+                if let Ok(bytes) = std::fs::read(path) {
+                    hash.update(bytes);
+                }
+            }
+        }
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn set_capability(capabilities: &mut BackendCapabilities, backend: &str, available: bool) {
+    match backend {
+        METAL => capabilities.metal = available,
+        VULKAN => capabilities.vulkan = available,
+        CUDA => capabilities.cuda = available,
+        _ => {}
+    }
 }
 
 /// Reads `JULIE_SIDECAR_FORCE_BACKEND`, treating an empty value as unset.
@@ -243,375 +469,874 @@ pub fn forced_backend() -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Builds the cache key: shim version + model sha256 + GPU identity + driver identity.
-///
-/// Components are joined with a character none of them contains, so a change in any one
-/// component always produces a different key.
-pub fn cache_key(sidecar_version: &str, model_sha256: &str, machine: &Machine) -> String {
-    format!(
-        "{sidecar_version}|{model_sha256}|{}|{}",
-        machine.gpu, machine.driver
-    )
-}
-
-/// Directory the binary lives in, where an accelerated build's backend plugins sit.
-///
-/// llama.cpp's split-backend builds load `ggml-<backend>` shared libraries at runtime and
-/// resolve them relative to the executable, not the working directory — so an accelerated
-/// build (Task 8) points llama.cpp's backend loader here before the first probe. This
-/// build compiles no accelerated backend and loads nothing dynamically; the helper exists
-/// so the path rule is decided and testable now.
-pub fn plugin_dir() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()?
-        .parent()
-        .map(Path::to_path_buf)
-}
-
-/// The cached benchmark verdict, as written beside the model cache.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CachedChoice {
-    key: String,
-    requested: String,
-    resolved: String,
-    degraded_reason: Option<String>,
-}
-
-impl CachedChoice {
-    fn into_selection(self) -> Selection {
-        Selection::new(self.requested, self.resolved, self.degraded_reason)
-    }
-}
-
 fn cache_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(SELECTION_CACHE_FILE)
 }
 
-/// Reads the cached choice, treating a missing or unreadable file as no cache.
-///
-/// A corrupt file is not an error worth failing a start over: re-running the benchmark
-/// costs a moment and rewrites the file correctly.
-fn read_cached(cache_dir: &Path) -> Option<CachedChoice> {
-    let raw = std::fs::read_to_string(cache_path(cache_dir)).ok()?;
-    serde_json::from_str(&raw).ok()
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RuntimeCache {
+    entries: BTreeMap<String, RuntimeCachedChoice>,
 }
 
-/// Writes the choice, ignoring failures — a cache that cannot be written costs a benchmark
-/// next start, which is not worth refusing to serve over.
-fn write_cached(cache_dir: &Path, key: &str, selection: &Selection) {
-    let record = CachedChoice {
-        key: key.to_string(),
-        requested: selection.requested.clone(),
-        resolved: selection.resolved.clone(),
-        degraded_reason: selection.degraded_reason.clone(),
-    };
-    let Ok(encoded) = serde_json::to_string(&record) else {
-        return;
-    };
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeCachedChoice {
+    requested: String,
+    resolved: String,
+    degraded_reason: Option<String>,
+    cuda: bool,
+    metal: bool,
+    vulkan: bool,
+}
+
+impl RuntimeCachedChoice {
+    fn from_runtime(selection: &RuntimeSelection) -> Self {
+        Self {
+            requested: selection.selection.requested.clone(),
+            resolved: selection.selection.resolved.clone(),
+            degraded_reason: selection.selection.degraded_reason.clone(),
+            cuda: selection.capabilities.cuda,
+            metal: selection.capabilities.metal,
+            vulkan: selection.capabilities.vulkan,
+        }
+    }
+
+    fn into_runtime(self) -> RuntimeSelection {
+        RuntimeSelection {
+            selection: Selection::new(self.requested, self.resolved, self.degraded_reason),
+            capabilities: BackendCapabilities {
+                cpu: true,
+                cuda: self.cuda,
+                metal: self.metal,
+                vulkan: self.vulkan,
+                ..Default::default()
+            },
+            device_index: None,
+        }
+    }
+}
+
+fn runtime_cache_key(context: SelectionContext<'_>, machine: &Machine) -> String {
+    let mut hash = Sha256::new();
+    for component in [
+        context.sidecar_version,
+        context.model_sha256,
+        context.native_build_identity,
+        context.packaged_backend_identity,
+        &machine.gpu,
+        &machine.driver,
+    ] {
+        hash.update(component.len().to_le_bytes());
+        hash.update(component.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn read_runtime_store(cache_dir: &Path) -> RuntimeCache {
+    std::fs::read(cache_path(cache_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn read_runtime_cache(cache_dir: &Path, key: &str) -> Option<RuntimeSelection> {
+    read_runtime_store(cache_dir)
+        .entries
+        .remove(key)
+        .map(RuntimeCachedChoice::into_runtime)
+}
+
+fn write_runtime_cache(cache_dir: &Path, key: &str, selection: &RuntimeSelection) {
     if std::fs::create_dir_all(cache_dir).is_err() {
         return;
     }
-    let _ = std::fs::write(cache_path(cache_dir), encoded);
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(cache_dir.join("backend-selection.lock"))
+    else {
+        return;
+    };
+    if fs4::FileExt::lock(&lock).is_err() {
+        return;
+    }
+    let mut store = read_runtime_store(cache_dir);
+    store.entries.insert(
+        key.to_string(),
+        RuntimeCachedChoice::from_runtime(selection),
+    );
+    let Ok(encoded) = serde_json::to_vec(&store) else {
+        return;
+    };
+    let Ok(mut temporary) = tempfile::NamedTempFile::new_in(cache_dir) else {
+        return;
+    };
+    if temporary.write_all(&encoded).is_err() || temporary.as_file().sync_all().is_err() {
+        return;
+    }
+    let _ = temporary.persist(cache_path(cache_dir));
+    let _ = fs4::FileExt::unlock(&lock);
+}
+
+/// Validates executable-relative dynamic module loading before invoking native code.
+pub fn load_modules_from_executable_with<F>(executable: &Path, mut loader: F) -> Result<(), String>
+where
+    F: FnMut(&Path) -> Result<(), String>,
+{
+    let parent = executable
+        .parent()
+        .ok_or_else(|| "executable has no parent directory".to_string())?;
+    let parent_text = parent
+        .to_str()
+        .ok_or_else(|| "executable parent path is not valid UTF-8".to_string())?;
+    if parent_text.as_bytes().contains(&0) {
+        return Err("executable parent path contains a NUL byte".to_string());
+    }
+    if !parent.is_dir() {
+        return Err("executable parent directory is not readable".to_string());
+    }
+    loader(parent)
+}
+
+fn module_file_name(backend: &str) -> String {
+    format!("{}ggml-{backend}{}", module_prefix(), module_suffix())
+}
+
+fn module_prefix() -> &'static str {
+    if cfg!(target_os = "windows") {
+        ""
+    } else {
+        "lib"
+    }
+}
+
+fn module_suffix() -> &'static str {
+    if cfg!(target_os = "windows") {
+        ".dll"
+    } else {
+        ".so"
+    }
+}
+
+fn packaged_module_paths(
+    directory: &Path,
+    declared: &DeclaredBackends,
+) -> Result<Vec<PathBuf>, String> {
+    packaged_module_paths_for_scope(directory, declared, true)
+}
+
+fn packaged_module_paths_for_scope(
+    directory: &Path,
+    declared: &DeclaredBackends,
+    include_accelerators: bool,
+) -> Result<Vec<PathBuf>, String> {
+    if !directory.is_dir() {
+        return Err("backend module directory is not readable".to_string());
+    }
+    let declared_names: Vec<String> = if include_accelerators {
+        [
+            (METAL, declared.metal),
+            (VULKAN, declared.vulkan),
+            (CUDA, declared.cuda),
+        ]
+        .into_iter()
+        .filter(|(_, enabled)| *enabled)
+        .map(|(backend, _)| module_file_name(backend))
+        .collect()
+    } else {
+        Vec::new()
+    };
+    let cpu_prefix = format!("{}ggml-cpu", module_prefix());
+    let mut paths = std::fs::read_dir(directory)
+        .map_err(|err| format!("cannot read backend module directory: {err}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            (name.starts_with(&cpu_prefix) && name.ends_with(module_suffix()))
+                || declared_names.iter().any(|declared| name == declared)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn load_packaged_modules_with<S, L>(
+    executable: &Path,
+    declared: &DeclaredBackends,
+    include_accelerators: bool,
+    mut score_cpu_variant: S,
+    mut loader: L,
+) -> Result<(), String>
+where
+    S: FnMut(&Path) -> Result<i32, String>,
+    L: FnMut(&Path) -> Result<(), String>,
+{
+    load_modules_from_executable_with(executable, |directory| {
+        let paths = packaged_module_paths_for_scope(directory, declared, include_accelerators)?;
+        let cpu_base_name = module_file_name(CPU);
+        let cpu_variant_prefix = format!("{}ggml-cpu-", module_prefix());
+        let cpu_base = paths.iter().find(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some(cpu_base_name.as_str())
+        });
+        let mut best: Option<(&PathBuf, i32)> = None;
+        let mut scoring_failures = Vec::new();
+        for path in paths.iter().filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&cpu_variant_prefix))
+        }) {
+            match score_cpu_variant(path) {
+                Ok(score) if score > 0 && best.is_none_or(|(_, current)| score > current) => {
+                    best = Some((path, score));
+                }
+                Ok(_) => {}
+                Err(reason) => scoring_failures.push(format!("{}: {reason}", path.display())),
+            }
+        }
+        let cpu = best.map(|(path, _)| path).or(cpu_base).ok_or_else(|| {
+            if scoring_failures.is_empty() {
+                "no supported packaged CPU backend module found beside the executable".to_string()
+            } else {
+                format!(
+                    "cannot score a packaged CPU backend module: {}",
+                    scoring_failures.join(", ")
+                )
+            }
+        })?;
+        loader(cpu).map_err(|reason| {
+            format!(
+                "llama.cpp could not load packaged CPU backend module {}: {reason}",
+                cpu.display()
+            )
+        })?;
+        if include_accelerators {
+            for path in paths.iter().filter(|path| {
+                let name = path.file_name().and_then(|name| name.to_str());
+                name != Some(cpu_base_name.as_str())
+                    && !name.is_some_and(|name| name.starts_with(&cpu_variant_prefix))
+            }) {
+                let _ = loader(path);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Loads only packaged CPU sibling modules through an injected native loader.
+pub fn load_packaged_cpu_modules_from_executable_with<S, L>(
+    executable: &Path,
+    score_cpu_variant: S,
+    loader: L,
+) -> Result<(), String>
+where
+    S: FnMut(&Path) -> Result<i32, String>,
+    L: FnMut(&Path) -> Result<(), String>,
+{
+    load_packaged_modules_with(
+        executable,
+        &DeclaredBackends::build(),
+        false,
+        score_cpu_variant,
+        loader,
+    )
+}
+
+#[cfg(feature = "dynamic-backends")]
+fn score_native_cpu_variant(path: &Path) -> Result<i32, String> {
+    // Pinned CPU variant modules export this no-argument C symbol before registration.
+    unsafe {
+        let library = libloading::Library::new(path).map_err(|err| err.to_string())?;
+        let score = library
+            .get::<unsafe extern "C" fn() -> std::ffi::c_int>(b"ggml_backend_score\0")
+            .map_err(|err| err.to_string())?;
+        Ok(score())
+    }
+}
+
+#[cfg(feature = "dynamic-backends")]
+fn load_native_module(path: &Path) -> Result<(), String> {
+    let path_text = path
+        .to_str()
+        .ok_or_else(|| "backend module path is not valid UTF-8".to_string())?;
+    let path_text = std::ffi::CString::new(path_text)
+        .map_err(|_| "backend module path contains a NUL byte".to_string())?;
+    let loaded = unsafe { llama_cpp_sys_2::ggml_backend_load(path_text.as_ptr()) };
+    if loaded.is_null() {
+        Err("native registry load returned null".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Loads only explicitly declared sibling modules and never consults loader search paths.
+#[cfg(feature = "dynamic-backends")]
+pub fn load_packaged_modules_from_executable(executable: &Path) -> Result<(), String> {
+    let declared = DeclaredBackends::build();
+    load_packaged_modules_with(
+        executable,
+        &declared,
+        true,
+        score_native_cpu_variant,
+        load_native_module,
+    )
+}
+
+/// Loads only packaged CPU sibling modules for a forced-CPU run.
+#[cfg(feature = "dynamic-backends")]
+pub fn load_packaged_cpu_modules_from_executable(executable: &Path) -> Result<(), String> {
+    load_packaged_cpu_modules_from_executable_with(
+        executable,
+        score_native_cpu_variant,
+        load_native_module,
+    )
+}
+
+/// Static builds have no sibling modules to load.
+#[cfg(not(feature = "dynamic-backends"))]
+pub fn load_packaged_modules_from_executable(_executable: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Static builds link their CPU backend and have no sibling module to load.
+#[cfg(not(feature = "dynamic-backends"))]
+pub fn load_packaged_cpu_modules_from_executable(_executable: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
+mod task3_tests {
     use super::*;
-    use crate::health::{self, Limits, ModelState};
-    use crate::manifest;
     use std::cell::Cell;
+    use std::time::Duration;
 
-    /// Counts benchmark runs so a test can prove a cache hit skipped the probe.
-    struct ProbeCounter(Cell<u32>);
-
-    struct FixedMachine(Machine);
-
-    impl MachineIdentity for FixedMachine {
-        fn identify(&self) -> Machine {
-            self.0.clone()
+    fn declared() -> DeclaredBackends {
+        DeclaredBackends {
+            metal: true,
+            vulkan: true,
+            cuda: true,
+            rocm: false,
+            dynamic_backends: true,
         }
     }
 
-    fn machine(gpu: &str, driver: &str) -> FixedMachine {
-        FixedMachine(Machine {
-            gpu: gpu.to_string(),
-            driver: driver.to_string(),
-        })
-    }
-
-    fn counted<'a>(
-        probes: &'a ProbeCounter,
-        verdict: Selection,
-    ) -> impl FnOnce(&Machine) -> Selection + 'a {
-        move |_| {
-            probes.0.set(probes.0.get() + 1);
-            verdict
+    fn context<'a>() -> SelectionContext<'a> {
+        SelectionContext {
+            sidecar_version: "0.1.0",
+            model_sha256: "model-a",
+            native_build_identity: "native-a",
+            packaged_backend_identity: "metal+vulkan+cuda",
         }
     }
 
-    fn probes() -> ProbeCounter {
-        ProbeCounter(Cell::new(0))
+    fn device(backend: &str, index: usize, description: &str) -> RuntimeDevice {
+        RuntimeDevice {
+            backend: backend.to_string(),
+            index,
+            name: format!("{backend}{index}"),
+            description: description.to_string(),
+            memory_total: 1024,
+            driver: "driver-a".to_string(),
+        }
     }
 
-    #[test]
-    fn a_forced_cpu_backend_short_circuits_the_benchmark_and_the_cache() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let selection = select_with(
-            dir.path(),
-            "0.1.0",
-            "abc",
-            &machine("gpu", "driver"),
-            Some("cpu"),
-            |_| panic!("a forced backend must not benchmark"),
-        );
-        assert_eq!(selection, Selection::cpu());
-        assert!(!cache_path(dir.path()).exists());
+    fn discovery(devices: &[RuntimeDevice]) -> Discovery {
+        discover_candidates(&declared(), devices)
     }
 
-    #[cfg(not(feature = "metal"))]
-    #[test]
-    fn the_cpu_only_build_defaults_to_cpu() {
-        assert_eq!(build_selection(), Selection::cpu());
-    }
-
-    #[cfg(feature = "metal")]
-    #[test]
-    fn the_metal_build_defaults_to_metal_with_no_degradation() {
-        let selection = build_selection();
-        assert_eq!(selection.requested, METAL);
-        assert_eq!(selection.resolved, METAL);
-        assert!(selection.accelerated);
-        assert_eq!(selection.degraded_reason, None);
-    }
-
-    #[cfg(feature = "metal")]
-    #[test]
-    fn a_forced_metal_backend_is_honoured_in_the_metal_build() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let selection = select_with(
-            dir.path(),
-            "0.1.0",
-            "abc",
-            &machine("gpu", "driver"),
-            Some("Metal"),
-            |_| panic!("a forced backend must not benchmark"),
-        );
-        assert_eq!(selection.resolved, METAL);
-        assert!(selection.accelerated);
-        assert_eq!(selection.degraded_reason, None);
-        assert!(!cache_path(dir.path()).exists());
-    }
-
-    #[cfg(feature = "metal")]
-    #[test]
-    fn the_metal_machine_reports_a_non_none_identity() {
-        let identity = MetalMachine.identify();
-        assert_ne!(identity, Machine::none());
-        assert!(!identity.gpu.is_empty());
-        assert!(!identity.driver.is_empty());
-    }
-
-    #[cfg(not(feature = "metal"))]
-    #[test]
-    fn a_forced_accelerated_backend_degrades_to_cpu_in_this_build() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let selection = select_with(
-            dir.path(),
-            "0.1.0",
-            "abc",
-            &machine("gpu", "driver"),
-            Some("Metal"),
-            |_| panic!("a forced backend must not benchmark"),
-        );
-        assert_eq!(selection.requested, "metal");
-        assert_eq!(selection.resolved, CPU);
-        assert!(!selection.accelerated);
-        assert_eq!(
-            selection.degraded_reason.as_deref(),
-            Some(NO_ACCELERATED_BACKEND)
-        );
-        assert!(!cache_path(dir.path()).exists());
-    }
-
-    #[test]
-    fn the_first_start_benchmarks_and_the_second_reads_the_cache() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let runs = probes();
-        let first = select_with(
-            dir.path(),
-            "0.1.0",
-            "abc",
-            &machine("gpu", "driver"),
-            None,
-            counted(&runs, Selection::cpu()),
-        );
-        let second = select_with(
-            dir.path(),
-            "0.1.0",
-            "abc",
-            &machine("gpu", "driver"),
-            None,
-            counted(&runs, Selection::cpu()),
-        );
-        assert_eq!(first, Selection::cpu());
-        assert_eq!(second, first);
-        assert_eq!(runs.0.get(), 1);
-    }
-
-    #[test]
-    fn a_cached_degraded_choice_round_trips_every_field() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let runs = probes();
-        let verdict =
-            Selection::degraded_to_cpu("vulkan", "vulkan lost the micro-benchmark to cpu");
-        let written = select_with(
-            dir.path(),
-            "0.1.0",
-            "abc",
-            &machine("gpu", "driver"),
-            None,
-            counted(&runs, verdict.clone()),
-        );
-        let read_back = select_with(
-            dir.path(),
-            "0.1.0",
-            "abc",
-            &machine("gpu", "driver"),
-            None,
-            |_| panic!("a cached choice must skip the probe"),
-        );
-        assert_eq!(written, verdict);
-        assert_eq!(read_back, verdict);
-        assert_eq!(runs.0.get(), 1);
-    }
-
-    #[test]
-    fn every_key_component_invalidates_the_cached_choice() {
-        let components: [(&str, &str, &str, &str); 4] = [
-            ("0.2.0", "abc", "gpu", "driver"),
-            ("0.1.0", "def", "gpu", "driver"),
-            ("0.1.0", "abc", "other-gpu", "driver"),
-            ("0.1.0", "abc", "gpu", "other-driver"),
-        ];
-        for (version, sha, gpu, driver) in components {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let runs = probes();
-            select_with(
-                dir.path(),
-                "0.1.0",
-                "abc",
-                &machine("gpu", "driver"),
-                None,
-                counted(&runs, Selection::cpu()),
-            );
-            select_with(
-                dir.path(),
-                version,
-                sha,
-                &machine(gpu, driver),
-                None,
-                counted(&runs, Selection::cpu()),
-            );
-            assert_eq!(
-                runs.0.get(),
-                2,
-                "changing ({version}, {sha}, {gpu}, {driver}) must re-benchmark"
-            );
+    fn timing(batch_1_ms: u64, batch_16_ms: u64) -> ProbeTiming {
+        ProbeTiming {
+            batch_1: Duration::from_millis(batch_1_ms),
+            batch_16: Duration::from_millis(batch_16_ms),
         }
     }
 
     #[test]
-    fn a_corrupt_cache_file_re_runs_the_benchmark() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(cache_path(dir.path()), "not json").expect("seed");
-        let runs = probes();
-        let selection = select_with(
-            dir.path(),
-            "0.1.0",
-            "abc",
-            &machine("gpu", "driver"),
-            None,
-            counted(&runs, Selection::cpu()),
-        );
-        assert_eq!(selection, Selection::cpu());
-        assert_eq!(runs.0.get(), 1);
-    }
-
-    #[test]
-    fn cache_key_changes_with_every_component() {
-        let base = cache_key("0.1.0", "abc", &Machine::none());
-        assert_ne!(base, cache_key("0.2.0", "abc", &Machine::none()));
-        assert_ne!(base, cache_key("0.1.0", "def", &Machine::none()));
-        assert_ne!(
-            base,
-            cache_key(
-                "0.1.0",
-                "abc",
-                &Machine {
-                    gpu: "other".to_string(),
-                    driver: "none".to_string()
-                }
-            )
-        );
-        assert_ne!(
-            base,
-            cache_key(
-                "0.1.0",
-                "abc",
-                &Machine {
-                    gpu: "none".to_string(),
-                    driver: "other".to_string()
-                }
-            )
-        );
-    }
-
-    #[test]
-    fn a_cpu_only_build_reports_no_accelerator_identity() {
-        assert_eq!(CpuOnlyMachine.identify(), Machine::none());
-    }
-
-    #[test]
-    fn the_plugin_dir_is_the_directory_holding_the_running_binary() {
-        let exe = std::env::current_exe().expect("current exe");
-        assert_eq!(plugin_dir().as_deref(), exe.parent());
-    }
-
-    #[test]
-    fn a_requested_but_unavailable_backend_stays_ready_and_degraded_in_health() {
-        let selection = Selection::degraded_to_cpu("vulkan", NO_ACCELERATED_BACKEND);
-        let pin = manifest::default_model();
-        let facts = crate::health::EngineFacts {
-            runtime: "llama.cpp".to_string(),
-            device: selection.resolved.clone(),
-            requested_backend: selection.requested.clone(),
-            resolved_backend: selection.resolved.clone(),
-            accelerated: selection.accelerated,
-            degraded_reason: selection.degraded_reason.clone(),
-            capabilities: crate::health::BackendCapabilities {
-                cpu: true,
-                ..Default::default()
-            },
-            llama_cpp_build: "test".to_string(),
+    fn declared_runtime_intersection_filters_transitive_metal_and_unknown_backends() {
+        let package = DeclaredBackends {
+            metal: false,
+            vulkan: true,
+            cuda: false,
+            rocm: true,
+            dynamic_backends: true,
         };
-        let value = health::build(
-            &ModelState::Ready {
-                pin,
-                dims: pin.serve_dims,
-            },
-            &facts,
-            Limits::default(),
-            "0.1.0",
+        let found = discover_candidates(
+            &package,
+            &[
+                device("Metal", 1, "Apple GPU"),
+                device("Vulkan", 2, "Vulkan GPU"),
+                device("CUDA", 3, "CUDA GPU"),
+                device("ROCm", 4, "AMD GPU"),
+                device("SYCL", 5, "Intel GPU"),
+            ],
         );
-        assert_eq!(value["ready"], true);
-        assert_eq!(value["accelerated"], false);
-        assert_eq!(value["degraded_reason"], NO_ACCELERATED_BACKEND);
-        assert_eq!(value["load_policy"]["requested_device_backend"], "vulkan");
-        assert_eq!(value["load_policy"]["resolved_device_backend"], "cpu");
-        assert_eq!(value["load_policy"]["accelerated"], false);
+
         assert_eq!(
-            value["load_policy"]["degraded_reason"],
-            NO_ACCELERATED_BACKEND
+            found
+                .candidates
+                .iter()
+                .map(|candidate| candidate.backend.as_str())
+                .collect::<Vec<_>>(),
+            vec![CPU, VULKAN]
         );
+        assert_eq!(
+            found.capabilities,
+            BackendCapabilities {
+                cpu: true,
+                vulkan: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn forced_cpu_loads_only_cpu_runtime_and_skips_discovery_benchmark_and_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executable = dir.path().join("julie-semantic-sidecar");
+        std::fs::write(&executable, b"").expect("executable");
+        for backend in ["cpu-unsupported", "cpu-good", "cpu-best", METAL, VULKAN] {
+            std::fs::write(dir.path().join(module_file_name(backend)), b"module").expect("module");
+        }
+        let scored = std::cell::RefCell::new(Vec::new());
+        let loaded = std::cell::RefCell::new(Vec::new());
+        load_packaged_cpu_modules_from_executable_with(
+            &executable,
+            |path| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("module name");
+                scored.borrow_mut().push(name.to_string());
+                Ok(if name.contains("unsupported") {
+                    0
+                } else if name.contains("best") {
+                    20
+                } else {
+                    10
+                })
+            },
+            |path| {
+                loaded.borrow_mut().push(
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .expect("module name")
+                        .to_string(),
+                );
+                Ok(())
+            },
+        )
+        .expect("cpu runtime");
+        let selected = select_runtime_with(
+            dir.path(),
+            context(),
+            Some("CPU"),
+            || panic!("cpu force must skip discovery"),
+            |_| panic!("cpu force must skip probes"),
+        )
+        .expect("selection");
+
+        assert_eq!(scored.borrow().len(), 3);
+        assert_eq!(loaded.into_inner(), vec![module_file_name("cpu-best")]);
+        assert_eq!(selected.selection, Selection::cpu());
+        assert_eq!(selected.capabilities, BackendCapabilities::cpu_only());
+        assert!(!dir.path().join(SELECTION_CACHE_FILE).exists());
+    }
+
+    #[test]
+    fn forced_backend_probes_cpu_and_only_the_requested_accelerator() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let selected = select_runtime_with(
+            dir.path(),
+            context(),
+            Some("VULKAN"),
+            || {
+                Ok(discovery(&[
+                    device("Metal", 1, "Apple GPU"),
+                    device("Vulkan", 2, "Vulkan GPU"),
+                ]))
+            },
+            |candidate| {
+                seen.borrow_mut().push(candidate.backend.clone());
+                Ok(if candidate.backend == CPU {
+                    timing(20, 200)
+                } else {
+                    timing(10, 100)
+                })
+            },
+        )
+        .expect("selection");
+
+        assert_eq!(seen.into_inner(), vec![CPU, VULKAN]);
+        assert_eq!(selected.selection.resolved, VULKAN);
+        assert_eq!(selected.device_index, Some(2));
+    }
+
+    #[test]
+    fn unknown_and_unavailable_forced_values_stay_ready_on_cpu_with_a_reason() {
+        for forced in ["sycl", "cuda"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let selected = select_runtime_with(
+                dir.path(),
+                context(),
+                Some(forced),
+                || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+                |candidate| {
+                    assert_eq!(candidate.backend, CPU);
+                    Ok(timing(20, 200))
+                },
+            )
+            .expect("selection");
+            assert_eq!(selected.selection.requested, forced);
+            assert_eq!(selected.selection.resolved, CPU);
+            assert!(selected.selection.degraded_reason.is_some());
+        }
+    }
+
+    #[test]
+    fn failed_slower_and_tied_accelerators_fall_back_to_cpu() {
+        for accelerator in [
+            Err("probe failed"),
+            Ok(timing(21, 200)),
+            Ok(timing(20, 200)),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let selected = select_runtime_with(
+                dir.path(),
+                context(),
+                None,
+                || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+                |candidate| {
+                    if candidate.backend == CPU {
+                        Ok(timing(20, 200))
+                    } else {
+                        accelerator.map_err(str::to_string)
+                    }
+                },
+            )
+            .expect("selection");
+            assert_eq!(selected.selection.resolved, CPU);
+            assert!(!selected.selection.accelerated);
+            assert!(selected.selection.degraded_reason.is_some());
+            assert!(!selected.capabilities.vulkan || accelerator.is_ok());
+        }
+    }
+
+    #[test]
+    fn cpu_probe_failure_is_fatal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = select_runtime_with(
+            dir.path(),
+            context(),
+            None,
+            || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+            |candidate| {
+                if candidate.backend == CPU {
+                    Err("cpu inference failed".to_string())
+                } else {
+                    Ok(timing(10, 100))
+                }
+            },
+        )
+        .expect_err("cpu probe failure");
+
+        assert!(error.contains("cpu probe failed"));
+        assert!(!dir.path().join(SELECTION_CACHE_FILE).exists());
+    }
+
+    #[test]
+    fn every_cache_identity_component_invalidates_independently() {
+        let variants = [
+            SelectionContext {
+                sidecar_version: "0.2.0",
+                ..context()
+            },
+            SelectionContext {
+                model_sha256: "model-b",
+                ..context()
+            },
+            SelectionContext {
+                native_build_identity: "native-b",
+                ..context()
+            },
+            SelectionContext {
+                packaged_backend_identity: "vulkan",
+                ..context()
+            },
+        ];
+        for variant in variants {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let probes = Cell::new(0);
+            for current in [context(), variant] {
+                let selected = select_runtime_with(
+                    dir.path(),
+                    current,
+                    None,
+                    || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+                    |candidate| {
+                        probes.set(probes.get() + 1);
+                        Ok(if candidate.backend == CPU {
+                            timing(20, 200)
+                        } else {
+                            timing(10, 100)
+                        })
+                    },
+                )
+                .expect("selection");
+                assert_eq!(selected.selection.resolved, VULKAN);
+            }
+            assert_eq!(probes.get(), 4);
+        }
+    }
+
+    #[test]
+    fn gpu_and_driver_identity_each_invalidate_the_cache() {
+        for changed in [
+            device("Vulkan", 2, "Other GPU"),
+            RuntimeDevice {
+                driver: "driver-b".to_string(),
+                ..device("Vulkan", 2, "Vulkan GPU")
+            },
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let probes = Cell::new(0);
+            for gpu in [device("Vulkan", 2, "Vulkan GPU"), changed] {
+                select_runtime_with(
+                    dir.path(),
+                    context(),
+                    None,
+                    || Ok(discovery(&[gpu])),
+                    |candidate| {
+                        probes.set(probes.get() + 1);
+                        Ok(if candidate.backend == CPU {
+                            timing(20, 200)
+                        } else {
+                            timing(10, 100)
+                        })
+                    },
+                )
+                .expect("selection");
+            }
+            assert_eq!(probes.get(), 4);
+        }
+    }
+
+    #[test]
+    fn alternating_models_keep_both_cached_verdicts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probes = Cell::new(0);
+        for model_sha256 in ["model-a", "model-b", "model-a", "model-b"] {
+            select_runtime_with(
+                dir.path(),
+                SelectionContext {
+                    model_sha256,
+                    ..context()
+                },
+                None,
+                || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+                |candidate| {
+                    probes.set(probes.get() + 1);
+                    Ok(if candidate.backend == CPU {
+                        timing(20, 200)
+                    } else {
+                        timing(10, 100)
+                    })
+                },
+            )
+            .expect("selection");
+        }
+        assert_eq!(probes.get(), 4);
+    }
+
+    #[test]
+    fn corrupt_cache_recovers_by_probing_and_rewriting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(SELECTION_CACHE_FILE), "not json").expect("seed");
+        let probes = Cell::new(0);
+        let selected = select_runtime_with(
+            dir.path(),
+            context(),
+            None,
+            || Ok(discovery(&[device("Vulkan", 2, "Vulkan GPU")])),
+            |candidate| {
+                probes.set(probes.get() + 1);
+                Ok(if candidate.backend == CPU {
+                    timing(20, 200)
+                } else {
+                    timing(10, 100)
+                })
+            },
+        )
+        .expect("selection");
+        assert_eq!(selected.selection.resolved, VULKAN);
+        assert_eq!(probes.get(), 2);
+        assert!(serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(dir.path().join(SELECTION_CACHE_FILE)).expect("cache")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn loader_uses_the_executable_parent_and_reports_missing_modules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("julie-semantic-sidecar");
+        std::fs::write(&exe, b"").expect("exe");
+        let loaded = std::cell::RefCell::new(None);
+        load_modules_from_executable_with(&exe, |path| {
+            *loaded.borrow_mut() = Some(path.to_path_buf());
+            Err("module missing".to_string())
+        })
+        .expect_err("missing module");
+        assert_eq!(loaded.into_inner().as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn packaged_module_discovery_ignores_arbitrary_environment_and_undeclared_modules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let vulkan = dir.path().join(module_file_name(VULKAN));
+        let cuda = dir.path().join(module_file_name(CUDA));
+        let arbitrary = outside.path().join(module_file_name(VULKAN));
+        for path in [&vulkan, &cuda, &arbitrary] {
+            std::fs::write(path, b"module").expect("module");
+        }
+        std::env::set_var("GGML_BACKEND_PATH", outside.path());
+        let package = DeclaredBackends {
+            metal: false,
+            vulkan: true,
+            cuda: false,
+            rocm: false,
+            dynamic_backends: true,
+        };
+        let found = packaged_module_paths(dir.path(), &package).expect("paths");
+        std::env::remove_var("GGML_BACKEND_PATH");
+
+        assert_eq!(found, vec![vulkan]);
+    }
+
+    #[test]
+    fn rocm_feature_does_not_load_hip_or_invent_a_rocm_module() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cpu = dir.path().join(module_file_name("cpu-test"));
+        let hip = dir.path().join(module_file_name("hip"));
+        let rocm = dir.path().join(module_file_name("rocm"));
+        for path in [&cpu, &hip, &rocm] {
+            std::fs::write(path, b"module").expect("module");
+        }
+        let package = DeclaredBackends {
+            metal: false,
+            vulkan: false,
+            cuda: false,
+            rocm: true,
+            dynamic_backends: true,
+        };
+
+        assert_eq!(
+            packaged_module_paths(dir.path(), &package).expect("paths"),
+            vec![cpu]
+        );
+    }
+
+    #[test]
+    fn zero_scoring_cpu_variants_fall_back_to_the_base_cpu_module() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executable = dir.path().join("julie-semantic-sidecar");
+        std::fs::write(&executable, b"").expect("executable");
+        for backend in [CPU, "cpu-unsupported-a", "cpu-unsupported-b"] {
+            std::fs::write(dir.path().join(module_file_name(backend)), b"module").expect("module");
+        }
+        let loaded = std::cell::RefCell::new(Vec::new());
+
+        load_packaged_cpu_modules_from_executable_with(
+            &executable,
+            |_| Ok(0),
+            |path| {
+                loaded.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            },
+        )
+        .expect("base cpu fallback");
+
+        assert_eq!(
+            loaded.into_inner(),
+            vec![dir.path().join(module_file_name(CPU))]
+        );
+    }
+
+    #[test]
+    fn full_loader_registers_one_cpu_winner_and_each_declared_stable_accelerator() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executable = dir.path().join("julie-semantic-sidecar");
+        std::fs::write(&executable, b"").expect("executable");
+        for backend in ["cpu-good", "cpu-best", METAL, VULKAN, CUDA, "hip"] {
+            std::fs::write(dir.path().join(module_file_name(backend)), b"module").expect("module");
+        }
+        let declared = DeclaredBackends {
+            metal: true,
+            vulkan: false,
+            cuda: true,
+            rocm: true,
+            dynamic_backends: true,
+        };
+        let loaded = std::cell::RefCell::new(Vec::new());
+
+        load_packaged_modules_with(
+            &executable,
+            &declared,
+            true,
+            |path| {
+                Ok(if path.ends_with(module_file_name("cpu-best")) {
+                    20
+                } else {
+                    10
+                })
+            },
+            |path| {
+                loaded.borrow_mut().push(
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .expect("module name")
+                        .to_string(),
+                );
+                Ok(())
+            },
+        )
+        .expect("modules");
+
+        assert_eq!(
+            loaded.into_inner(),
+            vec![
+                module_file_name("cpu-best"),
+                module_file_name(CUDA),
+                module_file_name(METAL),
+            ]
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn native_backend_modules_use_the_cmake_module_suffix() {
+        assert_eq!(module_file_name(METAL), "libggml-metal.so");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_executable_parent_is_rejected_without_calling_the_loader() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'/', b't', b'm', b'p', b'/', 0xff, b'/', b'x',
+        ]));
+        let called = Cell::new(false);
+        let error = load_modules_from_executable_with(&path, |_| {
+            called.set(true);
+            Ok(())
+        })
+        .expect_err("non utf8 path");
+        assert!(error.contains("UTF-8"));
+        assert!(!called.get());
     }
 }

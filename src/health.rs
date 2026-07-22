@@ -53,6 +53,14 @@ pub struct BackendCapabilities {
 }
 
 impl BackendCapabilities {
+    /// The guaranteed floor before any accelerator proves usable.
+    pub fn cpu_only() -> Self {
+        Self {
+            cpu: true,
+            ..Self::default()
+        }
+    }
+
     fn to_value(self) -> Value {
         json!({
             "cpu": { "available": self.cpu },

@@ -235,6 +235,9 @@ fn a8_health_capabilities_carry_the_four_reference_backends() {
             "capabilities.{backend}.available must be boolean"
         );
     }
+    for backend in ["hip", "sycl"] {
+        assert!(capabilities.get(backend).is_none());
+    }
 }
 
 #[test]

@@ -360,6 +360,7 @@ dependencies = [
  "dirs",
  "fs4",
  "libc",
+ "libloading",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "serde",

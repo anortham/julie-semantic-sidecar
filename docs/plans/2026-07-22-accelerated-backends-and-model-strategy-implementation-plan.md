@@ -160,13 +160,13 @@
 
 **Acceptance:**
 
-- [ ] No production path returns a fixed accelerator choice without timing it against CPU.
-- [ ] The cached choice invalidates for native build, package backend, GPU, driver, sidecar version, or model SHA changes.
-- [ ] Alternating BGE and Qwen reuses each model's matching cached verdict instead of overwriting one global slot.
-- [ ] Missing/failing/slower acceleration is ready on CPU and explains why.
-- [ ] Reported device, requested/resolved backend, acceleration, degradation, and capabilities match the runtime outcome.
-- [ ] No HIP/SYCL key or false alias is emitted under the current v1 contract.
-- [ ] Entire-session stdout purity still passes.
+- [x] No production path returns a fixed accelerator choice without timing it against CPU.
+- [x] The cached choice invalidates for native build, package backend, GPU, driver, sidecar version, or model SHA changes.
+- [x] Alternating BGE and Qwen reuses each model's matching cached verdict instead of overwriting one global slot.
+- [x] Missing/failing/slower acceleration is ready on CPU and explains why.
+- [x] Reported device, requested/resolved backend, acceleration, degradation, and capabilities match the runtime outcome.
+- [x] No HIP/SYCL key or false alias is emitted under the current v1 contract.
+- [x] Entire-session stdout purity still passes.
 
 ## Task 4: Produce reproducible, self-describing archives
 
