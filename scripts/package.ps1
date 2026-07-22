@@ -33,10 +33,10 @@ if ($effectiveRustFlags.Contains("target-cpu=native")) {
 }
 
 $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
-$isWindows = $settings.Target.Contains("windows")
-$exe = if ($isWindows) { "julie-semantic-sidecar.exe" } else { "julie-semantic-sidecar" }
-$helper = if ($isWindows) { "julie-package-manifest.exe" } else { "julie-package-manifest" }
-$archiveKind = if ($isWindows) { "zip" } else { "tar.gz" }
+$targetIsWindows = $settings.Target.Contains("windows")
+$exe = if ($targetIsWindows) { "julie-semantic-sidecar.exe" } else { "julie-semantic-sidecar" }
+$helper = if ($targetIsWindows) { "julie-package-manifest.exe" } else { "julie-package-manifest" }
+$archiveKind = if ($targetIsWindows) { "zip" } else { "tar.gz" }
 
 $cargoArguments = @(
     "build", "--release", "--target", $settings.Target,
@@ -52,7 +52,13 @@ $nativeOut = @(
 )
 if ($nativeOut.Count -ne 1) { throw "expected one llama-cpp-sys out_dir, found $($nativeOut.Count)" }
 
-$buildDir = Join-Path $repoRoot "target/$($settings.Target)/release"
+$cargoTargetDir = if ($env:CARGO_TARGET_DIR) {
+    [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR, $repoRoot)
+}
+else {
+    Join-Path $repoRoot "target"
+}
+$buildDir = Join-Path $cargoTargetDir "$($settings.Target)/release"
 $stageRoot = Join-Path $repoRoot "dist"
 $stage = Join-Path $stageRoot $Profile
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
@@ -68,7 +74,7 @@ function Copy-NativeFile([System.IO.FileInfo]$Source) {
 }
 
 if ($settings.Features.Contains("dynamic-backends")) {
-    $nativeLibraryDirectories = @("lib", "lib64") |
+    $nativeLibraryDirectories = @("bin", "lib", "lib64") |
         ForEach-Object { Join-Path $nativeOut[0] $_ } |
         Where-Object { Test-Path $_ }
     Get-ChildItem -File $nativeLibraryDirectories | ForEach-Object { Copy-NativeFile $_ }

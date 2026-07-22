@@ -265,7 +265,7 @@ Metal remains compiled into the Apple Silicon executable, so its manifest declar
 
 **Acceptance:**
 
-- [ ] Windows and Linux portable Vulkan archives have real-device proof and CPU fallback proof.
+- [x] Windows and Linux portable Vulkan archives have real-device proof and CPU fallback proof.
 - [ ] CUDA is called supported only after real NVIDIA proof.
 - [ ] ROCm and SYCL remain unshipped until their separate contract/build prerequisites and real hardware gates pass.
 
