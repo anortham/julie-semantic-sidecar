@@ -294,6 +294,13 @@ fn packaging_scripts_use_the_shared_helper_before_backend_tier_archives() {
 }
 
 #[test]
+fn packaging_scripts_stage_native_core_libraries_from_lib_or_lib64() {
+    for script in packaging_scripts() {
+        assert!(script.contains("lib64"));
+    }
+}
+
+#[test]
 fn packaging_scripts_reject_native_cpu_flags_and_contain_no_publication_behavior() {
     let [bash, powershell] = packaging_scripts();
     for script in [&bash, &powershell] {

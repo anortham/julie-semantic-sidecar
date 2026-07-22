@@ -1286,7 +1286,14 @@ fn hardware_smoke_entry_points_require_an_exact_unpacked_archive() {
         assert!(script.contains("package-manifest.json"), "{path}");
         assert!(script.contains("backend-selection.json"), "{path}");
         assert!(script.contains("software"), "{path}");
+        assert!(script.contains("health.get(\"device\""), "{path}");
+        assert!(script.contains("using device"), "{path}");
+        assert!(
+            script.contains("PHYSICAL_DEVICE_TYPE_(INTEGRATED|DISCRETE)_GPU"),
+            "{path}"
+        );
         assert!(script.contains("conformance"), "{path}");
+        assert!(script.contains("prepare failed after 3 attempts"), "{path}");
         assert!(script.contains("--batch 1"), "{path}");
         assert!(script.contains("--batch 16"), "{path}");
         assert!(

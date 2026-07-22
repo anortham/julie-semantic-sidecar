@@ -97,8 +97,10 @@ copy_native_file() {
 }
 
 if [[ "$features" == *dynamic-backends* ]]; then
-  for source in "$native_out/lib/"*; do
-    [[ -e "$source" ]] && copy_native_file "$source"
+  for native_lib_dir in "$native_out/lib" "$native_out/lib64"; do
+    for source in "$native_lib_dir/"*; do
+      [[ -e "$source" ]] && copy_native_file "$source"
+    done
   done
   for source in "$native_out/backends/"*; do
     [[ -e "$source" ]] || continue

@@ -68,7 +68,10 @@ function Copy-NativeFile([System.IO.FileInfo]$Source) {
 }
 
 if ($settings.Features.Contains("dynamic-backends")) {
-    Get-ChildItem -File (Join-Path $nativeOut[0] "lib") | ForEach-Object { Copy-NativeFile $_ }
+    $nativeLibraryDirectories = @("lib", "lib64") |
+        ForEach-Object { Join-Path $nativeOut[0] $_ } |
+        Where-Object { Test-Path $_ }
+    Get-ChildItem -File $nativeLibraryDirectories | ForEach-Object { Copy-NativeFile $_ }
     Get-ChildItem -File (Join-Path $nativeOut[0] "backends") | ForEach-Object {
         if ($_.Name -match '^(lib)?ggml-cpu' -or $_.Name -match "^(lib)?ggml-$($settings.Backend)\.") {
             Copy-NativeFile $_

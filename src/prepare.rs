@@ -313,6 +313,15 @@ pub fn acquire(
     cache_dir: &Path,
     events: &mut dyn Write,
 ) -> Result<Prepared, PrepareError> {
+    acquire_with_timeouts(request, cache_dir, events, DOWNLOAD_TIMEOUTS)
+}
+
+fn acquire_with_timeouts(
+    request: &PrepareRequest,
+    cache_dir: &Path,
+    events: &mut dyn Write,
+    timeouts: DownloadTimeouts,
+) -> Result<Prepared, PrepareError> {
     let final_path = cache_dir.join(&request.file_name);
 
     if let Err(err) = std::fs::create_dir_all(cache_dir) {
@@ -331,7 +340,7 @@ pub fn acquire(
         Ok(lock) => lock,
         Err(message) => return Err(report(events, request, &final_path, message)),
     };
-    let outcome = acquire_locked(request, &final_path, cache_dir, events);
+    let outcome = acquire_locked(request, &final_path, cache_dir, events, timeouts);
     let _ = FileExt::unlock(&lock);
     match outcome {
         Ok(prepared) => Ok(prepared),
@@ -360,6 +369,7 @@ fn acquire_locked(
     final_path: &Path,
     cache_dir: &Path,
     events: &mut dyn Write,
+    timeouts: DownloadTimeouts,
 ) -> Result<Prepared, String> {
     if final_path.exists() {
         match file_digest(final_path) {
@@ -389,7 +399,7 @@ fn acquire_locked(
     }
 
     preflight_disk(cache_dir, request.size_bytes)?;
-    download_verified(request, final_path, cache_dir, events)?;
+    download_verified(request, final_path, cache_dir, events, timeouts)?;
     emit_done(events, &request.model_id, final_path, &request.sha256);
     Ok(Prepared {
         path: final_path.to_path_buf(),
@@ -417,38 +427,39 @@ fn preflight_disk(cache_dir: &Path, size_bytes: u64) -> Result<(), String> {
 /// these a server that accepts and then stalls would block forever while `acquire`
 /// holds the per-model lock — hanging every concurrent prepare instead of failing loud.
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
-/// Whole-call ceiling, sized for the 1.2 GiB qwen3 pin at roughly 500 KiB/s.
-const DOWNLOAD_TOTAL_TIMEOUT_SECS: u64 = 2_700;
-/// Escape hatch for slower links (and the deadline lever for the stall tests).
-const DOWNLOAD_TIMEOUT_ENV: &str = "JULIE_SIDECAR_DOWNLOAD_TIMEOUT_SECS";
+const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+const DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(2_700);
 
-fn download_total_timeout() -> Duration {
-    let secs = std::env::var(DOWNLOAD_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DOWNLOAD_TOTAL_TIMEOUT_SECS);
-    Duration::from_secs(secs)
+#[derive(Clone, Copy)]
+struct DownloadTimeouts {
+    connect: Duration,
+    response: Duration,
+    total: Duration,
 }
+
+const DOWNLOAD_TIMEOUTS: DownloadTimeouts = DownloadTimeouts {
+    connect: DOWNLOAD_CONNECT_TIMEOUT,
+    response: DOWNLOAD_RESPONSE_TIMEOUT,
+    total: DOWNLOAD_TOTAL_TIMEOUT,
+};
 
 fn download_verified(
     request: &PrepareRequest,
     final_path: &Path,
     cache_dir: &Path,
     events: &mut dyn Write,
+    timeouts: DownloadTimeouts,
 ) -> Result<(), String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(DOWNLOAD_CONNECT_TIMEOUT))
-        .timeout_recv_response(Some(DOWNLOAD_RESPONSE_TIMEOUT))
-        .timeout_global(Some(download_total_timeout()))
+        .timeout_connect(Some(timeouts.connect))
+        .timeout_recv_response(Some(timeouts.response))
+        .timeout_global(Some(timeouts.total))
         .build()
         .into();
-    let mut response = agent.get(&request.source_url).call().map_err(|err| {
-        format!(
-            "cannot fetch {}: {err} (raise {DOWNLOAD_TIMEOUT_ENV} for a slow link)",
-            request.source_url
-        )
-    })?;
+    let mut response = agent
+        .get(&request.source_url)
+        .call()
+        .map_err(|err| format!("cannot fetch {}: {err}; retry prepare", request.source_url))?;
     let total_bytes = request.size_bytes;
     if let Some(offered) = response.body_mut().content_length() {
         if offered != total_bytes {
@@ -477,12 +488,9 @@ fn download_verified(
     let mut last_progress = Instant::now();
     emit_progress(events, &request.model_id, received, total_bytes);
     loop {
-        let read = reader.read(&mut buffer).map_err(|err| {
-            format!(
-                "cannot read {}: {err} (raise {DOWNLOAD_TIMEOUT_ENV} for a slow link)",
-                request.source_url
-            )
-        })?;
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|err| format!("cannot read {}: {err}; retry prepare", request.source_url))?;
         if read == 0 {
             break;
         }
@@ -614,4 +622,45 @@ fn emit_error(
             "source_url": source_url,
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn a_stalled_download_times_out_and_releases_the_model_lock() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/model.gguf", listener.local_addr().expect("addr"));
+        thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                thread::sleep(Duration::from_secs(2));
+                drop(stream);
+            }
+        });
+        let cache = tempfile::tempdir().expect("tempdir");
+        let request = PrepareRequest {
+            model_id: "stall-model".to_string(),
+            file_name: "stall-model.gguf".to_string(),
+            source_url: url,
+            sha256: "0".repeat(64),
+            size_bytes: 1,
+        };
+        let timeouts = DownloadTimeouts {
+            connect: Duration::from_millis(100),
+            response: Duration::from_millis(100),
+            total: Duration::from_millis(200),
+        };
+        let mut output = Vec::new();
+
+        let error = acquire_with_timeouts(&request, cache.path(), &mut output, timeouts)
+            .expect_err("stall must time out");
+
+        assert!(error.message().contains("retry prepare"), "{error}");
+        assert!(!error.message().contains("JULIE_SIDECAR_"), "{error}");
+        let lock = cache.path().join("stall-model.lock");
+        assert!(try_hold(&lock).is_some(), "model lock remained held");
+    }
 }

@@ -202,6 +202,8 @@ else:
         raise SystemExit(f"prepared health mismatch: {responses[0]}")
     if expectation == "accelerated" and (health.get("resolved_backend") != advertised or health.get("accelerated") is not True):
         raise SystemExit(f"accelerator health mismatch: {responses[0]}")
+    if expectation == "accelerated" and any(marker in str(health.get("device", "")).lower() for marker in ("llvmpipe", "lavapipe", "swiftshader", "software rasterizer", "microsoft basic render")):
+        raise SystemExit(f"software device was selected: {responses[0]}")
     if expectation == "cpu" and (health.get("resolved_backend") != "cpu" or health.get("accelerated") is not False):
         raise SystemExit(f"forced CPU health mismatch: {responses[0]}")
     if expectation == "fallback" and (health.get("resolved_backend") != "cpu" or health.get("accelerated") is not False or not health.get("degraded_reason")):
@@ -257,19 +259,40 @@ case "$backend" in
     fallback_backend="metal"
     ;;
 esac
-if grep -Eiq 'llvmpipe|lavapipe|swiftshader|software rasterizer|microsoft basic render' "$evidence_dir/raw-logs/device.txt"; then
+device_report="$evidence_dir/raw-logs/device.txt"
+if grep -Eiq 'llvmpipe|lavapipe|swiftshader|software rasterizer|microsoft basic render' "$device_report" \
+  && { [[ "$backend" != "vulkan" ]] || ! grep -Eq 'deviceType.*PHYSICAL_DEVICE_TYPE_(INTEGRATED|DISCRETE)_GPU' "$device_report"; }; then
   echo "hardware-smoke: software renderer is not real-device evidence" >&2
   exit 1
 fi
 
+prepare_model() {
+  local model="$1"
+  local log="$evidence_dir/raw-logs/prepare-$model.log"
+  : >"$log"
+  for attempt in 1 2 3; do
+    if JULIE_EMBEDDING_CACHE_DIR="$cache_dir" "$binary" prepare --model "$model" >>"$log" 2>&1; then
+      return 0
+    fi
+    printf 'hardware-smoke: prepare attempt %s failed for %s\n' "$attempt" "$model" >>"$log"
+    [[ "$attempt" == "3" ]] || sleep $((attempt * 30))
+  done
+  echo "hardware-smoke: prepare failed after 3 attempts: $model" >&2
+  return 1
+}
+
 for model in bge-small-en-v1.5-f32 qwen3-0.6b-f16; do
-  JULIE_EMBEDDING_CACHE_DIR="$cache_dir" "$binary" prepare --model "$model" \
-    >"$evidence_dir/raw-logs/prepare-$model.log" 2>&1
+  prepare_model "$model"
 done
 
 selection_cache="$cache_dir/backend-selection.json"
 rm -f "$selection_cache"
 protocol_smoke "selection-rebuild" "$cache_dir" "" "accelerated"
+if grep -Eiq 'using device .*\b(llvmpipe|lavapipe|swiftshader|software rasterizer|microsoft basic render)\b' \
+  "$evidence_dir/raw-logs/selection-rebuild.stderr.log"; then
+  echo "hardware-smoke: software device was selected" >&2
+  exit 1
+fi
 if [[ ! -f "$selection_cache" ]]; then
   echo "hardware-smoke: selection cache was not rebuilt" >&2
   exit 1

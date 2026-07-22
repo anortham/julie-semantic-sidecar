@@ -57,6 +57,8 @@ else:
         raise SystemExit(f"prepared health mismatch: {responses[0]}")
     if expectation == "accelerated" and (health.get("resolved_backend") != advertised or health.get("accelerated") is not True):
         raise SystemExit(f"accelerator health mismatch: {responses[0]}")
+    if expectation == "accelerated" and any(marker in str(health.get("device", "")).lower() for marker in ("llvmpipe", "lavapipe", "swiftshader", "software rasterizer", "microsoft basic render")):
+        raise SystemExit(f"software device was selected: {responses[0]}")
     if expectation == "cpu" and (health.get("resolved_backend") != "cpu" or health.get("accelerated") is not False):
         raise SystemExit(f"forced CPU health mismatch: {responses[0]}")
     if expectation == "fallback" and (health.get("resolved_backend") != "cpu" or health.get("accelerated") is not False or not health.get("degraded_reason")):
@@ -129,6 +131,19 @@ function Invoke-Conformance([string]$RequestedBackend) {
     $arguments = @('test', '--release', '--test', 'conformance', '--', '--ignored', '--test-threads=1', '--nocapture')
     & cargo @arguments *> $log
     if ($LASTEXITCODE -ne 0) { throw "conformance failed: $RequestedBackend" }
+}
+
+function Invoke-Prepare([string]$Model) {
+    $env:JULIE_EMBEDDING_CACHE_DIR = $CacheDir
+    $prepareLog = Join-Path $EvidenceDir "raw-logs/prepare-$Model.log"
+    Set-Content -LiteralPath $prepareLog -Value '' -NoNewline
+    foreach ($attempt in 1..3) {
+        & $script:binary prepare --model $Model *>> $prepareLog
+        if ($LASTEXITCODE -eq 0) { return }
+        "hardware-smoke: prepare attempt $attempt failed for $Model" | Add-Content -LiteralPath $prepareLog
+        if ($attempt -ne 3) { Start-Sleep -Seconds ($attempt * 30) }
+    }
+    throw "prepare failed after 3 attempts: $Model"
 }
 
 try {
@@ -220,20 +235,23 @@ try {
             $fallbackBackend = 'metal'
         }
     }
-    if ((Get-Content -Raw $deviceLog) -match '(?i)llvmpipe|lavapipe|swiftshader|software rasterizer|microsoft basic render') {
+    $deviceReport = Get-Content -Raw $deviceLog
+    if ($deviceReport -match '(?i)llvmpipe|lavapipe|swiftshader|software rasterizer|microsoft basic render' -and
+        ($Backend -ne 'vulkan' -or $deviceReport -notmatch 'deviceType.*PHYSICAL_DEVICE_TYPE_(INTEGRATED|DISCRETE)_GPU')) {
         throw 'software renderer is not real-device evidence'
     }
 
     foreach ($model in @('bge-small-en-v1.5-f32', 'qwen3-0.6b-f16')) {
-        $env:JULIE_EMBEDDING_CACHE_DIR = $CacheDir
-        $prepareLog = Join-Path $EvidenceDir "raw-logs/prepare-$model.log"
-        & $binary prepare --model $model *> $prepareLog
-        if ($LASTEXITCODE -ne 0) { throw "prepare failed: $model" }
+        Invoke-Prepare $model
     }
 
     $selectionCache = Join-Path $CacheDir 'backend-selection.json'
     Remove-Item -Force -ErrorAction SilentlyContinue $selectionCache
     Invoke-ProtocolSmoke 'selection-rebuild' $CacheDir '' 'accelerated'
+    $selectionLog = Get-Content -Raw (Join-Path $EvidenceDir 'raw-logs/selection-rebuild.stderr.log')
+    if ($selectionLog -match '(?i)using device .*\b(llvmpipe|lavapipe|swiftshader|software rasterizer|microsoft basic render)\b') {
+        throw 'software device was selected'
+    }
     if (-not (Test-Path -LiteralPath $selectionCache -PathType Leaf)) { throw 'selection cache was not rebuilt' }
     $selectionBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $selectionCache).Hash
     Invoke-ProtocolSmoke 'selection-reuse' $CacheDir '' 'accelerated'

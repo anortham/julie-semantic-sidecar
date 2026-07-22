@@ -480,64 +480,6 @@ fn an_interrupted_download_leaves_a_partial_that_later_cleanup_removes() {
     assert!(cache.path().join("named-model.lock").exists());
 }
 
-struct TimeoutEnvGuard;
-
-impl TimeoutEnvGuard {
-    fn set(secs: &str) -> Self {
-        std::env::set_var("JULIE_SIDECAR_DOWNLOAD_TIMEOUT_SECS", secs);
-        TimeoutEnvGuard
-    }
-}
-
-impl Drop for TimeoutEnvGuard {
-    fn drop(&mut self) {
-        std::env::remove_var("JULIE_SIDECAR_DOWNLOAD_TIMEOUT_SECS");
-    }
-}
-
-#[test]
-fn a_stalled_server_fails_the_download_and_releases_the_model_lock() {
-    let body = b"stalled-then-served".to_vec();
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let stalled_url = format!("http://{}/model.gguf", listener.local_addr().expect("addr"));
-    // Detached on purpose: accepts one connection and never writes a byte. Joining a
-    // sleeping handler (the Fixture pattern) would hang the test's own teardown.
-    thread::spawn(move || {
-        if let Ok((stream, _)) = listener.accept() {
-            thread::sleep(Duration::from_secs(30));
-            drop(stream);
-        }
-    });
-    let cache = tempfile::tempdir().expect("tempdir");
-    let mut request = request_for_url(&stalled_url, &body);
-    request.model_id = "stall-model".to_string();
-    request.file_name = "stall-model.gguf".to_string();
-    let _env = env_guard();
-    let _guard = TimeoutEnvGuard::set("5");
-    let mut out = Vec::new();
-
-    let started = std::time::Instant::now();
-    let err = prepare::acquire(&request, cache.path(), &mut out).expect_err("stall must not hang");
-    assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "the deadline must fire long before the 30 s stall"
-    );
-    assert!(
-        err.message()
-            .contains("JULIE_SIDECAR_DOWNLOAD_TIMEOUT_SECS"),
-        "the error must name the slow-link escape hatch: {}",
-        err.message()
-    );
-
-    let healthy = Fixture::start(body.clone(), Duration::ZERO);
-    let mut request = request_for(&healthy, &body);
-    request.model_id = "stall-model".to_string();
-    request.file_name = "stall-model.gguf".to_string();
-    let mut out = Vec::new();
-    prepare::acquire(&request, cache.path(), &mut out)
-        .expect("the stalled attempt must release the model lock");
-}
-
 #[test]
 fn a_content_length_disagreeing_with_the_pin_fails_before_the_body_is_read() {
     let body = vec![b'x'; 4096];

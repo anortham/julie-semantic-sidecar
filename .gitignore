@@ -5,3 +5,6 @@
 /models
 *.gguf
 .worktrees/
+/artifact-validation/
+/dist/
+/hardware-evidence/

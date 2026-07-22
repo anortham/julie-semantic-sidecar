@@ -43,12 +43,19 @@ const RUNTIME: &str = "llama.cpp";
 /// Probe used to measure the tokenizer's per-input special-token overhead.
 const OVERHEAD_PROBE: &str = "probe";
 
-/// Ceiling on tokens encoded in a single llama context.
+/// Ceiling on context cells encoded in one multi-input llama context.
 ///
 /// Bounds peak memory: a 250-item batch of budget-length Qwen3 inputs would otherwise ask
 /// for millions of context tokens at once. Inputs are grouped under this ceiling, and a
 /// single input longer than it still gets a context sized to fit it exactly.
-const MAX_TOKENS_PER_ENCODE: usize = 16_384;
+const MAX_TOKENS_PER_ENCODE: usize = 4_096;
+
+/// Ceiling on concurrent sequences in one causal decode.
+///
+/// llama.cpp's Vulkan graph reserves a single compute allocation that grows with the
+/// sequence count. The portable profile's 6 GiB device fails at 120 Qwen3 sequences even
+/// when the context is below 4k cells; 64 leaves allocation headroom across drivers.
+const MAX_DECODE_SEQUENCES: usize = 64;
 
 /// Bytes read per digest chunk when the cached model file is verified at load.
 const DIGEST_CHUNK_BYTES: usize = 1024 * 1024;
@@ -658,12 +665,12 @@ impl EmbedEngine for LlamaEngine {
 
         // A cls-pooled encoder must hold its whole group in one micro-batch, so its groups
         // are bounded by the micro-batch ceiling rather than the larger encode ceiling.
-        let group_budget = match self.pin.pooling {
-            Pooling::Cls => MAX_CLS_GROUP_TOKENS,
-            Pooling::Last => MAX_TOKENS_PER_ENCODE,
+        let (group_budget, max_sequences) = match self.pin.pooling {
+            Pooling::Cls => (MAX_CLS_GROUP_TOKENS, health::MAX_BATCH_ITEMS),
+            Pooling::Last => (MAX_TOKENS_PER_ENCODE, MAX_DECODE_SEQUENCES),
         };
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
-        for group in group_by_cell_budget(&inputs, group_budget) {
+        for group in group_by_cell_budget(&inputs, group_budget, max_sequences) {
             vectors.extend(isolate(&group, dims, &|items| self.encode_group(items))?);
         }
 
@@ -687,7 +694,7 @@ impl EmbedEngine for LlamaEngine {
     }
 }
 
-/// Groups inputs into runs whose CONTEXT CELLS stay under `budget`.
+/// Groups inputs into runs whose CONTEXT CELLS and sequence count stay under their limits.
 ///
 /// The context a group needs is `longest member x member count`, because llama.cpp
 /// partitions `n_ctx` evenly across sequences — so the budget is applied to that product,
@@ -695,18 +702,25 @@ impl EmbedEngine for LlamaEngine {
 /// also fits a same-sized batch/ubatch ceiling. An input longer than the budget forms a
 /// group of its own rather than being dropped or split — it is already fitted to the
 /// model's own limit.
-pub fn group_by_cell_budget<T>(inputs: &[T], budget: usize) -> Vec<Vec<&Vec<LlamaToken>>>
+pub fn group_by_cell_budget<T>(
+    inputs: &[T],
+    budget: usize,
+    max_sequences: usize,
+) -> Vec<Vec<&Vec<LlamaToken>>>
 where
     T: std::borrow::Borrow<Vec<LlamaToken>>,
 {
     let mut groups: Vec<Vec<&Vec<LlamaToken>>> = Vec::new();
     let mut current: Vec<&Vec<LlamaToken>> = Vec::new();
     let mut current_max = 0usize;
+    let max_sequences = max_sequences.max(1);
 
     for input in inputs {
         let tokens = input.borrow();
         let next_max = current_max.max(tokens.len());
-        if !current.is_empty() && next_max * (current.len() + 1) > budget {
+        if !current.is_empty()
+            && (current.len() >= max_sequences || next_max * (current.len() + 1) > budget)
+        {
             groups.push(std::mem::take(&mut current));
             current_max = 0;
         }
@@ -1276,7 +1290,7 @@ mod tests {
             vec![LlamaToken(1); 4],
             vec![LlamaToken(1); 4],
         ];
-        let groups = group_by_cell_budget(&inputs, 8);
+        let groups = group_by_cell_budget(&inputs, 8, usize::MAX);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 2);
         assert_eq!(groups[1].len(), 1);
@@ -1285,7 +1299,7 @@ mod tests {
     #[test]
     fn group_by_cell_budget_gives_an_oversized_input_its_own_group() {
         let inputs: Vec<Vec<LlamaToken>> = vec![vec![LlamaToken(1); 2], vec![LlamaToken(1); 50]];
-        let groups = group_by_cell_budget(&inputs, 8);
+        let groups = group_by_cell_budget(&inputs, 8, usize::MAX);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[1][0].len(), 50);
     }
@@ -1300,10 +1314,26 @@ mod tests {
             vec![LlamaToken(1); 2],
             vec![LlamaToken(1); 6],
         ];
-        let groups = group_by_cell_budget(&inputs, 16);
+        let groups = group_by_cell_budget(&inputs, 16, usize::MAX);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 3);
         assert_eq!(groups[1].len(), 1);
+    }
+
+    #[test]
+    fn qwen_conformance_batch_is_split_below_the_portable_vulkan_context_limit() {
+        let inputs: Vec<Vec<LlamaToken>> = (0..250).map(|_| vec![LlamaToken(1); 28]).collect();
+        let groups = group_by_cell_budget(&inputs, MAX_TOKENS_PER_ENCODE, MAX_DECODE_SEQUENCES);
+
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), 250);
+        assert_eq!(
+            groups.iter().map(Vec::len).collect::<Vec<_>>(),
+            [64, 64, 64, 58]
+        );
+        assert!(groups.iter().all(|group| {
+            group.iter().map(|tokens| tokens.len()).max().unwrap_or(0) * group.len()
+                <= MAX_TOKENS_PER_ENCODE
+        }));
     }
 
     #[test]
