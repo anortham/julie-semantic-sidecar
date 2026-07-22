@@ -98,7 +98,7 @@ const PINS: &[ModelPin] = &[
         document_instruction: "",
         max_text_tokens: 32768,
         model_revision: "main",
-        tier: Tier::Default,
+        tier: Tier::Fallback,
     },
     ModelPin {
         id: "bge-small-en-v1.5-f32",
@@ -116,11 +116,11 @@ const PINS: &[ModelPin] = &[
         document_instruction: "",
         max_text_tokens: 512,
         model_revision: "main",
-        tier: Tier::Fallback,
+        tier: Tier::Default,
     },
 ];
 
-/// Every pinned model, in tier order.
+/// Every pinned model, in stable manifest order.
 pub fn manifest() -> &'static [ModelPin] {
     PINS
 }

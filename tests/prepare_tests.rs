@@ -587,7 +587,14 @@ fn clean_stale_partials_on_a_missing_directory_is_not_an_error() {
 #[test]
 fn resolve_defaults_to_the_manifest_default_tier() {
     let pin = prepare::resolve(None).expect("default pin");
+    assert_eq!(pin.id, "bge-small-en-v1.5-f32");
     assert_eq!(pin.id, manifest::default_model().id);
+}
+
+#[test]
+fn resolve_accepts_the_explicit_qwen_comparison_model() {
+    let pin = prepare::resolve(Some("qwen3-0.6b-f16")).expect("qwen3 pin");
+    assert_eq!(pin.id, "qwen3-0.6b-f16");
 }
 
 #[test]

@@ -6,7 +6,7 @@ const QWEN_QUERY_INSTRUCTION: &str = "Instruct: Given a code search query, retri
 const BGE_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
 
 #[test]
-fn manifest_holds_exactly_the_two_pinned_models_in_tier_order() {
+fn manifest_holds_exactly_the_two_pinned_models_in_stable_order() {
     let pins = manifest::manifest();
     assert_eq!(pins.len(), 2);
     assert_eq!(pins[0].id, "qwen3-0.6b-f16");
@@ -38,7 +38,7 @@ fn qwen3_pin_matches_the_frozen_knob_table_byte_for_byte() {
     assert_eq!(pin.document_instruction, "");
     assert_eq!(pin.max_text_tokens, 32768);
     assert_eq!(pin.model_revision, "main");
-    assert_eq!(pin.tier, Tier::Default);
+    assert_eq!(pin.tier, Tier::Fallback);
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn bge_pin_matches_the_frozen_knob_table_byte_for_byte() {
     assert_eq!(pin.document_instruction, "");
     assert_eq!(pin.max_text_tokens, 512);
     assert_eq!(pin.model_revision, "main");
-    assert_eq!(pin.tier, Tier::Fallback);
+    assert_eq!(pin.tier, Tier::Default);
 }
 
 #[test]
@@ -96,9 +96,9 @@ fn lookup_is_exact_and_rejects_unknown_ids() {
 }
 
 #[test]
-fn default_tier_resolution_selects_the_qwen3_pin() {
+fn default_tier_resolution_selects_the_bge_pin() {
     let pin = manifest::default_model();
-    assert_eq!(pin.id, "qwen3-0.6b-f16");
+    assert_eq!(pin.id, "bge-small-en-v1.5-f32");
     assert_eq!(pin.tier, Tier::Default);
     assert_eq!(pin.id, julie_semantic_sidecar::DEFAULT_MODEL_ID);
 }
@@ -145,10 +145,11 @@ fn engine_on(requested: &str, resolved: &str, degraded_reason: Option<&str>) -> 
 }
 
 fn ready_health() -> Value {
+    let pin = manifest::default_model();
     health::build(
         &ModelState::Ready {
-            pin: manifest::default_model(),
-            dims: 512,
+            pin,
+            dims: pin.serve_dims,
         },
         &engine_on("metal", "metal", None),
         Limits::default(),
@@ -161,23 +162,23 @@ fn ready_health_reports_dims_and_the_full_contract_field_list() {
     let value = ready_health();
 
     assert_eq!(value["ready"], true);
-    assert_eq!(value["dims"], 512);
+    assert_eq!(value["dims"], 384);
     assert!(value["degraded_reason"].is_null());
-    assert_eq!(value["model_id"], "qwen3-0.6b-f16");
+    assert_eq!(value["model_id"], "bge-small-en-v1.5-f32");
     assert_eq!(value["model_sha256"], manifest::default_model().sha256);
     assert_eq!(value["model_revision"], "main");
     assert_eq!(value["runtime"], "llama.cpp");
     assert_eq!(value["device"], "metal");
     assert_eq!(value["resolved_backend"], "metal");
     assert_eq!(value["accelerated"], true);
-    assert_eq!(value["pooling"], "last");
+    assert_eq!(value["pooling"], "cls");
     assert_eq!(value["normalization"], "l2");
     assert_eq!(value["instruction_policy_version"], 1);
-    assert_eq!(value["max_text_tokens"], 32768);
+    assert_eq!(value["max_text_tokens"], 512);
     assert_eq!(value["max_batch_items"], health::MAX_BATCH_ITEMS);
     assert_eq!(value["max_request_bytes"], health::MAX_REQUEST_BYTES);
-    assert_eq!(value["native_dims"], 1024);
-    assert_eq!(value["mrl_lanes"], serde_json::json!([256, 512, 1024]));
+    assert_eq!(value["native_dims"], 384);
+    assert_eq!(value["mrl_lanes"], serde_json::json!([384]));
     assert_eq!(value["llama_cpp_build"], "b10068");
     assert_eq!(value["sidecar_version"], "0.1.0");
 }
@@ -205,8 +206,8 @@ fn missing_model_reports_not_ready_with_the_exact_model_not_prepared_reason() {
         "model_not_prepared"
     );
     assert!(value.get("dims").is_none());
-    assert_eq!(value["model_id"], "qwen3-0.6b-f16");
-    assert_eq!(value["native_dims"], 1024);
+    assert_eq!(value["model_id"], "bge-small-en-v1.5-f32");
+    assert_eq!(value["native_dims"], 384);
 }
 
 #[test]
@@ -214,7 +215,7 @@ fn degraded_backend_mirrors_accelerated_and_reason_into_load_policy() {
     let value = health::build(
         &ModelState::Ready {
             pin: manifest::default_model(),
-            dims: 512,
+            dims: manifest::default_model().serve_dims,
         },
         &engine_on("vulkan", "cpu", Some("benchmark_cpu_faster")),
         Limits::default(),
@@ -238,7 +239,7 @@ fn backend_mismatch_without_a_supplied_reason_still_yields_a_non_null_reason() {
     let value = health::build(
         &ModelState::Ready {
             pin: manifest::default_model(),
-            dims: 512,
+            dims: manifest::default_model().serve_dims,
         },
         &engine_on("vulkan", "cpu", None),
         Limits::default(),
@@ -298,19 +299,19 @@ fn additive_metal_and_vulkan_capabilities_ride_alongside_the_torch_keys() {
 }
 
 #[test]
-fn fallback_model_health_reports_its_own_knobs() {
-    let pin = manifest::by_id("bge-small-en-v1.5-f32").expect("bge pin present");
+fn comparison_model_health_reports_qwen_identity_and_dimensions() {
+    let pin = manifest::by_id("qwen3-0.6b-f16").expect("qwen3 pin present");
     let value = health::build(
-        &ModelState::Ready { pin, dims: 384 },
+        &ModelState::Ready { pin, dims: 512 },
         &engine_on("cpu", "cpu", None),
         Limits::default(),
         "0.1.0",
     );
 
-    assert_eq!(value["dims"], 384);
-    assert_eq!(value["native_dims"], 384);
-    assert_eq!(value["mrl_lanes"], serde_json::json!([384]));
-    assert_eq!(value["pooling"], "cls");
-    assert_eq!(value["max_text_tokens"], 512);
-    assert_eq!(value["model_id"], "bge-small-en-v1.5-f32");
+    assert_eq!(value["dims"], 512);
+    assert_eq!(value["native_dims"], 1024);
+    assert_eq!(value["mrl_lanes"], serde_json::json!([256, 512, 1024]));
+    assert_eq!(value["pooling"], "last");
+    assert_eq!(value["max_text_tokens"], 32768);
+    assert_eq!(value["model_id"], "qwen3-0.6b-f16");
 }

@@ -12,13 +12,15 @@ loop, model manifest, `prepare` subcommand, and engine land in later tasks.
 ## Launch interface
 
 ```
-julie-semantic-sidecar [serve [--model <id>]]   # default verb; default model qwen3-0.6b-f16
+julie-semantic-sidecar [serve [--model <id>]]   # default verb; default model bge-small-en-v1.5-f32
 julie-semantic-sidecar prepare [--model <id>]   # download + verify a model into the shared cache
 julie-semantic-sidecar --version
 ```
 
 `serve` reads requests from stdin and writes one response line per request to stdout until EOF.
 An unknown verb exits 2 with usage on stderr.
+Consumers should always pass an explicit model id so their selected encoder never follows a
+standalone-default change.
 
 ## Environment
 

@@ -16,7 +16,7 @@ pub mod stdio_guard;
 pub mod truncate;
 
 /// Manifest id of the model served when no `--model` argument is given.
-pub const DEFAULT_MODEL_ID: &str = "qwen3-0.6b-f16";
+pub const DEFAULT_MODEL_ID: &str = "bge-small-en-v1.5-f32";
 
 /// Semantic version of this binary, single-sourced from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

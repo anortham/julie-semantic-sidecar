@@ -97,17 +97,27 @@ mod tests {
         assert_eq!(
             parse(&[]),
             Ok(Cli::Serve {
-                model: DEFAULT_MODEL_ID.to_string()
+                model: "bge-small-en-v1.5-f32".to_string()
             })
         );
     }
 
     #[test]
-    fn serve_accepts_a_model_override() {
+    fn serve_without_a_model_uses_bge() {
         assert_eq!(
-            parse(&["serve", "--model", "bge-small-en-v1.5-f32"]),
+            parse(&["serve"]),
             Ok(Cli::Serve {
                 model: "bge-small-en-v1.5-f32".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn serve_accepts_the_explicit_qwen_comparison_model() {
+        assert_eq!(
+            parse(&["serve", "--model", "qwen3-0.6b-f16"]),
+            Ok(Cli::Serve {
+                model: "qwen3-0.6b-f16".to_string()
             })
         );
     }

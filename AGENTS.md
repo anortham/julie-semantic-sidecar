@@ -21,7 +21,7 @@ model acquisition, model paths, or download URLs — this binary does.
 ## Launch interface (frozen by the plan; non-wire)
 
 ```
-julie-semantic-sidecar [serve [--model <id>]]   # default verb; default model qwen3-0.6b-f16
+julie-semantic-sidecar [serve [--model <id>]]   # default verb; default model bge-small-en-v1.5-f32
 julie-semantic-sidecar prepare [--model <id>]
 julie-semantic-sidecar --version
 ```
@@ -29,6 +29,8 @@ julie-semantic-sidecar --version
 Unknown verb → exit 2 with usage on stderr. Env knobs are exactly two:
 `JULIE_EMBEDDING_CACHE_DIR` (per the contract) and `JULIE_SIDECAR_FORCE_BACKEND=cpu`
 (diagnostic/CI only). No others.
+Consumers pass an explicit model id so their selected encoder never follows a standalone-default
+change.
 
 ## Load-bearing rules
 

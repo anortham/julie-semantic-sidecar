@@ -128,10 +128,10 @@
 
 **Acceptance:**
 
-- [ ] Omitted standalone selection is BGE-small everywhere.
-- [ ] Qwen remains explicitly preparable and servable but is never selected by omission.
-- [ ] Health reports BGE 384 dimensions and Qwen 512 dimensions for the selected pin.
-- [ ] Miller still launches `serve --model bge-small-en-v1.5-f32` explicitly.
+- [x] Omitted standalone selection is BGE-small everywhere.
+- [x] Qwen remains explicitly preparable and servable but is never selected by omission.
+- [x] Health reports BGE 384 dimensions and Qwen 512 dimensions for the selected pin.
+- [x] Miller still launches `serve --model bge-small-en-v1.5-f32` explicitly.
 
 ## Task 3: Implement discovery, real benchmarking, cached selection, and truthful health
 
