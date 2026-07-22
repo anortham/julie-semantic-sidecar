@@ -186,7 +186,7 @@ README.md
 
 Metal remains compiled into the Apple Silicon executable, so its manifest declares a built-in `metal` backend and no fake plugin file.
 
-**Package manifest:** schema version, sidecar version, Rust target triple, portable/vendor tier, advertised backend, native llama build identity, model policy ids and default id, and a sorted list of archive-relative files with SHA-256, size, and role. Paths must be relative, normalized, and free of build/worktree prefixes.
+**Package manifest:** schema version, sidecar version, Rust target triple, portable/vendor tier, advertised backend, native llama build identity, model policy ids and default id, and a sorted list of archive-relative payload files with SHA-256, size, and role. Paths must be relative, normalized, and free of build/worktree prefixes. `package-manifest.json` is the sole metadata exception because a file cannot contain its own stable digest; validation rejects every other undeclared file.
 
 **Steps:**
 
@@ -201,10 +201,10 @@ Metal remains compiled into the Apple Silicon executable, so its manifest declar
 **Acceptance:**
 
 - [ ] Every archive contains one sidecar executable, CPU inference, exactly one advertised accelerator, and no model weights.
-- [ ] Every file is declared with a verified checksum; no undeclared native library or development path survives.
+- [ ] Every payload file is declared with a verified checksum; no undeclared file other than `package-manifest.json`, native library, or development path survives.
 - [ ] Dynamic modules and their dependencies load from the unpacked flat executable-relative layout without `PATH`, `LD_LIBRARY_PATH`, or build-tree help.
-- [ ] Bash and PowerShell use one manifest schema/validator.
-- [ ] Publication remains absent from both scripts.
+- [x] Bash and PowerShell use one manifest schema/validator.
+- [x] Publication remains absent from both scripts.
 
 ## Task 5: Encode package, conformance, and hardware gates in automation
 

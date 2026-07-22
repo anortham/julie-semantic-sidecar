@@ -1,157 +1,183 @@
 #!/usr/bin/env bash
-#
-# Release layout builder for julie-semantic-sidecar.
-#
-# FROZEN LAYOUT RULE — do not change without changing src/backend_select.rs:
-#
-#   Everything the binary loads at runtime lives in the SAME directory as the
-#   executable. `backend_select::plugin_dir()` is `current_exe().parent()`, so any
-#   ggml backend plugin module (libggml-vulkan.so / ggml-vulkan.dll / libggml-metal.dylib)
-#   and any non-system shared library MUST be copied next to the executable — never
-#   into a lib/ or bin/ subdirectory, and never left to an rpath outside the archive.
-#
-#   Archive root layout (one flat directory per target triple):
-#     julie-semantic-sidecar[.exe]      the executable
-#     <backend plugin modules>          TODO: accelerated builds only — see below
-#     <bundled shared libraries>        TODO: accelerated builds only — see below
-#     LICENSE
-#     README.md
-#
-# macOS arm64 builds `--features metal` (embedded Metal shaders; verified on an M2 Ultra
-# 2026-07-20 — the CPU-only sidecar shipped 12x under the P0 design floor, see the
-# metal-backend branch). Every other leg is CPU-ONLY today: `Cargo.toml` pins
-# llama-cpp-2/llama-cpp-sys-2 =0.1.151 with `default-features = false`, which statically
-# links ggml-cpu and ships exactly one file plus the docs.
-#
-# TODO — remaining accelerated builds (exact flags from the plan's Global Constraints; NOT
-# enabled here because they cannot be built or tested on this machine/leg):
-#   Linux/Windows : --features vulkan with backend-DL (GGML_BACKEND_DL), CMake -DGGML_NATIVE=OFF
-#                   → copy the produced ggml backend plugin module next to the executable
-#                     and add it to the per-platform file list below.
-#   macOS x64     : stays CPU-only.
-# `-DGGML_NATIVE=OFF` is required on every leg for cross-machine determinism once the
-# build stops being a plain `cargo build`.
-#
-# Usage: scripts/package.sh [--smoke] [--target <triple>]
-#   --smoke   run the packaged smoke (--version + offline not-ready health) before archiving
-#
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+profile=""
 run_smoke=0
-target=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --profile) profile="${2:?--profile needs a value}"; shift 2 ;;
     --smoke) run_smoke=1; shift ;;
-    --target) target="${2:?--target needs a triple}"; shift 2 ;;
     *) echo "package: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-
-host_triple="$(rustc -vV | awk '/^host: /{print $2}')"
-if [[ -z "$target" ]]; then
-  target="$host_triple"
-fi
-# The target names the staging directory fed to rm -rf and labels the archive, so an
-# arbitrary value is both a path-traversal hazard and an architecture lie.
-if [[ ! "$target" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-  echo "package: --target must be a plain target triple, got: $target" >&2
+if [[ -z "$profile" ]]; then
+  echo "package: --profile is required" >&2
   exit 2
 fi
-version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
 
-exe="julie-semantic-sidecar"
-archive_kind="tar.gz"
-case "$target" in
-  *windows*) exe="julie-semantic-sidecar.exe"; archive_kind="zip" ;;
+case "$profile" in
+  apple-arm64-metal-portable)
+    target="aarch64-apple-darwin"; backend="metal"; tier="portable"; features="metal" ;;
+  linux-x64-vulkan-portable)
+    target="x86_64-unknown-linux-gnu"; backend="vulkan"; tier="portable"; features="vulkan,dynamic-backends" ;;
+  windows-x64-vulkan-portable)
+    target="x86_64-pc-windows-msvc"; backend="vulkan"; tier="portable"; features="vulkan,dynamic-backends" ;;
+  linux-x64-cuda-vendor)
+    target="x86_64-unknown-linux-gnu"; backend="cuda"; tier="vendor"; features="cuda,dynamic-backends" ;;
+  windows-x64-cuda-vendor)
+    target="x86_64-pc-windows-msvc"; backend="cuda"; tier="vendor"; features="cuda,dynamic-backends" ;;
+  *) echo "package: unknown profile: $profile" >&2; exit 2 ;;
 esac
 
-echo "package: version   $version"
-echo "package: target    $target"
-echo "package: archive   $archive_kind"
-
-features=()
-case "$target" in
-  aarch64-apple-darwin) features=(--features metal) ;;
-esac
-
-# ${features[@]+...} keeps the empty-array expansion safe under `set -u` on bash 3.2
-# (macOS system bash), where a bare "${features[@]}" would abort the script.
-echo "package: building release binary (features: ${features[*]:-cpu-only})"
-if [[ "$target" == "$host_triple" ]]; then
-  cargo build --release ${features[@]+"${features[@]}"}
-  built_exe="target/release/$exe"
-else
-  # An explicit non-host target must actually build for that target — staging the
-  # host binary under a cross-target label ships the wrong architecture.
-  cargo build --release --target "$target" ${features[@]+"${features[@]}"}
-  built_exe="target/$target/release/$exe"
+host_triple="$(rustc -vV | awk '/^host: /{print $2}')"
+if [[ "$host_triple" != "$target" ]]; then
+  echo "package: profile $profile must run on $target, current host is $host_triple" >&2
+  exit 1
 fi
 
+effective_rustflags="${RUSTFLAGS:-} ${CARGO_ENCODED_RUSTFLAGS:-}"
+compact_rustflags="${effective_rustflags//[[:space:]]/}"
+if [[ "$compact_rustflags" == *"target-cpu=native"* ]]; then
+  echo "package: effective Rust flags must not contain -Ctarget-cpu=native" >&2
+  exit 1
+fi
+
+version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+exe="julie-semantic-sidecar"
+helper="julie-package-manifest"
+archive_kind="tar.gz"
+if [[ "$target" == *windows* ]]; then
+  exe="$exe.exe"
+  helper="$helper.exe"
+  archive_kind="zip"
+fi
+
+build_messages="$(mktemp)"
+helper_run_dir=""
+cleanup() {
+  rm -f "$build_messages"
+  if [[ -n "$helper_run_dir" ]]; then
+    rm -rf "$helper_run_dir"
+  fi
+}
+trap cleanup EXIT
+cargo build --release --target "$target" --features "$features" --bins --message-format=json-render-diagnostics >"$build_messages"
+native_out="$(python3 - "$build_messages" <<'PY'
+import json, sys
+found = []
+with open(sys.argv[1], encoding="utf-8") as stream:
+    for line in stream:
+        message = json.loads(line)
+        if message.get("reason") == "build-script-executed" and "llama-cpp-sys-2" in message.get("package_id", ""):
+            found.append(message["out_dir"])
+if len(found) != 1:
+    raise SystemExit(f"expected one llama-cpp-sys out_dir, found {len(found)}")
+print(found[0])
+PY
+)"
+
+build_dir="$repo_root/target/$target/release"
 stage_root="$repo_root/dist"
-stage="$stage_root/$target"
+stage="$stage_root/$profile"
 rm -rf "$stage"
 mkdir -p "$stage"
-
-cp "$built_exe" "$stage/$exe"
+cp "$build_dir/$exe" "$stage/$exe"
 cp LICENSE "$stage/LICENSE"
 cp README.md "$stage/README.md"
 chmod +x "$stage/$exe"
 
-echo "package: staged layout"
-ls -l "$stage"
+copy_native_file() {
+  local source="$1"
+  local name
+  name="$(basename "$source")"
+  case "$name" in
+    *.dll|*.so|*.so.*|*.dylib|*.dylib.*) cp -L "$source" "$stage/$name" ;;
+  esac
+}
+
+if [[ "$features" == *dynamic-backends* ]]; then
+  for source in "$native_out/lib/"*; do
+    [[ -e "$source" ]] && copy_native_file "$source"
+  done
+  for source in "$native_out/backends/"*; do
+    [[ -e "$source" ]] || continue
+    name="$(basename "$source")"
+    case "$name" in
+      libggml-cpu*.so|ggml-cpu*.dll|libggml-cpu*.dylib) copy_native_file "$source" ;;
+      "libggml-$backend.so"|"ggml-$backend.dll"|"libggml-$backend.dylib") copy_native_file "$source" ;;
+    esac
+  done
+fi
+
+helper_path="$build_dir/$helper"
+if [[ "$features" == *dynamic-backends* ]]; then
+  helper_run_dir="$(mktemp -d)"
+  cp "$helper_path" "$helper_run_dir/$helper"
+  for source in "$stage/"*; do
+    [[ -e "$source" ]] && copy_name="$(basename "$source")"
+    case "${copy_name:-}" in
+      *.dll|*.so|*.so.*|*.dylib|*.dylib.*) cp -L "$source" "$helper_run_dir/$copy_name" ;;
+    esac
+  done
+  helper_path="$helper_run_dir/$helper"
+fi
+"$helper_path" create --root "$stage" --target "$target" --tier "$tier" --backend "$backend"
+"$helper_path" verify --root "$stage"
+
+if [[ "$target" == *linux* && "$features" == *dynamic-backends* ]]; then
+  if ! readelf -d "$stage/$exe" | grep -E '(RPATH|RUNPATH).*[\$]ORIGIN' >/dev/null; then
+    echo "package: Linux dynamic executable lacks an \$ORIGIN runpath" >&2
+    exit 1
+  fi
+fi
 
 if [[ "$run_smoke" == "1" ]]; then
-  echo "package: smoke — packaged --version"
   "$stage/$exe" --version
-
-  echo "package: smoke — offline not-ready health from an empty cache dir"
   smoke_cache="$(mktemp -d)"
-  smoke_out="$(
-    printf '%s\n%s\n' \
-      '{"schema":"julie.embedding.sidecar","version":1,"request_id":"smoke-health","method":"health","params":{}}' \
-      '{"schema":"julie.embedding.sidecar","version":1,"request_id":"smoke-stop","method":"shutdown","params":{}}' \
-      | JULIE_EMBEDDING_CACHE_DIR="$smoke_cache" "$stage/$exe" serve
-  )"
+  smoke_out="$({ printf '%s\n' \
+    '{"schema":"julie.embedding.sidecar","version":1,"request_id":"health","method":"health","params":{}}' \
+    '{"schema":"julie.embedding.sidecar","version":1,"request_id":"stop","method":"shutdown","params":{}}'; } \
+    | JULIE_EMBEDDING_CACHE_DIR="$smoke_cache" "$stage/$exe" serve)"
   rm -rf "$smoke_cache"
-  echo "$smoke_out"
-  case "$smoke_out" in
-    *'"ready":false'*) ;;
-    *) echo "package: smoke FAILED — health did not report ready:false" >&2; exit 1 ;;
-  esac
-  case "$smoke_out" in
-    *'"degraded_reason":"model_not_prepared"'*) ;;
-    *) echo "package: smoke FAILED — health did not report model_not_prepared" >&2; exit 1 ;;
-  esac
-  case "$smoke_out" in
-    *'"stopping":true'*) ;;
-    *) echo "package: smoke FAILED — shutdown did not answer" >&2; exit 1 ;;
-  esac
-  echo "package: smoke OK"
+  [[ "$smoke_out" == *'"ready":false'* && "$smoke_out" == *'"stopping":true'* ]]
 fi
 
-archive_base="julie-semantic-sidecar-${version}-${target}"
-cd "$stage_root"
-rm -f "$archive_base.$archive_kind" "$archive_base.$archive_kind.sha256"
+archive_base="julie-semantic-sidecar-${version}-${target}-${backend}-${tier}"
+archive_name="$archive_base.$archive_kind"
+archive="$stage_root/$archive_name"
+rm -f "$archive" "$archive.sha256"
+python3 - "$stage" "$archive" "$archive_kind" <<'PY'
+import gzip, pathlib, stat, sys, tarfile, zipfile
+root, output, kind = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+files = sorted(path for path in root.iterdir() if path.is_file())
+if kind == "zip":
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for path in files:
+            info = zipfile.ZipInfo(path.name, (1980, 1, 1, 0, 0, 0))
+            mode = 0o755 if path.name.endswith(".exe") else 0o644
+            info.external_attr = (stat.S_IFREG | mode) << 16
+            archive.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+else:
+    with output.open("wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w") as archive:
+            for path in files:
+                data = path.read_bytes()
+                info = tarfile.TarInfo(path.name)
+                info.size = len(data); info.mtime = 0; info.uid = 0; info.gid = 0
+                info.uname = ""; info.gname = ""
+                info.mode = 0o755 if path.name == "julie-semantic-sidecar" else 0o644
+                import io
+                archive.addfile(info, io.BytesIO(data))
+PY
 
-if [[ "$archive_kind" == "zip" ]]; then
-  if command -v 7z >/dev/null 2>&1; then
-    7z a -tzip "$archive_base.zip" "./$target/*" >/dev/null
-  else
-    (cd "$target" && zip -q -r "../$archive_base.zip" .)
-  fi
-else
-  tar -czf "$archive_base.tar.gz" -C "$target" .
-fi
-
-archive="$archive_base.$archive_kind"
 if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum "$archive" > "$archive.sha256"
+  (cd "$stage_root" && sha256sum "$archive_name" >"$archive_name.sha256")
 else
-  shasum -a 256 "$archive" > "$archive.sha256"
+  (cd "$stage_root" && shasum -a 256 "$archive_name" >"$archive_name.sha256")
 fi
-
-echo "package: archive   $stage_root/$archive"
-echo "package: sha256    $(cat "$archive.sha256")"
+echo "package: manifest $stage/package-manifest.json"
+echo "package: archive  $archive"
+echo "package: sha256   $(cat "$archive.sha256")"

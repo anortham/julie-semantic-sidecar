@@ -6,8 +6,8 @@ A thin Rust stdio binary that turns text into embedding vectors. It speaks the f
 Metal / Vulkan / CPU backends. Consumers (Miller, Julie) spawn it and talk NDJSON; they never
 download models or compute model paths.
 
-**Status: under construction.** The verb skeleton and module layout are in place; the protocol
-loop, model manifest, `prepare` subcommand, and engine land in later tasks.
+**Status: release candidate under active validation.** CPU and Metal run locally; Vulkan and CUDA
+packages remain compile candidates until the platform and real-hardware gates pass.
 
 ## Launch interface
 
@@ -39,6 +39,31 @@ cargo fmt --check
 ```
 
 The toolchain is pinned in `rust-toolchain.toml`.
+
+## Package profiles
+
+Packages use an explicit profile and never bundle model weights:
+
+```text
+apple-arm64-metal-portable
+linux-x64-vulkan-portable
+windows-x64-vulkan-portable
+linux-x64-cuda-vendor
+windows-x64-cuda-vendor
+```
+
+Metal is built into the Apple arm64 executable. Windows and Linux profiles place llama.cpp core
+libraries, CPU modules, and the advertised Vulkan or CUDA module flat beside the executable.
+CUDA archives are candidates, not supported releases, until real NVIDIA hardware validation passes.
+
+Build with `scripts/package.sh --profile <name>` or
+`scripts/package.ps1 -Profile <name>`. Archive names include sidecar version, Rust target, backend,
+and portable/vendor tier. Both scripts reject `-Ctarget-cpu=native`, create and verify the same
+`package-manifest.json`, and contain no publication step.
+
+The manifest records every payload file with its SHA-256, size, and role. The manifest itself is
+the sole metadata exception because a file cannot truthfully contain its own SHA-256. Verification
+rejects every other undeclared file, nested path, model weight, or backend/profile mismatch.
 
 ## License
 

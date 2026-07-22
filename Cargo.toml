@@ -16,6 +16,10 @@ path = "src/lib.rs"
 name = "julie-semantic-sidecar"
 path = "src/main.rs"
 
+[[bin]]
+name = "julie-package-manifest"
+path = "src/bin/julie-package-manifest.rs"
+
 [features]
 metal = ["llama-cpp-2/metal"]
 vulkan = ["llama-cpp-2/vulkan"]

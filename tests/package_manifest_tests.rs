@@ -1,0 +1,292 @@
+use julie_semantic_sidecar::package_manifest::{
+    self, AdvertisedBackend, PackageFileRole, PackageManifest, PackageProfile, PackageTier,
+    MANIFEST_FILE,
+};
+use std::path::Path;
+use std::process::Command;
+
+const HELPER: &str = env!("CARGO_BIN_EXE_julie-package-manifest");
+
+fn write(root: &Path, name: &str, bytes: &[u8]) {
+    std::fs::write(root.join(name), bytes).expect("write payload");
+}
+
+fn dynamic_stage(root: &Path) {
+    write(root, "julie-semantic-sidecar", b"executable");
+    write(root, "libggml.so", b"ggml");
+    write(root, "libllama.so", b"llama");
+    write(root, "libggml-cpu-x86_64.so", b"cpu");
+    write(root, "libggml-vulkan.so", b"vulkan");
+    write(root, "LICENSE", b"license");
+    write(root, "README.md", b"readme");
+}
+
+fn vulkan_profile() -> PackageProfile {
+    PackageProfile {
+        rust_target: "x86_64-unknown-linux-gnu".to_string(),
+        tier: PackageTier::Portable,
+        advertised_backend: AdvertisedBackend::Vulkan,
+        native_build_identity: "native-build-a".to_string(),
+    }
+}
+
+fn rewrite(root: &Path, mutate: impl FnOnce(&mut PackageManifest)) {
+    let path = root.join(MANIFEST_FILE);
+    let mut manifest: PackageManifest =
+        serde_json::from_slice(&std::fs::read(&path).expect("read manifest")).expect("manifest");
+    mutate(&mut manifest);
+    std::fs::write(path, serde_json::to_vec_pretty(&manifest).expect("json")).expect("rewrite");
+}
+
+#[test]
+fn create_is_deterministic_and_records_sorted_verified_payloads_and_model_policy() {
+    let first = tempfile::tempdir().expect("tempdir");
+    let second = tempfile::tempdir().expect("tempdir");
+    for root in [first.path(), second.path()] {
+        dynamic_stage(root);
+        package_manifest::write(root, &vulkan_profile()).expect("write manifest");
+    }
+
+    assert_eq!(
+        std::fs::read(first.path().join(MANIFEST_FILE)).expect("first"),
+        std::fs::read(second.path().join(MANIFEST_FILE)).expect("second")
+    );
+    let manifest = package_manifest::verify(first.path()).expect("verify");
+    let paths = manifest
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(!paths.contains(&MANIFEST_FILE));
+    assert_eq!(manifest.schema_version, 1);
+    assert_eq!(manifest.rust_target, vulkan_profile().rust_target);
+    assert_eq!(manifest.advertised_backend, AdvertisedBackend::Vulkan);
+    assert_eq!(
+        manifest.model_policy.default_id,
+        julie_semantic_sidecar::DEFAULT_MODEL_ID
+    );
+    assert_eq!(
+        manifest.model_policy.ids,
+        vec!["bge-small-en-v1.5-f32", "qwen3-0.6b-f16"]
+    );
+    assert!(manifest
+        .files
+        .iter()
+        .all(|file| file.sha256.len() == 64 && file.size > 0));
+}
+
+#[test]
+fn verify_rejects_every_undeclared_file_except_the_manifest_itself() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    dynamic_stage(dir.path());
+    package_manifest::write(dir.path(), &vulkan_profile()).expect("write manifest");
+    write(dir.path(), "surprise.txt", b"undeclared");
+
+    let error = package_manifest::verify(dir.path()).expect_err("undeclared file");
+    assert!(error.to_string().contains("undeclared file surprise.txt"));
+}
+
+#[test]
+fn verify_rejects_checksum_and_size_mismatches() {
+    for replacement in [b"changed".as_slice(), b"longer changed payload".as_slice()] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        dynamic_stage(dir.path());
+        package_manifest::write(dir.path(), &vulkan_profile()).expect("write manifest");
+        write(dir.path(), "README.md", replacement);
+
+        let error = package_manifest::verify(dir.path()).expect_err("payload mismatch");
+        assert!(
+            error.to_string().contains("README.md")
+                && (error.to_string().contains("checksum") || error.to_string().contains("size"))
+        );
+    }
+}
+
+#[test]
+fn verify_rejects_absolute_traversal_and_development_paths() {
+    for bad in [
+        "/tmp/libggml.so",
+        "../libggml.so",
+        "target/release/libggml.so",
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        dynamic_stage(dir.path());
+        package_manifest::write(dir.path(), &vulkan_profile()).expect("write manifest");
+        rewrite(dir.path(), |manifest| {
+            manifest.files[0].path = bad.to_string()
+        });
+
+        let error = package_manifest::verify(dir.path()).expect_err("unsafe path");
+        assert!(
+            error.to_string().contains("invalid package path"),
+            "{bad}: {error}"
+        );
+    }
+}
+
+#[test]
+fn create_rejects_model_weights_and_misplaced_native_libraries() {
+    for bad in ["model.gguf", "lib/libggml.so"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        dynamic_stage(dir.path());
+        let path = dir.path().join(bad);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("directory");
+        }
+        std::fs::write(path, b"bad").expect("bad payload");
+
+        let error = package_manifest::write(dir.path(), &vulkan_profile()).expect_err("bad file");
+        assert!(
+            error.to_string().contains("model weight")
+                || error.to_string().contains("flat package root")
+        );
+    }
+}
+
+#[test]
+fn dynamic_profiles_require_executable_core_cpu_and_advertised_accelerator_roles() {
+    for missing in [
+        &["julie-semantic-sidecar"][..],
+        &["libggml.so", "libllama.so"][..],
+        &["libggml-cpu-x86_64.so"][..],
+        &["libggml-vulkan.so"][..],
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        dynamic_stage(dir.path());
+        for name in missing {
+            std::fs::remove_file(dir.path().join(name)).expect("remove");
+        }
+
+        let error =
+            package_manifest::write(dir.path(), &vulkan_profile()).expect_err("missing role");
+        assert!(error.to_string().contains("missing required"), "{error}");
+    }
+}
+
+#[test]
+fn backend_file_disagreement_and_extra_accelerator_modules_are_rejected() {
+    for extra in ["libggml-cuda.so", "libggml-hip.so", "libggml-sycl.so"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        dynamic_stage(dir.path());
+        write(dir.path(), extra, b"extra accelerator");
+
+        let error =
+            package_manifest::write(dir.path(), &vulkan_profile()).expect_err("extra backend");
+        assert!(error.to_string().contains("accelerator"), "{error}");
+    }
+}
+
+#[test]
+fn apple_metal_is_built_in_and_rejects_a_fake_plugin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "julie-semantic-sidecar", b"executable");
+    write(dir.path(), "LICENSE", b"license");
+    write(dir.path(), "README.md", b"readme");
+    let profile = PackageProfile {
+        rust_target: "aarch64-apple-darwin".to_string(),
+        tier: PackageTier::Portable,
+        advertised_backend: AdvertisedBackend::Metal,
+        native_build_identity: "native-metal".to_string(),
+    };
+
+    let manifest = package_manifest::write(dir.path(), &profile).expect("built in metal");
+    assert_eq!(manifest.files.len(), 3);
+    assert!(manifest
+        .files
+        .iter()
+        .all(|file| file.role != PackageFileRole::AcceleratorBackend));
+    write(dir.path(), "libggml-metal.so", b"fake plugin");
+    assert!(package_manifest::write(dir.path(), &profile).is_err());
+}
+
+#[test]
+fn rust_helper_creates_and_verifies_with_the_shared_validator() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(dir.path(), "julie-semantic-sidecar", b"executable");
+    write(dir.path(), "LICENSE", b"license");
+    write(dir.path(), "README.md", b"readme");
+
+    let create = Command::new(HELPER)
+        .args([
+            "create",
+            "--root",
+            dir.path().to_str().expect("root"),
+            "--target",
+            "aarch64-apple-darwin",
+            "--tier",
+            "portable",
+            "--backend",
+            "metal",
+        ])
+        .output()
+        .expect("create helper");
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let verify = Command::new(HELPER)
+        .args(["verify", "--root", dir.path().to_str().expect("root")])
+        .output()
+        .expect("verify helper");
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    assert!(dir.path().join(MANIFEST_FILE).is_file());
+}
+
+fn packaging_scripts() -> [String; 2] {
+    [
+        std::fs::read_to_string("scripts/package.sh").expect("bash package script"),
+        std::fs::read_to_string("scripts/package.ps1").expect("PowerShell package script"),
+    ]
+}
+
+#[test]
+fn packaging_scripts_define_only_the_explicit_portable_and_cuda_candidate_profiles() {
+    for script in packaging_scripts() {
+        for profile in [
+            "apple-arm64-metal-portable",
+            "linux-x64-vulkan-portable",
+            "windows-x64-vulkan-portable",
+            "linux-x64-cuda-vendor",
+            "windows-x64-cuda-vendor",
+        ] {
+            assert!(script.contains(profile), "missing {profile}");
+        }
+        assert!(!script.contains("rocm"));
+        assert!(!script.contains("sycl"));
+        assert!(!script.contains("macos-x64"));
+    }
+}
+
+#[test]
+fn packaging_scripts_use_the_shared_helper_before_backend_tier_archives() {
+    for script in packaging_scripts() {
+        assert!(script.contains("julie-package-manifest"));
+        assert!(script.contains("create"));
+        assert!(script.contains("verify"));
+        assert!(script.contains("package-manifest.json"));
+        assert!(script.contains("backend"));
+        assert!(script.contains("tier"));
+    }
+}
+
+#[test]
+fn packaging_scripts_reject_native_cpu_flags_and_contain_no_publication_behavior() {
+    let [bash, powershell] = packaging_scripts();
+    for script in [&bash, &powershell] {
+        assert!(script.contains("target-cpu=native"));
+        for forbidden in ["cargo publish", "gh release", "git push", "Publish-Module"] {
+            assert!(!script.contains(forbidden), "forbidden {forbidden}");
+        }
+    }
+    assert!(bash.contains("sha256sum \"$archive_name\""));
+    assert!(!bash.contains("sha256sum \"$archive\""));
+    assert!(powershell.contains("GetFileName($archive)"));
+    assert!(!powershell.contains("$env:PATH"));
+}

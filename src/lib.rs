@@ -9,6 +9,7 @@ pub mod engine;
 pub mod engine_trait;
 pub mod health;
 pub mod manifest;
+pub mod package_manifest;
 pub mod prepare;
 pub mod protocol;
 pub mod sanitize;
