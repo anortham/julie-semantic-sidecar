@@ -239,8 +239,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          subst T: $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw "failed to create short build drive" }
           "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "CARGO_TARGET_DIR=$env:RUNNER_TEMP\julie-target" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_TARGET_DIR=T:\" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Expose Vulkan CMake package prefix
         if: matrix.backend == 'vulkan'

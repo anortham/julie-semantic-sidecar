@@ -1358,7 +1358,8 @@ fn vulkan_workflows_install_the_complete_sdk_and_windows_cmake_headers() {
         assert!(!workflow.contains(r#""os":"windows-2025""#));
         assert!(workflow.contains("uses: ilammy/msvc-dev-cmd@v1"));
         assert!(workflow.contains("CMAKE_GENERATOR=Ninja"));
-        assert!(workflow.contains(r#"CARGO_TARGET_DIR=$env:RUNNER_TEMP\julie-target"#));
+        assert!(workflow.contains("subst T: $env:RUNNER_TEMP"));
+        assert!(workflow.contains(r#"CARGO_TARGET_DIR=T:\"#));
         assert!(workflow.contains("uses: humbletim/install-vulkan-sdk@v1.2"));
         assert!(workflow.contains("version: 1.4.309.0"));
         assert!(workflow.contains("cache: true"));
