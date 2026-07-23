@@ -61,8 +61,8 @@ jobs:
       matrix:
         include: >-
           ${{ inputs.include_cuda_candidates
-              && fromJSON('[{"os":"macos-15","profile":"apple-arm64-metal-portable","backend":"metal","package_shell":"bash"},{"os":"ubuntu-24.04","profile":"linux-x64-vulkan-portable","backend":"vulkan","package_shell":"bash"},{"os":"windows-2025","profile":"windows-x64-vulkan-portable","backend":"vulkan","package_shell":"pwsh"},{"os":"ubuntu-24.04","profile":"linux-x64-cuda-vendor","backend":"cuda","package_shell":"bash"},{"os":"windows-2025","profile":"windows-x64-cuda-vendor","backend":"cuda","package_shell":"pwsh"}]')
-              || fromJSON('[{"os":"macos-15","profile":"apple-arm64-metal-portable","backend":"metal","package_shell":"bash"},{"os":"ubuntu-24.04","profile":"linux-x64-vulkan-portable","backend":"vulkan","package_shell":"bash"},{"os":"windows-2025","profile":"windows-x64-vulkan-portable","backend":"vulkan","package_shell":"pwsh"}]') }}
+              && fromJSON('[{"os":"macos-15","profile":"apple-arm64-metal-portable","backend":"metal","package_shell":"bash"},{"os":"ubuntu-24.04","profile":"linux-x64-vulkan-portable","backend":"vulkan","package_shell":"bash"},{"os":"windows-2022","profile":"windows-x64-vulkan-portable","backend":"vulkan","package_shell":"pwsh"},{"os":"ubuntu-24.04","profile":"linux-x64-cuda-vendor","backend":"cuda","package_shell":"bash"},{"os":"windows-2022","profile":"windows-x64-cuda-vendor","backend":"cuda","package_shell":"pwsh"}]')
+              || fromJSON('[{"os":"macos-15","profile":"apple-arm64-metal-portable","backend":"metal","package_shell":"bash"},{"os":"ubuntu-24.04","profile":"linux-x64-vulkan-portable","backend":"vulkan","package_shell":"bash"},{"os":"windows-2022","profile":"windows-x64-vulkan-portable","backend":"vulkan","package_shell":"pwsh"}]') }}
     defaults:
       run:
         shell: bash

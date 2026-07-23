@@ -1354,6 +1354,8 @@ fn release_is_checksum_bound_approval_gated_and_artifact_only() {
 fn vulkan_workflows_install_the_complete_sdk_and_windows_cmake_headers() {
     for path in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
         let workflow = repository_file(path);
+        assert!(workflow.contains(r#""os":"windows-2022""#));
+        assert!(!workflow.contains(r#""os":"windows-2025""#));
         assert!(workflow.contains("uses: humbletim/install-vulkan-sdk@v1.2"));
         assert!(workflow.contains("version: 1.4.309.0"));
         assert!(workflow.contains("cache: true"));

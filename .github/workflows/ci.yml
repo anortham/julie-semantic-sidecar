@@ -63,8 +63,8 @@ jobs:
           ${{ github.event_name == 'pull_request'
               && fromJSON('[{"name":"linux-x64","os":"ubuntu-latest"}]')
               || github.event_name == 'push'
-              && fromJSON('[{"name":"linux-x64","os":"ubuntu-latest"},{"name":"windows-x64","os":"windows-2025"}]')
-              || fromJSON('[{"name":"macos-arm64","os":"macos-15"},{"name":"macos-x64","os":"macos-15-intel"},{"name":"linux-x64","os":"ubuntu-latest"},{"name":"windows-x64","os":"windows-2025"}]') }}
+              && fromJSON('[{"name":"linux-x64","os":"ubuntu-latest"},{"name":"windows-x64","os":"windows-2022"}]')
+              || fromJSON('[{"name":"macos-arm64","os":"macos-15"},{"name":"macos-x64","os":"macos-15-intel"},{"name":"linux-x64","os":"ubuntu-latest"},{"name":"windows-x64","os":"windows-2022"}]') }}
     env:
       JULIE_EMBEDDING_CACHE_DIR: ${{ github.workspace }}/model-cache
       JULIE_SIDECAR_FORCE_BACKEND: cpu
@@ -197,7 +197,7 @@ jobs:
             backend: vulkan
             package_shell: bash
           - name: windows-x64-vulkan-portable
-            os: windows-2025
+            os: windows-2022
             profile: windows-x64-vulkan-portable
             backend: vulkan
             package_shell: pwsh
