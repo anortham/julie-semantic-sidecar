@@ -1355,7 +1355,7 @@ fn vulkan_workflows_install_the_complete_pinned_sdk() {
     for path in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
         let workflow = repository_file(path);
         assert!(workflow.contains("uses: humbletim/install-vulkan-sdk@v1.2"));
-        assert!(workflow.contains("version: 1.4.304.1"));
+        assert!(workflow.contains("version: 1.4.309.0"));
         assert!(workflow.contains("cache: true"));
         assert!(!workflow.contains("humbletim/setup-vulkan-sdk"));
     }
