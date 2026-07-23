@@ -83,6 +83,11 @@ jobs:
           cache: true
           quiet: true
 
+      - name: Expose Vulkan CMake package prefix
+        if: matrix.backend == 'vulkan'
+        shell: bash
+        run: echo "CMAKE_PREFIX_PATH=${VULKAN_SDK}" >> "${GITHUB_ENV}"
+
       - name: Prepare CUDA toolkit for optional candidate build
         if: matrix.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.35

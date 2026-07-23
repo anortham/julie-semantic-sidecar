@@ -221,6 +221,11 @@ jobs:
           cache: true
           quiet: true
 
+      - name: Expose Vulkan CMake package prefix
+        if: matrix.backend == 'vulkan'
+        shell: bash
+        run: echo "CMAKE_PREFIX_PATH=${VULKAN_SDK}" >> "${GITHUB_ENV}"
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Compile and package portable profile with Bash

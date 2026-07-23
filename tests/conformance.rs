@@ -1357,6 +1357,7 @@ fn vulkan_workflows_install_the_complete_pinned_sdk() {
         assert!(workflow.contains("uses: humbletim/install-vulkan-sdk@v1.2"));
         assert!(workflow.contains("version: 1.4.309.0"));
         assert!(workflow.contains("cache: true"));
+        assert!(workflow.contains("CMAKE_PREFIX_PATH=${VULKAN_SDK}"));
         assert!(!workflow.contains("humbletim/setup-vulkan-sdk"));
     }
 }
