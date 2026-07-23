@@ -215,11 +215,11 @@ jobs:
 
       - name: Prepare Vulkan SDK for compile proof
         if: matrix.backend == 'vulkan'
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        uses: humbletim/install-vulkan-sdk@v1.2
         with:
-          vulkan-query-version: 1.4.304.1
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, SPIRV-Headers, SPIRV-Tools, Glslang
-          vulkan-use-cache: true
+          version: 1.4.304.1
+          cache: true
+          quiet: true
 
       - uses: Swatinem/rust-cache@v2
 
