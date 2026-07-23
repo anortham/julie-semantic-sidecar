@@ -1351,13 +1351,14 @@ fn release_is_checksum_bound_approval_gated_and_artifact_only() {
 }
 
 #[test]
-fn vulkan_workflows_install_the_complete_pinned_sdk() {
+fn vulkan_workflows_install_the_complete_sdk_and_windows_cmake_headers() {
     for path in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
         let workflow = repository_file(path);
         assert!(workflow.contains("uses: humbletim/install-vulkan-sdk@v1.2"));
         assert!(workflow.contains("version: 1.4.309.0"));
         assert!(workflow.contains("cache: true"));
         assert!(workflow.contains("CMAKE_PREFIX_PATH=${VULKAN_SDK}"));
-        assert!(!workflow.contains("humbletim/setup-vulkan-sdk"));
+        assert!(workflow.contains("uses: humbletim/setup-vulkan-sdk@v1.2.1"));
+        assert!(workflow.contains("vulkan-components: SPIRV-Headers"));
     }
 }

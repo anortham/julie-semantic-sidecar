@@ -83,6 +83,14 @@ jobs:
           cache: true
           quiet: true
 
+      - name: Install Windows SPIR-V CMake package
+        if: matrix.backend == 'vulkan' && runner.os == 'Windows'
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.4.309.0
+          vulkan-components: SPIRV-Headers
+          vulkan-use-cache: true
+
       - name: Expose Vulkan CMake package prefix
         if: matrix.backend == 'vulkan'
         shell: bash
