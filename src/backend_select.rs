@@ -108,6 +108,7 @@ pub struct RuntimeDevice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendCandidate {
     pub backend: String,
+    pub device: String,
     pub device_index: Option<usize>,
 }
 
@@ -153,6 +154,7 @@ impl ProbeTiming {
 pub struct RuntimeSelection {
     pub selection: Selection,
     pub capabilities: BackendCapabilities,
+    pub device: String,
     pub device_index: Option<usize>,
     cache_key: Option<String>,
 }
@@ -228,6 +230,7 @@ pub fn discover_candidates(
 ) -> Discovery {
     let mut candidates = vec![BackendCandidate {
         backend: CPU.to_string(),
+        device: CPU.to_string(),
         device_index: None,
     }];
     let mut capabilities = BackendCapabilities::cpu_only();
@@ -245,6 +248,11 @@ pub fn discover_candidates(
         {
             candidates.push(BackendCandidate {
                 backend: backend.to_string(),
+                device: if device.description.trim().is_empty() {
+                    device.name.clone()
+                } else {
+                    device.description.clone()
+                },
                 device_index: Some(device.index),
             });
             set_capability(&mut capabilities, backend, true);
@@ -291,6 +299,7 @@ where
         return Ok(RuntimeSelection {
             selection: Selection::cpu(),
             capabilities: BackendCapabilities::cpu_only(),
+            device: CPU.to_string(),
             device_index: None,
             cache_key: None,
         });
@@ -388,6 +397,7 @@ where
             RuntimeSelection {
                 selection: Selection::new(&winner.backend, &winner.backend, None),
                 capabilities,
+                device: winner.device.clone(),
                 device_index: winner.device_index,
                 cache_key: None,
             }
@@ -398,6 +408,7 @@ where
                     "accelerated backend did not beat cpu",
                 ),
                 capabilities,
+                device: CPU.to_string(),
                 device_index: None,
                 cache_key: None,
             }
@@ -413,6 +424,7 @@ where
                 },
             ),
             capabilities,
+            device: CPU.to_string(),
             device_index: None,
             cache_key: None,
         }
@@ -420,6 +432,7 @@ where
         RuntimeSelection {
             selection: Selection::cpu(),
             capabilities,
+            device: CPU.to_string(),
             device_index: None,
             cache_key: None,
         }
@@ -437,6 +450,7 @@ fn degraded_runtime(requested: &str, reason: &str) -> RuntimeSelection {
     RuntimeSelection {
         selection: Selection::degraded_to_cpu(requested, reason),
         capabilities: BackendCapabilities::cpu_only(),
+        device: CPU.to_string(),
         device_index: None,
         cache_key: None,
     }
@@ -517,6 +531,7 @@ struct RuntimeCachedChoice {
     cuda: bool,
     metal: bool,
     vulkan: bool,
+    device: String,
     #[serde(default)]
     device_index: Option<usize>,
 }
@@ -530,6 +545,7 @@ impl RuntimeCachedChoice {
             cuda: selection.capabilities.cuda,
             metal: selection.capabilities.metal,
             vulkan: selection.capabilities.vulkan,
+            device: selection.device.clone(),
             device_index: selection.device_index,
         }
     }
@@ -544,6 +560,7 @@ impl RuntimeCachedChoice {
                 vulkan: self.vulkan,
                 ..Default::default()
             },
+            device: self.device,
             device_index: self.device_index,
             cache_key: None,
         }
@@ -976,14 +993,17 @@ mod task3_tests {
             vec![
                 BackendCandidate {
                     backend: CPU.to_string(),
+                    device: CPU.to_string(),
                     device_index: None,
                 },
                 BackendCandidate {
                     backend: VULKAN.to_string(),
+                    device: "Integrated GPU".to_string(),
                     device_index: Some(2),
                 },
                 BackendCandidate {
                     backend: VULKAN.to_string(),
+                    device: "Discrete GPU".to_string(),
                     device_index: Some(7),
                 },
             ]
@@ -1362,6 +1382,7 @@ mod task3_tests {
             .expect("selection");
 
             assert_eq!(selected.device_index, Some(7));
+            assert_eq!(selected.device, "Discrete GPU");
             assert_eq!(probes.get(), expected_probes);
         }
     }

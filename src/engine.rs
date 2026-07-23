@@ -182,6 +182,7 @@ pub struct LlamaEngine {
     model: LlamaModel,
     eos_reserve: usize,
     special_token_overhead: usize,
+    device: String,
     selection: Selection,
     capabilities: BackendCapabilities,
 }
@@ -292,6 +293,7 @@ impl LlamaEngine {
     ) -> Result<Self, EngineError> {
         let candidate = backend_select::BackendCandidate {
             backend: runtime.selection.resolved.clone(),
+            device: runtime.device.clone(),
             device_index: runtime.device_index,
         };
         match Self::load_candidate(
@@ -317,6 +319,7 @@ impl LlamaEngine {
                     &backend,
                     &backend_select::BackendCandidate {
                         backend: backend_select::CPU.to_string(),
+                        device: backend_select::CPU.to_string(),
                         device_index: None,
                     },
                     fallback,
@@ -352,6 +355,7 @@ impl LlamaEngine {
             model,
             eos_reserve,
             special_token_overhead,
+            device: candidate.device.clone(),
             selection,
             capabilities,
         })
@@ -624,7 +628,7 @@ impl LlamaEngine {
     fn engine_facts(&self) -> EngineFacts {
         EngineFacts {
             runtime: RUNTIME.to_string(),
-            device: self.selection.resolved.clone(),
+            device: self.device.clone(),
             requested_backend: self.selection.requested.clone(),
             resolved_backend: self.selection.resolved.clone(),
             accelerated: self.selection.accelerated,
@@ -1239,6 +1243,7 @@ mod tests {
     fn a_cpu_resolution_pins_zero_offloaded_layers() {
         let params = model_params_for_candidate(&backend_select::BackendCandidate {
             backend: backend_select::CPU.to_string(),
+            device: backend_select::CPU.to_string(),
             device_index: None,
         })
         .expect("cpu placement");
@@ -1340,10 +1345,12 @@ mod tests {
     fn candidate_placement_pins_cpu_and_uses_the_enumerated_accelerator_index() {
         let cpu = placement_for_candidate(&backend_select::BackendCandidate {
             backend: backend_select::CPU.to_string(),
+            device: backend_select::CPU.to_string(),
             device_index: None,
         });
         let vulkan = placement_for_candidate(&backend_select::BackendCandidate {
             backend: backend_select::VULKAN.to_string(),
+            device: "Discrete GPU".to_string(),
             device_index: Some(7),
         });
 
@@ -1389,6 +1396,7 @@ mod tests {
     fn fixed_probes_time_batch_one_and_the_sixteen_text_indexing_batch() {
         let candidate = backend_select::BackendCandidate {
             backend: backend_select::METAL.to_string(),
+            device: "Apple GPU".to_string(),
             device_index: Some(3),
         };
         let calls = std::cell::RefCell::new(Vec::new());
@@ -1511,6 +1519,7 @@ mod tests {
     fn a_failed_fixed_probe_rejects_the_candidate() {
         let candidate = backend_select::BackendCandidate {
             backend: backend_select::CUDA.to_string(),
+            device: "CUDA GPU".to_string(),
             device_index: Some(4),
         };
         let calls = std::cell::Cell::new(0);

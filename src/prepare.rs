@@ -313,7 +313,15 @@ pub fn acquire(
     cache_dir: &Path,
     events: &mut dyn Write,
 ) -> Result<Prepared, PrepareError> {
-    acquire_with_timeouts(request, cache_dir, events, DOWNLOAD_TIMEOUTS)
+    acquire_with_timeouts(
+        request,
+        cache_dir,
+        events,
+        DownloadTimeouts {
+            total: download_total_timeout(request.size_bytes),
+            ..DOWNLOAD_TIMEOUTS
+        },
+    )
 }
 
 fn acquire_with_timeouts(
@@ -429,6 +437,15 @@ fn preflight_disk(cache_dir: &Path, size_bytes: u64) -> Result<(), String> {
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(2_700);
+const DOWNLOAD_MIN_BYTES_PER_SECOND: u64 = 64 * 1_024;
+
+fn download_total_timeout(size_bytes: u64) -> Duration {
+    Duration::from_secs(
+        size_bytes
+            .div_ceil(DOWNLOAD_MIN_BYTES_PER_SECOND)
+            .max(DOWNLOAD_TOTAL_TIMEOUT.as_secs()),
+    )
+}
 
 #[derive(Clone, Copy)]
 struct DownloadTimeouts {
@@ -662,5 +679,17 @@ mod tests {
         assert!(!error.message().contains("JULIE_SIDECAR_"), "{error}");
         let lock = cache.path().join("stall-model.lock");
         assert!(try_hold(&lock).is_some(), "model lock remained held");
+    }
+
+    #[test]
+    fn total_download_timeout_scales_with_the_declared_model_size() {
+        assert_eq!(
+            download_total_timeout(133_609_568),
+            Duration::from_secs(2_700)
+        );
+        assert_eq!(
+            download_total_timeout(1_197_629_632),
+            Duration::from_secs(18_275)
+        );
     }
 }
