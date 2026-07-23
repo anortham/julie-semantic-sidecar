@@ -1349,3 +1349,16 @@ fn release_is_checksum_bound_approval_gated_and_artifact_only() {
     assert!(!workflow.contains("action-gh-release"));
     assert!(!workflow.contains("git tag"));
 }
+
+#[test]
+fn vulkan_workflows_install_glslang_build_dependencies() {
+    let required_components = "Vulkan-Headers, Vulkan-Loader, SPIRV-Headers, SPIRV-Tools, Glslang";
+
+    for path in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
+        let workflow = repository_file(path);
+        assert!(
+            workflow.contains(required_components),
+            "{path} must install {required_components}"
+        );
+    }
+}
