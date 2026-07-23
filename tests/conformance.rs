@@ -1356,6 +1356,8 @@ fn vulkan_workflows_install_the_complete_sdk_and_windows_cmake_headers() {
         let workflow = repository_file(path);
         assert!(workflow.contains(r#""os":"windows-2022""#));
         assert!(!workflow.contains(r#""os":"windows-2025""#));
+        assert!(workflow.contains("uses: ilammy/msvc-dev-cmd@v1"));
+        assert!(workflow.contains("CMAKE_GENERATOR=Ninja"));
         assert!(workflow.contains("uses: humbletim/install-vulkan-sdk@v1.2"));
         assert!(workflow.contains("version: 1.4.309.0"));
         assert!(workflow.contains("cache: true"));
