@@ -10,7 +10,9 @@ against a floor.
 
 This makes the RC->v0.1.0 promotion gate's throughput floor checkable in one command:
 
-    scripts/bench-throughput.py --binary target/release/julie-semantic-sidecar
+    scripts/bench-throughput.py \
+      --binary target/release/julie-semantic-sidecar \
+      --expect-backend metal
 
 See docs/rc-promotion-gate.md for the floor and its rationale, and the protocol contract
 mirrored in Miller at docs/contracts/semantic-sidecar-protocol-v1.md.
@@ -24,9 +26,11 @@ import hashlib
 import json
 import os
 import pathlib
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 SCHEMA = "julie.embedding.sidecar"
@@ -35,7 +39,7 @@ PROTOCOL_MAX_BATCH = 250
 DEFAULT_BATCH = 64
 DEFAULT_ROUNDS = 4
 DEFAULT_FLOOR = 40.0
-HEALTH_TIMEOUT_S = 120.0
+DEFAULT_RESPONSE_TIMEOUT_S = 120.0
 SUPPORTED_BACKENDS = ("cpu", "cuda", "directml", "mps", "metal", "vulkan")
 
 
@@ -64,11 +68,40 @@ def rpc(request_id, method, params):
     ) + "\n"
 
 
+def validate_reply(reply, request_id, method):
+    if not isinstance(reply, dict):
+        raise BenchError(f"{request_id}: response envelope is not an object")
+    if reply.get("request_id") != request_id:
+        raise BenchError(
+            f"response order mismatch: expected {request_id}, "
+            f"got {reply.get('request_id')}"
+        )
+    if "error" in reply:
+        error = reply["error"]
+        if not isinstance(error, dict):
+            raise BenchError(f"{request_id}: error is not an object")
+        raise BenchError(
+            f"sidecar error for '{method}': "
+            f"[{error.get('code')}] {error.get('message')}"
+        )
+    result = reply.get("result")
+    if not isinstance(result, dict):
+        raise BenchError(f"{request_id}: result is not an object")
+    return result
+
+
 class Sidecar:
-    def __init__(self, binary, stderr_file, model=None):
+    def __init__(
+        self,
+        binary,
+        stderr_file,
+        model=None,
+        response_timeout=DEFAULT_RESPONSE_TIMEOUT_S,
+    ):
         command = [binary, "serve"]
         if model:
             command += ["--model", model]
+        self.response_timeout = response_timeout
         self._proc = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -77,32 +110,47 @@ class Sidecar:
             text=True,
             bufsize=1,
         )
+        self.replies = queue.Queue()
+        self.reader = threading.Thread(target=self._read_stdout, daemon=True)
+        self.reader.start()
+
+    def _read_stdout(self):
+        stdout = self._proc.stdout
+        if stdout is not None:
+            for line in stdout:
+                self.replies.put(line)
+        self.replies.put(None)
+
+    def _read_reply(self):
+        try:
+            line = self.replies.get(timeout=self.response_timeout)
+        except queue.Empty as error:
+            self.abort()
+            raise BenchError(
+                f"sidecar response timed out after {self.response_timeout:g}s"
+            ) from error
+        if line is None:
+            raise BenchError(
+                "sidecar closed stdout before replying "
+                f"(exit code {self._proc.poll()})"
+            )
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError as error:
+            raise BenchError(
+                f"sidecar emitted non-JSON on stdout: {line!r} ({error})"
+            ) from error
 
     def call(self, request_id, method, params):
         proc = self._proc
-        if proc.stdin is None or proc.stdout is None:
+        if proc.stdin is None:
             raise BenchError("sidecar stdio pipes are not open")
         start = time.monotonic()
         proc.stdin.write(rpc(request_id, method, params))
         proc.stdin.flush()
-        line = proc.stdout.readline()
+        reply = self._read_reply()
         elapsed = time.monotonic() - start
-        if line == "":
-            raise BenchError(
-                "sidecar closed stdout before answering "
-                f"'{method}' (exit code {proc.poll()})"
-            )
-        try:
-            reply = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise BenchError(f"sidecar emitted non-JSON on stdout: {line!r} ({exc})")
-        if reply.get("error"):
-            err = reply["error"]
-            raise BenchError(
-                f"sidecar error for '{method}': "
-                f"[{err.get('code')}] {err.get('message')}"
-            )
-        return elapsed, reply.get("result", {})
+        return elapsed, validate_reply(reply, request_id, method)
 
     @property
     def pid(self):
@@ -115,7 +163,16 @@ class Sidecar:
                 proc.stdin.close()
             proc.wait(timeout=10)
         except Exception:
+            self.abort()
+
+    def abort(self):
+        proc = self._proc
+        if proc.poll() is None:
             proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def sidecar_rss_bytes(pid):
@@ -140,13 +197,20 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def validate_expected_backend(health, expected_backend):
+def expected_backend_selected(health, expected_backend):
     if expected_backend is None:
-        return
+        return None
     expected_accelerated = expected_backend != "cpu"
     resolved_backend = health.get("resolved_backend")
     accelerated = health.get("accelerated")
-    if resolved_backend != expected_backend or accelerated is not expected_accelerated:
+    return resolved_backend == expected_backend and accelerated is expected_accelerated
+
+
+def validate_expected_backend(health, expected_backend):
+    if expected_backend_selected(health, expected_backend) is False:
+        expected_accelerated = expected_backend != "cpu"
+        resolved_backend = health.get("resolved_backend")
+        accelerated = health.get("accelerated")
         raise BenchError(
             f"expected backend {expected_backend} with accelerated="
             f"{str(expected_accelerated).lower()}, got backend={resolved_backend} "
@@ -154,14 +218,24 @@ def validate_expected_backend(health, expected_backend):
         )
 
 
-def run_bench(binary, batch, rounds, floor, model=None, expected_backend=None):
+def run_bench(
+    binary,
+    batch,
+    rounds,
+    floor,
+    model=None,
+    expected_backend=None,
+    response_timeout=DEFAULT_RESPONSE_TIMEOUT_S,
+):
+    if floor > 0 and expected_backend is None:
+        raise BenchError("expected backend is required when floor is greater than 0")
     resolved_binary = str(pathlib.Path(binary).resolve())
     resolved_harness = str(pathlib.Path(__file__).resolve())
     with tempfile.NamedTemporaryFile(
         mode="w+", suffix=".sidecar-bench-stderr.log", delete=False
     ) as stderr_file:
         stderr_path = stderr_file.name
-        sidecar = Sidecar(resolved_binary, stderr_file, model)
+        sidecar = Sidecar(resolved_binary, stderr_file, model, response_timeout)
         try:
             _, health = sidecar.call("bench-health", "health", {})
             if not health.get("ready", False):
@@ -182,7 +256,10 @@ def run_bench(binary, batch, rounds, floor, model=None, expected_backend=None):
                 elapsed, result = sidecar.call(
                     f"bench-round-{r}", "embed_batch", {"texts": texts}
                 )
-                n = len(result.get("vectors", []))
+                vectors = result.get("vectors")
+                if not isinstance(vectors, list):
+                    raise BenchError(f"round {r}: vectors is not an array")
+                n = len(vectors)
                 if n != batch:
                     raise BenchError(
                         f"round {r}: expected {batch} vectors, got {n}"
@@ -196,7 +273,7 @@ def run_bench(binary, batch, rounds, floor, model=None, expected_backend=None):
             sidecar.close()
 
     steady = sum(rates) / len(rates)
-    return {
+    report = {
         "recorded_utc": datetime.datetime.now(datetime.timezone.utc)
         .isoformat()
         .replace("+00:00", "Z"),
@@ -210,9 +287,12 @@ def run_bench(binary, batch, rounds, floor, model=None, expected_backend=None):
         "batch": batch,
         "rounds": rounds,
         "warmup_rounds": 1,
+        "response_timeout_seconds": response_timeout,
         "floor_units_per_s": floor,
         "expected_backend": expected_backend,
-        "expected_backend_selected": None if expected_backend is None else True,
+        "expected_backend_selected": expected_backend_selected(
+            health, expected_backend
+        ),
         "steady_state_units_per_s": steady,
         "per_round_units_per_s": rates,
         "pass": steady >= floor,
@@ -226,6 +306,8 @@ def run_bench(binary, batch, rounds, floor, model=None, expected_backend=None):
             "sidecar_version": health.get("sidecar_version"),
         },
     }
+    os.unlink(stderr_path)
+    return report
 
 
 def parse_args(argv):
@@ -262,6 +344,15 @@ def parse_args(argv):
         help="fail before measuring unless health reports this backend truthfully",
     )
     parser.add_argument(
+        "--response-timeout",
+        type=float,
+        default=DEFAULT_RESPONSE_TIMEOUT_S,
+        help=(
+            "maximum seconds to wait for each sidecar response "
+            f"(default {DEFAULT_RESPONSE_TIMEOUT_S:g})"
+        ),
+    )
+    parser.add_argument(
         "--json", action="store_true", help="emit the result as a single JSON object"
     )
     args = parser.parse_args(argv)
@@ -275,6 +366,10 @@ def parse_args(argv):
         parser.error("--rounds must be >= 1")
     if args.floor < 0:
         parser.error("--floor must be >= 0")
+    if args.floor > 0 and args.expect_backend is None:
+        parser.error("--expect-backend is required when --floor is greater than 0")
+    if args.response_timeout <= 0:
+        parser.error("--response-timeout must be greater than 0")
     return args
 
 
@@ -288,8 +383,9 @@ def main(argv):
             args.floor,
             args.model,
             args.expect_backend,
+            args.response_timeout,
         )
-    except BenchError as exc:
+    except (BenchError, OSError, subprocess.SubprocessError, ValueError) as exc:
         if args.json:
             print(json.dumps({"error": str(exc), "pass": False}))
         else:

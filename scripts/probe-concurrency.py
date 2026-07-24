@@ -18,6 +18,8 @@ import time
 SCHEMA = "julie.embedding.sidecar"
 VERSION = 1
 MAX_PIPELINED_REQUESTS = 32
+MIN_CLIENTS = 3
+MIN_REQUESTS = 8
 SUPPORTED_BACKENDS = ("cpu", "cuda", "directml", "mps", "metal", "vulkan")
 
 
@@ -100,6 +102,10 @@ class Sidecar:
         replies = []
         for request in requests:
             reply = self._read_reply()
+            if not isinstance(reply, dict):
+                raise ProbeError(
+                    f"{request['request_id']}: response envelope is not an object"
+                )
             if reply.get("request_id") != request["request_id"]:
                 raise ProbeError(
                     f"response order mismatch: expected {request['request_id']}, "
@@ -107,15 +113,26 @@ class Sidecar:
                 )
             if "error" in reply:
                 raise ProbeError(f"{request['request_id']}: {reply['error']}")
-            replies.append(reply["result"])
+            result = reply.get("result")
+            if not isinstance(result, dict):
+                raise ProbeError(f"{request['request_id']}: result is not an object")
+            replies.append(result)
         finished = time.monotonic()
         elapsed_ms = (finished - started) * 1000
 
         health = replies[0]
         if health.get("ready") is not True:
             raise ProbeError(f"client {client_index} not ready: {health}")
-        vectors = [result["vector"] for result in replies[1:]]
-        if any(len(vector) != health["dims"] for vector in vectors):
+        dims = health.get("dims")
+        if not isinstance(dims, int):
+            raise ProbeError(f"client {client_index} health has no integer dims")
+        vectors = []
+        for result in replies[1:]:
+            vector = result.get("vector")
+            if not isinstance(vector, list):
+                raise ProbeError(f"client {client_index} query has no vector")
+            vectors.append(vector)
+        if any(len(vector) != dims for vector in vectors):
             raise ProbeError(f"client {client_index} returned a wrong vector dimension")
         return {
             "client": client_index,
@@ -144,6 +161,8 @@ class Sidecar:
             )
             self.process.stdin.flush()
             reply = self._read_reply()
+            if not isinstance(reply, dict):
+                raise ProbeError("shutdown response envelope is not an object")
             if reply.get("result") != {"stopping": True}:
                 raise ProbeError(f"shutdown mismatch: {reply}")
             self.process.stdin.close()
@@ -256,6 +275,7 @@ def run_probe(binary, clients, requests, model, expected_backend, response_timeo
     overlap_ms = common_overlap_ms(results)
     pipelines_overlapped = overlap_ms > 0
     clean_exit = all(code == 0 for code in exit_codes)
+    gate_minimums_satisfied = clients >= MIN_CLIENTS and requests >= MIN_REQUESTS
     return {
         "recorded_utc": datetime.datetime.now(datetime.timezone.utc)
         .isoformat()
@@ -288,6 +308,7 @@ def run_probe(binary, clients, requests, model, expected_backend, response_timeo
         "vectors_bit_exact_across_processes": deterministic,
         "health_equal_across_processes": consistent_health,
         "expected_backend_selected": expected_health,
+        "gate_minimums_satisfied": gate_minimums_satisfied,
         "clean_exit": clean_exit,
         "pass": (
             deterministic
@@ -295,6 +316,7 @@ def run_probe(binary, clients, requests, model, expected_backend, response_timeo
             and expected_health
             and pipelines_overlapped
             and clean_exit
+            and gate_minimums_satisfied
         ),
     }
 
@@ -315,10 +337,10 @@ def parse_args(argv):
     parser.add_argument("--response-timeout", type=float, default=60)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-    if args.clients < 2:
-        parser.error("--clients must be at least 2")
-    if args.requests < 2:
-        parser.error("--requests must be at least 2")
+    if args.clients < MIN_CLIENTS:
+        parser.error(f"--clients must be at least {MIN_CLIENTS}")
+    if args.requests < MIN_REQUESTS:
+        parser.error(f"--requests must be at least {MIN_REQUESTS}")
     if args.requests > MAX_PIPELINED_REQUESTS:
         parser.error(f"--requests must be at most {MAX_PIPELINED_REQUESTS}")
     if args.response_timeout <= 0:
@@ -328,14 +350,21 @@ def parse_args(argv):
 
 def main(argv):
     args = parse_args(argv)
-    report = run_probe(
-        args.binary,
-        args.clients,
-        args.requests,
-        args.model,
-        args.expect_backend,
-        args.response_timeout,
-    )
+    try:
+        report = run_probe(
+            args.binary,
+            args.clients,
+            args.requests,
+            args.model,
+            args.expect_backend,
+            args.response_timeout,
+        )
+    except (ProbeError, OSError, subprocess.SubprocessError, ValueError) as error:
+        if args.json:
+            print(json.dumps({"error": str(error), "pass": False}))
+        else:
+            print(f"probe-concurrency: {error}", file=sys.stderr)
+        return 2
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -349,8 +378,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main(sys.argv[1:]))
-    except (ProbeError, OSError, subprocess.SubprocessError, ValueError) as error:
-        print(f"probe-concurrency: {error}", file=sys.stderr)
-        raise SystemExit(1)
+    raise SystemExit(main(sys.argv[1:]))

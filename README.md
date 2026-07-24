@@ -6,8 +6,12 @@ A thin Rust stdio binary that turns text into embedding vectors. It speaks the f
 Metal / Vulkan / CPU backends. Consumers (Miller, Julie) spawn it and talk NDJSON; they never
 download models or compute model paths.
 
-**Status: release candidate under active validation.** CPU and Metal run locally; Vulkan and CUDA
-packages remain compile candidates until the platform and real-hardware gates pass.
+**Status: release candidate under active validation.**
+**Current candidate: [`v0.1.0-rc.4`](docs/release-notes/v0.1.0-rc.4.md).** It remains a source
+and package candidate until checksum-bound archives are built and published with approval. The exact
+RC3 Apple arm64 archive has physical Apple Silicon CPU and Metal proof. RC4 does not inherit that
+archive-specific result. Apple x64, Linux Vulkan, Windows Vulkan, and CUDA remain package candidates
+until their exact archives pass the applicable physical-hardware gates.
 
 ## Launch interface
 
@@ -36,6 +40,7 @@ cargo build --release
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
 ```
 
 The toolchain is pinned in `rust-toolchain.toml`.

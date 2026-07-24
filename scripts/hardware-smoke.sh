@@ -185,7 +185,13 @@ if expectation != "absent":
 requests.append({"schema":"julie.embedding.sidecar","version":1,"request_id":"shutdown","method":"shutdown","params":{}})
 process = subprocess.Popen([binary, "serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=os.environ.copy())
 payload = "\n".join(json.dumps(request, separators=(",", ":")) for request in requests) + "\n"
-stdout, stderr = process.communicate(payload, timeout=900)
+try:
+    stdout, stderr = process.communicate(payload, timeout=900)
+except subprocess.TimeoutExpired:
+    process.kill()
+    stdout, stderr = process.communicate()
+    sys.stderr.write(stderr)
+    raise SystemExit("sidecar protocol smoke timed out after 900s")
 sys.stderr.write(stderr)
 if process.returncode != 0:
     raise SystemExit(f"sidecar exited {process.returncode}")

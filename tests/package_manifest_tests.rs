@@ -359,6 +359,35 @@ fn public_docs_and_promotion_gate_name_every_portable_profile() {
 }
 
 #[test]
+fn current_release_candidate_has_matching_public_notes_and_status() {
+    let version = env!("CARGO_PKG_VERSION");
+    assert_eq!(version, "0.1.0-rc.4");
+
+    let tag = format!("v{version}");
+    let release_notes_path = format!("docs/release-notes/{tag}.md");
+    let readme = std::fs::read_to_string("README.md").expect("README");
+    let release_notes =
+        std::fs::read_to_string(&release_notes_path).expect("current release notes");
+
+    assert!(
+        readme.contains(&format!(
+            "**Current candidate: [`{tag}`]({release_notes_path}).**"
+        )),
+        "README current-candidate pointer does not match {tag}"
+    );
+    assert!(
+        release_notes.starts_with(&format!("# {tag}\n")),
+        "release-note title does not match {tag}"
+    );
+    assert!(release_notes.contains("package candidate"));
+    assert!(release_notes.contains("physical Intel Mac"));
+    assert!(
+        readme.contains("python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'"),
+        "README must list the Python release-harness gate"
+    );
+}
+
+#[test]
 fn packaging_scripts_use_the_shared_helper_before_backend_tier_archives() {
     for script in packaging_scripts() {
         assert!(script.contains("julie-package-manifest"));

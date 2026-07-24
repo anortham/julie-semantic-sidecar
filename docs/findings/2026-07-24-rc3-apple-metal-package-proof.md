@@ -132,6 +132,11 @@ command using the proof-branch harness whose content SHA-256 is
 This harness is not part of release commit `24ce625`; the self-recorded content
 hash, not that release commit, binds the concurrency proof:
 
+The recorded hashes identify the exact harness content used for this RC3
+evidence. Later branches hardened both harnesses further, so a fresh run from a
+newer branch self-records a different harness hash without changing the
+historical RC3 evidence identity.
+
 ```bash
 JULIE_EMBEDDING_CACHE_DIR=/Users/murphy/source/julie-semantic-sidecar-evidence/2026-07-24-rc3-metal/cache \
 JULIE_SIDECAR_FORCE_BACKEND=cpu \

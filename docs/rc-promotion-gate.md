@@ -110,12 +110,13 @@ CPU fallback: Metal on macOS arm64 (`apple-arm64-metal-portable`), Metal on macO
 Linux x64 (`linux-x64-vulkan-portable`). Evidence for one platform or archive checksum never
 promotes another.
 
-The Apple x64 lane is built and artifact-validated on GitHub's `macos-15-intel` runner. That proves
-the exact target can compile, package, unpack, and satisfy its deterministic manifest; it is not
-physical Intel-Mac support evidence. Promotion requires the checksum-selected archive to pass the
-real-device, golden-vector, Metal-selection, CPU-fallback, and performance gates on a physical Intel
-Mac. It cannot inherit Apple arm64 evidence or the M2 Ultra throughput result; record an approved
-Intel reference machine and lane-specific floor before marking the x64 archive supported.
+The Apple x64 lane is configured to build and artifact-validate on GitHub's `macos-15-intel` runner.
+A successful run proves the exact target can compile, package, unpack, and satisfy its deterministic
+manifest; it is not physical Intel-Mac support evidence. Promotion requires the checksum-selected
+archive to pass the real-device, golden-vector, Metal-selection, CPU-fallback, and performance gates
+on a physical Intel Mac. It cannot inherit Apple arm64 evidence or the M2 Ultra throughput result;
+record an approved Intel reference machine and lane-specific floor before marking the x64 archive
+supported.
 
 CUDA, HIP/ROCm, and SYCL archives are vendor-specific lanes. They do not substitute for portable-lane
 proof and become supported only after their own exact-checksum real-device, golden-vector, fallback,
@@ -139,7 +140,8 @@ It then times `embed_batch` rounds after a discarded warm-up round and prints st
 units/s with a PASS/FAIL verdict against the floor (default `40`, overridable with `--floor`).
 Exit code: `0` PASS, `1` below floor, `2` not-ready / bad arguments / protocol error. Use
 `--json` for machine-readable output; `--batch`/`--rounds` to vary the shape (batch is capped at
-the protocol maximum of 250).
+the protocol maximum of 250), and `--response-timeout` to bound every sidecar response wait
+(default `120` seconds).
 
 Record the archive SHA-256 and measured steady-state number in the promotion evidence, not just the
 PASS. The 40 units/s value is the pre-change Qwen-derived minimum; a default-model change requires

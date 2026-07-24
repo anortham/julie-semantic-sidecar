@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import tempfile
@@ -51,7 +52,12 @@ class ProbeConcurrencyTests(unittest.TestCase):
                         }
                     elif method == "embed_query":
                         result = {"vector": [0.6, 0.8]}
+                        if os.environ.get("FAKE_MODE") == "missing-vector":
+                            result = {}
                     elif method == "shutdown":
+                        if os.environ.get("FAKE_MODE") == "malformed-shutdown":
+                            print("null", flush=True)
+                            break
                         result = {"stopping": True}
                     else:
                         raise RuntimeError(method)
@@ -86,8 +92,8 @@ class ProbeConcurrencyTests(unittest.TestCase):
         ):
             report = PROBE.run_probe(
                 str(self.binary),
-                clients=2,
-                requests=2,
+                clients=3,
+                requests=8,
                 model=None,
                 expected_backend="cpu",
                 response_timeout=5,
@@ -103,8 +109,32 @@ class ProbeConcurrencyTests(unittest.TestCase):
         self.assertEqual("cpu", report["forced_backend"])
         self.assertEqual(str(cache), report["cache_dir"])
         self.assertTrue(report["expected_backend_selected"])
+        self.assertTrue(report["gate_minimums_satisfied"])
         self.assertTrue(report["pipelines_overlapped"])
         self.assertGreater(report["pipeline_overlap_ms"], 0)
+
+    def test_programmatic_below_gate_shape_cannot_pass(self):
+        with mock.patch.dict(
+            os.environ,
+            {"FAKE_BACKEND": "cpu", "FAKE_QUERY_DELAY": "0.05"},
+            clear=False,
+        ):
+            report = PROBE.run_probe(
+                str(self.binary),
+                clients=2,
+                requests=2,
+                model=None,
+                expected_backend="cpu",
+                response_timeout=5,
+            )
+
+        self.assertIn(
+            "gate_minimums_satisfied",
+            report,
+            "programmatic evidence must disclose its gate shape",
+        )
+        self.assertFalse(report.get("gate_minimums_satisfied"))
+        self.assertFalse(report["pass"])
 
     def test_backend_mismatch_fails_the_probe(self):
         with mock.patch.dict(os.environ, {"FAKE_BACKEND": "cpu"}, clear=False):
@@ -179,6 +209,125 @@ class ProbeConcurrencyTests(unittest.TestCase):
                     ]
                 )
 
+    def test_parse_rejects_below_gate_process_and_request_counts(self):
+        for flag, value in (("--clients", "2"), ("--requests", "7")):
+            with self.subTest(flag=flag), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    PROBE.parse_args(
+                        [
+                            "--binary",
+                            str(self.binary),
+                            "--clients",
+                            "3",
+                            "--requests",
+                            "8",
+                            flag,
+                            value,
+                            "--expect-backend",
+                            "cpu",
+                        ]
+                    )
+
+    def test_json_harness_error_is_a_machine_readable_exit_two(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                PROBE,
+                "run_probe",
+                side_effect=PROBE.ProbeError("protocol failed"),
+            ),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            try:
+                exit_code = PROBE.main(
+                    [
+                        "--binary",
+                        str(self.binary),
+                        "--clients",
+                        "3",
+                        "--requests",
+                        "8",
+                        "--expect-backend",
+                        "cpu",
+                        "--json",
+                    ]
+                )
+            except PROBE.ProbeError:
+                self.fail("main must render harness failures instead of raising")
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual(
+            {"error": "protocol failed", "pass": False},
+            json.loads(output.getvalue()),
+        )
+
+    def test_malformed_reply_is_a_machine_readable_exit_two(self):
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"FAKE_MODE": "missing-vector"}, clear=False),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            try:
+                exit_code = PROBE.main(
+                    [
+                        "--binary",
+                        str(self.binary),
+                        "--clients",
+                        "3",
+                        "--requests",
+                        "8",
+                        "--expect-backend",
+                        "cpu",
+                        "--json",
+                    ]
+                )
+            except KeyError:
+                self.fail("malformed replies must become probe errors")
+
+        self.assertEqual(2, exit_code)
+        report = json.loads(output.getvalue())
+        self.assertFalse(report["pass"])
+        self.assertIn("vector", report["error"])
+
+    def test_malformed_shutdown_is_a_machine_readable_exit_two(self):
+        output = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "FAKE_BACKEND": "cpu",
+                    "FAKE_QUERY_DELAY": "0.05",
+                    "FAKE_MODE": "malformed-shutdown",
+                },
+                clear=False,
+            ),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            try:
+                exit_code = PROBE.main(
+                    [
+                        "--binary",
+                        str(self.binary),
+                        "--clients",
+                        "3",
+                        "--requests",
+                        "8",
+                        "--expect-backend",
+                        "cpu",
+                        "--json",
+                    ]
+                )
+            except AttributeError:
+                self.fail("malformed shutdown replies must become probe errors")
+
+        self.assertEqual(2, exit_code)
+        report = json.loads(output.getvalue())
+        self.assertFalse(report["pass"])
+        self.assertIn("shutdown", report["error"])
+
     def test_parser_accepts_every_advertised_backend_name(self):
         for backend in ("cpu", "cuda", "directml", "mps", "metal", "vulkan"):
             with self.subTest(backend=backend):
@@ -187,9 +336,9 @@ class ProbeConcurrencyTests(unittest.TestCase):
                         "--binary",
                         str(self.binary),
                         "--clients",
-                        "2",
+                        "3",
                         "--requests",
-                        "2",
+                        "8",
                         "--expect-backend",
                         backend,
                     ]

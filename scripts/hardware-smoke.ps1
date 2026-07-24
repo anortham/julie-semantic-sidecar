@@ -13,6 +13,15 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
+$pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
+if (-not $pythonCommand) {
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+}
+if (-not $pythonCommand) {
+    throw 'python3 or python is required'
+}
+$python = $pythonCommand.Source
+
 if (-not (Test-Path -LiteralPath $Archive -PathType Leaf)) {
     throw "archive does not exist: $Archive"
 }
@@ -40,7 +49,13 @@ if expectation != "absent":
 requests.append({"schema":"julie.embedding.sidecar","version":1,"request_id":"shutdown","method":"shutdown","params":{}})
 process = subprocess.Popen([binary, "serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=os.environ.copy())
 payload = "\n".join(json.dumps(request, separators=(",", ":")) for request in requests) + "\n"
-stdout, stderr = process.communicate(payload, timeout=900)
+try:
+    stdout, stderr = process.communicate(payload, timeout=900)
+except subprocess.TimeoutExpired:
+    process.kill()
+    stdout, stderr = process.communicate()
+    sys.stderr.write(stderr)
+    raise SystemExit("sidecar protocol smoke timed out after 900s")
 sys.stderr.write(stderr)
 if process.returncode != 0:
     raise SystemExit(f"sidecar exited {process.returncode}")
@@ -117,7 +132,7 @@ function Invoke-ProtocolSmoke([string]$Label, [string]$SmokeCache, [string]$Forc
     }
     $stdoutPath = Join-Path $EvidenceDir "raw-logs/$Label.stdout.jsonl"
     $stderrPath = Join-Path $EvidenceDir "raw-logs/$Label.stderr.log"
-    & python -c $protocolProgram $script:binary $Expectation $Backend 1> $stdoutPath 2> $stderrPath
+    & $script:python -c $protocolProgram $script:binary $Expectation $Backend 1> $stdoutPath 2> $stderrPath
     if ($LASTEXITCODE -ne 0) { throw "protocol smoke failed: $Label" }
 }
 
@@ -129,7 +144,12 @@ function Invoke-Conformance([string]$RequestedBackend) {
     $env:JULIE_SIDECAR_FORCE_BACKEND = $RequestedBackend
     $log = Join-Path $EvidenceDir "raw-logs/conformance-$RequestedBackend.log"
     $arguments = @('test', '--release', '--test', 'conformance', '--', '--ignored', '--test-threads=1', '--nocapture')
-    & cargo @arguments *> $log
+    @(
+        "conformance: binary   $script:binary"
+        "conformance: fixtures $FixturesDir"
+        "conformance: backend  $RequestedBackend"
+    ) | Set-Content -LiteralPath $log
+    & cargo @arguments *>> $log
     if ($LASTEXITCODE -ne 0) { throw "conformance failed: $RequestedBackend" }
 }
 
@@ -147,7 +167,7 @@ function Invoke-Prepare([string]$Model) {
 }
 
 try {
-    & python -c $extractProgram $Archive $unpackDir
+    & $script:python -c $extractProgram $Archive $unpackDir
     if ($LASTEXITCODE -ne 0) { throw 'archive extraction failed' }
 
     $binary = Join-Path $unpackDir 'julie-semantic-sidecar.exe'
@@ -267,10 +287,10 @@ try {
         $env:JULIE_EMBEDDING_CACHE_DIR = $CacheDir
         $env:JULIE_SIDECAR_FORCE_BACKEND = $measuredBackend
         $batchOneLog = Join-Path $EvidenceDir "raw-logs/bench-$measuredBackend-batch-1.json"
-        & python scripts/bench-throughput.py --binary $binary --batch 1 --rounds 4 --floor 0 --json > $batchOneLog
+        & $script:python scripts/bench-throughput.py --binary $binary --batch 1 --rounds 4 --floor 0 --expect-backend $measuredBackend --json > $batchOneLog
         if ($LASTEXITCODE -ne 0) { throw "batch-1 measurement failed: $measuredBackend" }
         $batchSixteenLog = Join-Path $EvidenceDir "raw-logs/bench-$measuredBackend-batch-16.json"
-        & python scripts/bench-throughput.py --binary $binary --batch 16 --rounds 4 --floor 0 --json > $batchSixteenLog
+        & $script:python scripts/bench-throughput.py --binary $binary --batch 16 --rounds 4 --floor 0 --expect-backend $measuredBackend --json > $batchSixteenLog
         if ($LASTEXITCODE -ne 0) { throw "batch-16 measurement failed: $measuredBackend" }
     }
 

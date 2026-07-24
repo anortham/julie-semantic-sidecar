@@ -1327,10 +1327,20 @@ fn hardware_smoke_entry_points_require_an_exact_unpacked_archive() {
         assert!(script.contains("prepare failed after 3 attempts"), "{path}");
         assert!(script.contains("--batch 1"), "{path}");
         assert!(script.contains("--batch 16"), "{path}");
+        assert_eq!(
+            script.matches("--expect-backend").count(),
+            2,
+            "{path} must bind both throughput records to their measured backend"
+        );
         assert!(
             script.contains("archive member is not flat and safe"),
             "{path}"
         );
+        assert!(
+            script.contains("except subprocess.TimeoutExpired:"),
+            "{path}"
+        );
+        assert!(script.contains("process.kill()"), "{path}");
     }
 
     let bash = repository_file("scripts/hardware-smoke.sh");
@@ -1339,6 +1349,19 @@ fn hardware_smoke_entry_points_require_an_exact_unpacked_archive() {
         "JULIE_EMBEDDING_CACHE_DIR=\"$cache_dir\" JULIE_CONFORMANCE_UNAVAILABLE_BACKEND"
     ));
     assert!(bash.contains("JULIE_CONFORMANCE_UNAVAILABLE_BACKEND=\"$fallback_backend\""));
+
+    let powershell = repository_file("scripts/hardware-smoke.ps1");
+    assert!(powershell.contains("Get-Command python3"));
+    assert!(powershell.contains("Get-Command python"));
+    assert!(!powershell.contains("& python "));
+    assert_eq!(powershell.matches("& $script:python").count(), 4);
+    for identity in [
+        "conformance: binary   $script:binary",
+        "conformance: fixtures $FixturesDir",
+        "conformance: backend  $RequestedBackend",
+    ] {
+        assert!(powershell.contains(identity), "{identity}");
+    }
 }
 
 #[test]

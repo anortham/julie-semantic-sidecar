@@ -5,20 +5,21 @@ Date: 2026-07-24
 ## Outcome
 
 The sidecar now defines `apple-x64-metal-portable` as the fourth portable package profile. It
-targets `x86_64-apple-darwin`, compiles the built-in Metal backend, and retains the existing runtime
-selection and truthful CPU fallback behavior. The frozen sidecar protocol and backend-selection
-implementation did not change.
+targets `x86_64-apple-darwin`, configures the built-in Metal backend, and retains the existing
+runtime selection and truthful CPU fallback behavior. The frozen sidecar protocol and
+backend-selection implementation did not change.
 
 The new profile is a package candidate, not a supported platform claim. CI and the manual candidate
-workflow build it on `macos-15-intel`, but artifact validation remains explicitly separate from
-physical Intel-Mac support evidence.
+workflow are configured to build it on `macos-15-intel`, but no x64 compile workflow has run for
+this branch. Artifact validation remains explicitly separate from physical Intel-Mac support
+evidence.
 
 ## Worktree
 
 - Path: `/Users/murphy/source/julie-semantic-sidecar/.worktrees/miller-takeover-macos-x64`
 - Branch: `codex/miller-takeover-macos-x64`
 - Base commit: `24ce6257bee7f41865b10daf1457ed9b4fd71a8a`
-- Commit created: none
+- Package-lane commit: `b1fd84f`
 - Other sidecar worktrees modified: none
 
 ## Changes
@@ -93,11 +94,30 @@ The focused tests first failed because the new structural extractors were absent
 the extractors were implemented. The post-review full `cargo test` gate passed 213 tests with
 25 hardware/model tests ignored; clippy, formatting, and actionlint also remained green.
 
+## RC4 Preparation Verification
+
+- `cargo test --locked`: 214 passed, 25 hardware/model tests ignored, 0 failed.
+- `cargo test --locked --features metal`: 214 passed, 25 hardware/model tests ignored, 0 failed.
+- Default and Metal `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- Python harness suite: 24 passed.
+- `shellcheck`, `bash -n`, and `actionlint`: passed.
+- The local RC4 Apple arm64 package built twice with byte-identical archive SHA-256
+  `4c4834fca5d7f2b1af5e650492c8c2c131dd6b69e4572752fd0f753c8348d65c`.
+- The RC4 manifest reports sidecar version `0.1.0-rc.4`; checksum-bound unpacked artifact
+  validation passed and explicitly remains non-support evidence.
+- The Apple x64 package adapter rejected this arm64 host before compilation, proving the host guard
+  does not manufacture cross-built Intel evidence.
+- Fresh RC4 reviews found and drove fixes for PowerShell/backend parity, concurrency error records
+  and gate minimums, derived backend truth, mandatory backend identity for positive-floor records,
+  bounded response waits, machine-readable harness failures, protocol reply validation, child
+  cleanup, evidence-log identity, smoke-timeout cleanup, and premature x64 compile wording.
+
 ## Remaining Promotion Evidence
 
-This source change is newer than `v0.1.0-rc.3`. Adoption requires an RC4 candidate and a public
-`x86_64-apple-darwin` archive/checksum produced from the reviewed commit. No workflow was dispatched
-and nothing was published, tagged, pushed, or released here.
+This branch is prepared locally as the `v0.1.0-rc.4` source and package candidate. Adoption requires
+a public `x86_64-apple-darwin` archive/checksum produced from the final reviewed commit. No workflow
+was dispatched and nothing was published, tagged, pushed, or released here.
 
 Before the Apple x64 lane can be called supported, the exact public archive checksum must pass on a
 physical Intel Mac:
