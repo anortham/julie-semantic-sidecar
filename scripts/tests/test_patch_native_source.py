@@ -14,8 +14,12 @@ CRATE = "llama-cpp-sys-2-0.1.151"
 SHADER_ROOT = Path("llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders")
 PATCHES = {
     SHADER_ROOT / "topk_moe.comp": (
-        b"const float INFINITY = 1.0 / 0.0;\n",
-        b"const float INFINITY = uintBitsToFloat(0x7F800000);\n",
+        b"const float INFINITY = 1.0 / 0.0;\n"
+        + b"float max_val = -INFINITY;\n"
+        + b"probs[0] = -INFINITY;\n" * 5,
+        b"#define NEGATIVE_INFINITY uintBitsToFloat(0xFF800000u)\n"
+        + b"float max_val = NEGATIVE_INFINITY;\n"
+        + b"probs[0] = NEGATIVE_INFINITY;\n" * 5,
     ),
     SHADER_ROOT / "copy_to_quant.comp": (
         b"float vmin = 1.0/0.0;\n",
@@ -26,7 +30,7 @@ PATCHES = {
         b"float m_max = uintBitsToFloat(0xFF800000);\n",
     ),
 }
-PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-infinity-v1"
+PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-infinity-v2"
 
 
 def expected_patch_identity() -> str:
@@ -112,7 +116,7 @@ class NativeSourcePatchTests(unittest.TestCase):
         result, crate_root, checksum = self.run_patch({path: source})
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("expected exactly one unpatched infinity expression", result.stderr)
+        self.assertIn("expected pinned unpatched infinity expressions", result.stderr)
         self.assertEqual((crate_root / path).read_bytes(), source)
         self.assertEqual(
             json.loads(checksum.read_text(encoding="utf-8"))["files"][path.as_posix()],
@@ -125,7 +129,7 @@ class NativeSourcePatchTests(unittest.TestCase):
         result, crate_root, checksum = self.run_patch({path: patched})
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("expected exactly one unpatched infinity expression", result.stderr)
+        self.assertIn("expected pinned unpatched infinity expressions", result.stderr)
         self.assertEqual((crate_root / path).read_bytes(), patched)
         self.assertEqual(
             json.loads(checksum.read_text(encoding="utf-8"))["files"][path.as_posix()],

@@ -379,8 +379,8 @@ fn packaging_patches_the_pinned_native_shader_before_building() {
     }
     assert!(bash.find("patch-native-source.py") < bash.find("cargo --config"));
     assert!(powershell.find("patch-native-source.py") < powershell.find("$messages = & cargo"));
-    assert!(bash.contains("vulkan-infinity-v1:[0-9a-f]{64}"));
-    assert!(powershell.contains("vulkan-infinity-v1:[0-9a-f]{64}"));
+    assert!(bash.contains("vulkan-infinity-v2:[0-9a-f]{64}"));
+    assert!(powershell.contains("vulkan-infinity-v2:[0-9a-f]{64}"));
     assert!(powershell.contains("-cnotmatch"));
     assert!(bash.contains("verify-patched"));
     assert!(powershell.contains("verify-patched"));
@@ -393,11 +393,11 @@ fn patched_package_verification_rejects_every_invalid_native_patch_identity_shap
         "cargo=release".to_string(),
         "cargo=release;native_patch=none".to_string(),
         format!(
-            "cargo=release;native_patch=llama-cpp-sys-2-0.1.151:vulkan-infinity-v1:{}",
+            "cargo=release;native_patch=llama-cpp-sys-2-0.1.151:vulkan-infinity-v2:{}",
             "0".repeat(63)
         ),
         format!(
-            "cargo=release;native_patch=llama-cpp-sys-2-0.1.151:vulkan-infinity-v1:{}",
+            "cargo=release;native_patch=llama-cpp-sys-2-0.1.151:vulkan-infinity-v2:{}",
             "A".repeat(64)
         ),
     ] {

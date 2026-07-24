@@ -74,7 +74,7 @@ try {
     if ($nativePatchExitCode -ne 0) { throw "native source patch failed" }
     if (
         $nativePatchOutput.Count -ne 1 -or
-        $nativePatchOutput[0].Trim() -cnotmatch '^llama-cpp-sys-2-0\.1\.151:vulkan-infinity-v1:[0-9a-f]{64}$'
+        $nativePatchOutput[0].Trim() -cnotmatch '^llama-cpp-sys-2-0\.1\.151:vulkan-infinity-v2:[0-9a-f]{64}$'
     ) {
         throw "native source patch returned an invalid identity"
     }

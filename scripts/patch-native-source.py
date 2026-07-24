@@ -11,19 +11,29 @@ CRATE = "llama-cpp-sys-2-0.1.151"
 SHADER_ROOT = Path("llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders")
 PATCHES = {
     SHADER_ROOT / "topk_moe.comp": (
-        b"const float INFINITY = 1.0 / 0.0;",
-        b"const float INFINITY = uintBitsToFloat(0x7F800000);",
+        (
+            b"const float INFINITY = 1.0 / 0.0;",
+            b"#define NEGATIVE_INFINITY uintBitsToFloat(0xFF800000u)",
+            1,
+        ),
+        (b"-INFINITY", b"NEGATIVE_INFINITY", 6),
     ),
     SHADER_ROOT / "copy_to_quant.comp": (
-        b"float vmin = 1.0/0.0;",
-        b"float vmin = uintBitsToFloat(0x7F800000);",
+        (
+            b"float vmin = 1.0/0.0;",
+            b"float vmin = uintBitsToFloat(0x7F800000);",
+            1,
+        ),
     ),
     SHADER_ROOT / "flash_attn_split_k_reduce.comp": (
-        b"float m_max = -1.0/0.0;",
-        b"float m_max = uintBitsToFloat(0xFF800000);",
+        (
+            b"float m_max = -1.0/0.0;",
+            b"float m_max = uintBitsToFloat(0xFF800000);",
+            1,
+        ),
     ),
 }
-PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-infinity-v1"
+PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-infinity-v2"
 
 
 def patch(vendor_root: Path) -> str:
@@ -41,7 +51,7 @@ def patch(vendor_root: Path) -> str:
         raise ValueError(f"invalid vendored checksum manifest: {checksum_path}")
 
     patched_sources = {}
-    for source_path, (original, replacement) in PATCHES.items():
+    for source_path, replacements in PATCHES.items():
         shader = crate_root / source_path
         try:
             source = shader.read_bytes()
@@ -49,15 +59,19 @@ def patch(vendor_root: Path) -> str:
             raise ValueError(
                 f"cannot read pinned native shader source: {shader}: {error}"
             ) from error
-        if source.count(original) != 1 or replacement in source:
-            raise ValueError(
-                f"expected exactly one unpatched infinity expression in {shader}"
-            )
+        for original, replacement, expected_count in replacements:
+            if source.count(original) != expected_count or replacement in source:
+                raise ValueError(
+                    f"expected pinned unpatched infinity expressions in {shader}"
+                )
         source_key = source_path.as_posix()
         expected_source_checksum = hashlib.sha256(source).hexdigest()
         if checksums.get("files", {}).get(source_key) != expected_source_checksum:
             raise ValueError(f"vendored checksum does not match {shader}")
-        patched_sources[source_path] = source.replace(original, replacement)
+        patched_source = source
+        for original, replacement, _ in replacements:
+            patched_source = patched_source.replace(original, replacement)
+        patched_sources[source_path] = patched_source
 
     identity_digest = hashlib.sha256()
     for source_path, patched_source in sorted(patched_sources.items()):
