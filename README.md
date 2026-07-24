@@ -46,15 +46,18 @@ Packages use an explicit profile and never bundle model weights:
 
 ```text
 apple-arm64-metal-portable
+apple-x64-metal-portable
 linux-x64-vulkan-portable
 windows-x64-vulkan-portable
 linux-x64-cuda-vendor
 windows-x64-cuda-vendor
 ```
 
-Metal is built into the Apple arm64 executable. Windows and Linux profiles place llama.cpp core
-libraries, CPU modules, and the advertised Vulkan or CUDA module flat beside the executable.
-CUDA archives are candidates, not supported releases, until real NVIDIA hardware validation passes.
+Metal is built into both Apple executables; each uses Metal when the runtime selects it and retains
+the CPU backend as the truthful fallback when Metal is unavailable or loses selection. Windows and
+Linux profiles place llama.cpp core libraries, CPU modules, and the advertised Vulkan or CUDA module
+flat beside the executable. The Apple x64 and CUDA archives are candidates, not supported releases,
+until exact-archive real-hardware validation passes on an Intel Mac or NVIDIA device respectively.
 
 Build with `scripts/package.sh --profile <name>` or
 `scripts/package.ps1 -Profile <name>`. Archive names include sidecar version, Rust target, backend,

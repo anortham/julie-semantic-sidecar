@@ -1243,6 +1243,37 @@ fn repository_file(path: &str) -> String {
         .unwrap_or_else(|error| panic!("read {path}: {error}"))
 }
 
+fn artifact_validation_lane<'a>(workflow: &'a str, profile: &str) -> &'a str {
+    let artifact_validation = workflow
+        .split_once("\n  artifact-validation:\n")
+        .expect("artifact-validation job")
+        .1;
+    let marker = format!("          - name: {profile}");
+    let lane = &artifact_validation[artifact_validation
+        .find(&marker)
+        .unwrap_or_else(|| panic!("artifact-validation lane {profile}"))..];
+    let end = lane.match_indices('\n').find_map(|(index, _)| {
+        let next_line = &lane[index + 1..];
+        let next_lane = next_line.starts_with("          - name:");
+        let next_job = next_line.starts_with("  ")
+            && !next_line.starts_with("   ")
+            && next_line
+                .lines()
+                .next()
+                .is_some_and(|line| line.ends_with(':'));
+        (next_lane || next_job).then_some(index)
+    });
+    let end = end.unwrap_or(lane.len());
+    &lane[..end]
+}
+
+fn release_matrix_entry_count(workflow: &str, profile: &str, os: &str) -> usize {
+    let entry = format!(
+        r#"{{"os":"{os}","profile":"{profile}","backend":"metal","package_shell":"bash"}}"#
+    );
+    workflow.matches(&entry).count()
+}
+
 #[test]
 fn conformance_entry_points_accept_an_archive_binary_and_requested_backend() {
     let script = repository_file("scripts/conformance.sh");
@@ -1324,13 +1355,47 @@ fn packaging_adapters_do_not_smoke_staged_layouts() {
 #[test]
 fn ci_names_portable_packages_as_artifact_validation_not_support_evidence() {
     let workflow = repository_file(".github/workflows/ci.yml");
+    let apple_x64_lane = r#"          - name: apple-x64-metal-portable
+            os: macos-15-intel
+            profile: apple-x64-metal-portable
+            backend: metal
+            package_shell: bash"#;
 
     assert!(workflow.contains("artifact validation"));
     assert!(workflow.contains("apple-arm64-metal-portable"));
+    assert_eq!(
+        artifact_validation_lane(&workflow, "apple-x64-metal-portable"),
+        apple_x64_lane
+    );
+    let wrong_runner_lane = apple_x64_lane.replace("os: macos-15-intel", "os: macos-15");
+    let drifted_workflow = workflow.replacen(apple_x64_lane, &wrong_runner_lane, 1);
+    assert_ne!(drifted_workflow, workflow);
+    assert_ne!(
+        artifact_validation_lane(&drifted_workflow, "apple-x64-metal-portable"),
+        apple_x64_lane
+    );
     assert!(workflow.contains("linux-x64-vulkan-portable"));
     assert!(workflow.contains("windows-x64-vulkan-portable"));
     assert!(workflow.contains("not support evidence"));
     assert!(workflow.contains("hardware-smoke.ps1"));
+}
+
+#[test]
+fn artifact_validation_lane_stops_before_the_next_top_level_job() {
+    let workflow = r#"jobs:
+  artifact-validation:
+    strategy:
+      matrix:
+        include:
+          - name: apple-x64-metal-portable
+            os: macos-15-intel
+  next-job:
+    runs-on: ubuntu-latest"#;
+
+    assert_eq!(
+        artifact_validation_lane(workflow, "apple-x64-metal-portable"),
+        "          - name: apple-x64-metal-portable\n            os: macos-15-intel"
+    );
 }
 
 #[test]
@@ -1344,7 +1409,29 @@ fn release_is_checksum_bound_approval_gated_and_artifact_only() {
     assert!(workflow.contains("package-manifest.json"));
     assert!(workflow.contains("raw-logs"));
     assert!(workflow.contains("hardware-smoke.ps1"));
-    assert!(!workflow.contains("macos-15-intel"));
+    assert_eq!(workflow.matches("apple-x64-metal-portable").count(), 3);
+    assert_eq!(
+        release_matrix_entry_count(&workflow, "apple-x64-metal-portable", "macos-15-intel"),
+        2
+    );
+    let drifted_workflow = workflow.replacen(
+        r#"{"os":"macos-15-intel","profile":"apple-x64-metal-portable","backend":"metal","package_shell":"bash"}"#,
+        r#"{"os":"macos-15","profile":"apple-x64-metal-portable","backend":"metal","package_shell":"bash"}"#,
+        1,
+    );
+    assert_eq!(
+        drifted_workflow.matches("apple-x64-metal-portable").count(),
+        3
+    );
+    assert_eq!(
+        release_matrix_entry_count(
+            &drifted_workflow,
+            "apple-x64-metal-portable",
+            "macos-15-intel"
+        ),
+        1
+    );
+    assert!(workflow.contains(r#"matrix.profile }}" == "$SELECTED_LANE""#));
     assert!(!workflow.contains("gh release"));
     assert!(!workflow.contains("action-gh-release"));
     assert!(!workflow.contains("git tag"));

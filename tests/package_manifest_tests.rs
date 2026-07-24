@@ -7,6 +7,13 @@ use std::path::Path;
 use std::process::Command;
 
 const HELPER: &str = env!("CARGO_BIN_EXE_julie-package-manifest");
+const PORTABLE_PROFILES: [&str; 4] = [
+    "apple-arm64-metal-portable",
+    "apple-x64-metal-portable",
+    "linux-x64-vulkan-portable",
+    "windows-x64-vulkan-portable",
+];
+const VENDOR_PROFILES: [&str; 2] = ["linux-x64-cuda-vendor", "windows-x64-cuda-vendor"];
 
 fn write(root: &Path, name: &str, bytes: &[u8]) {
     std::fs::write(root.join(name), bytes).expect("write payload");
@@ -196,25 +203,27 @@ fn backend_file_disagreement_and_extra_accelerator_modules_are_rejected() {
 
 #[test]
 fn apple_metal_is_built_in_and_rejects_a_fake_plugin() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write(dir.path(), "julie-semantic-sidecar", b"executable");
-    write(dir.path(), "LICENSE", b"license");
-    write(dir.path(), "README.md", b"readme");
-    let profile = PackageProfile {
-        rust_target: "aarch64-apple-darwin".to_string(),
-        tier: PackageTier::Portable,
-        advertised_backend: AdvertisedBackend::Metal,
-        native_build_identity: "native-metal".to_string(),
-    };
+    for rust_target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "julie-semantic-sidecar", b"executable");
+        write(dir.path(), "LICENSE", b"license");
+        write(dir.path(), "README.md", b"readme");
+        let profile = PackageProfile {
+            rust_target: rust_target.to_string(),
+            tier: PackageTier::Portable,
+            advertised_backend: AdvertisedBackend::Metal,
+            native_build_identity: "native-metal".to_string(),
+        };
 
-    let manifest = package_manifest::write(dir.path(), &profile).expect("built in metal");
-    assert_eq!(manifest.files.len(), 3);
-    assert!(manifest
-        .files
-        .iter()
-        .all(|file| file.role != PackageFileRole::AcceleratorBackend));
-    write(dir.path(), "libggml-metal.so", b"fake plugin");
-    assert!(package_manifest::write(dir.path(), &profile).is_err());
+        let manifest = package_manifest::write(dir.path(), &profile).expect("built in metal");
+        assert_eq!(manifest.files.len(), 3);
+        assert!(manifest
+            .files
+            .iter()
+            .all(|file| file.role != PackageFileRole::AcceleratorBackend));
+        write(dir.path(), "libggml-metal.so", b"fake plugin");
+        assert!(package_manifest::write(dir.path(), &profile).is_err());
+    }
 }
 
 #[test]
@@ -263,21 +272,89 @@ fn packaging_scripts() -> [String; 2] {
     ]
 }
 
+fn bash_declared_profiles(script: &str) -> Vec<&str> {
+    let profile_case = script
+        .split_once("case \"$profile\" in")
+        .expect("Bash profile case")
+        .1
+        .split_once("esac")
+        .expect("Bash profile case terminator")
+        .0;
+    profile_case
+        .lines()
+        .filter_map(|line| {
+            let (profile, _) = line.trim().split_once(')')?;
+            (profile != "*").then_some(profile)
+        })
+        .collect()
+}
+
+fn powershell_declared_profiles(script: &str) -> Vec<&str> {
+    let validate_set = script
+        .split_once("[ValidateSet(")
+        .expect("PowerShell profile ValidateSet")
+        .1
+        .split_once(")]")
+        .expect("PowerShell profile ValidateSet terminator")
+        .0;
+    validate_set
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .trim_end_matches(',')
+                .strip_prefix('"')?
+                .strip_suffix('"')
+        })
+        .collect()
+}
+
 #[test]
 fn packaging_scripts_define_only_the_explicit_portable_and_cuda_candidate_profiles() {
-    for script in packaging_scripts() {
-        for profile in [
-            "apple-arm64-metal-portable",
-            "linux-x64-vulkan-portable",
-            "windows-x64-vulkan-portable",
-            "linux-x64-cuda-vendor",
-            "windows-x64-cuda-vendor",
-        ] {
-            assert!(script.contains(profile), "missing {profile}");
+    let expected = PORTABLE_PROFILES
+        .into_iter()
+        .chain(VENDOR_PROFILES)
+        .collect::<Vec<_>>();
+    let [bash, powershell] = packaging_scripts();
+
+    assert_eq!(bash_declared_profiles(&bash), expected);
+    assert_eq!(powershell_declared_profiles(&powershell), expected);
+    for profile in &expected {
+        assert_eq!(
+            bash.matches(profile).count(),
+            1,
+            "Bash mapping for {profile}"
+        );
+        assert_eq!(
+            powershell.matches(profile).count(),
+            2,
+            "PowerShell declaration and mapping for {profile}"
+        );
+    }
+
+    let bash_drift = bash.replacen(
+        "  *) echo \"package: unknown profile: $profile\"",
+        "  macos-x64)\n    target=\"x86_64-apple-darwin\"; backend=\"cpu\"; tier=\"portable\"; features=\"\" ;;\n  *) echo \"package: unknown profile: $profile\"",
+        1,
+    );
+    assert_ne!(bash_drift, bash);
+    assert_ne!(bash_declared_profiles(&bash_drift), expected);
+
+    let powershell_drift = powershell.replacen(
+        "        \"apple-x64-metal-portable\",",
+        "        \"apple-x64-metal-portable\",\n        \"macos-x64\",",
+        1,
+    );
+    assert_ne!(powershell_drift, powershell);
+    assert_ne!(powershell_declared_profiles(&powershell_drift), expected);
+}
+
+#[test]
+fn public_docs_and_promotion_gate_name_every_portable_profile() {
+    for path in ["README.md", "docs/rc-promotion-gate.md"] {
+        let document = std::fs::read_to_string(path).expect("package documentation");
+        for profile in PORTABLE_PROFILES {
+            assert!(document.contains(profile), "{path} is missing {profile}");
         }
-        assert!(!script.contains("rocm"));
-        assert!(!script.contains("sycl"));
-        assert!(!script.contains("macos-x64"));
     }
 }
 

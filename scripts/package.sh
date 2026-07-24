@@ -19,6 +19,8 @@ fi
 case "$profile" in
   apple-arm64-metal-portable)
     target="aarch64-apple-darwin"; backend="metal"; tier="portable"; features="metal" ;;
+  apple-x64-metal-portable)
+    target="x86_64-apple-darwin"; backend="metal"; tier="portable"; features="metal" ;;
   linux-x64-vulkan-portable)
     target="x86_64-unknown-linux-gnu"; backend="vulkan"; tier="portable"; features="vulkan,dynamic-backends" ;;
   windows-x64-vulkan-portable)

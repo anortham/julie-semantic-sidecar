@@ -191,6 +191,11 @@ jobs:
             profile: apple-arm64-metal-portable
             backend: metal
             package_shell: bash
+          - name: apple-x64-metal-portable
+            os: macos-15-intel
+            profile: apple-x64-metal-portable
+            backend: metal
+            package_shell: bash
           - name: linux-x64-vulkan-portable
             os: ubuntu-24.04
             profile: linux-x64-vulkan-portable

@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet(
         "apple-arm64-metal-portable",
+        "apple-x64-metal-portable",
         "linux-x64-vulkan-portable",
         "windows-x64-vulkan-portable",
         "linux-x64-cuda-vendor",
@@ -16,6 +17,7 @@ Set-Location $repoRoot
 
 $settings = switch ($Profile) {
     "apple-arm64-metal-portable" { @{ Target = "aarch64-apple-darwin"; Backend = "metal"; Tier = "portable"; Features = "metal" } }
+    "apple-x64-metal-portable" { @{ Target = "x86_64-apple-darwin"; Backend = "metal"; Tier = "portable"; Features = "metal" } }
     "linux-x64-vulkan-portable" { @{ Target = "x86_64-unknown-linux-gnu"; Backend = "vulkan"; Tier = "portable"; Features = "vulkan,dynamic-backends" } }
     "windows-x64-vulkan-portable" { @{ Target = "x86_64-pc-windows-msvc"; Backend = "vulkan"; Tier = "portable"; Features = "vulkan,dynamic-backends" } }
     "linux-x64-cuda-vendor" { @{ Target = "x86_64-unknown-linux-gnu"; Backend = "cuda"; Tier = "vendor"; Features = "cuda,dynamic-backends" } }

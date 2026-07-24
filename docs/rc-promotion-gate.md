@@ -73,7 +73,7 @@ Review this evidence before changing support status; script success does not pro
 ## Artifact workflow boundary
 
 The manual artifact workflow requires the protected `artifact-release-approval` environment plus an
-exact `hardware_lane` and `expected_archive_sha256`. It always builds the three portable candidates
+exact `hardware_lane` and `expected_archive_sha256`. It always builds the four portable candidates
 and optionally builds CUDA candidates. Outputs remain workflow artifacts containing archives,
 checksums, manifests, and raw validation logs. The workflow does not publish, tag, promote a backend,
 change the Miller pin, or create public assets.
@@ -81,8 +81,17 @@ change the Miller pin, or create public assets.
 ## Portable and vendor-specific lanes
 
 Portable archives are the default consumer artifacts and must prove both their named accelerator and
-CPU fallback: Metal on macOS arm64, Vulkan on Windows x64, and Vulkan on Linux x64. Evidence for one
-platform or archive checksum never promotes another.
+CPU fallback: Metal on macOS arm64 (`apple-arm64-metal-portable`), Metal on macOS x64
+(`apple-x64-metal-portable`), Vulkan on Windows x64 (`windows-x64-vulkan-portable`), and Vulkan on
+Linux x64 (`linux-x64-vulkan-portable`). Evidence for one platform or archive checksum never
+promotes another.
+
+The Apple x64 lane is built and artifact-validated on GitHub's `macos-15-intel` runner. That proves
+the exact target can compile, package, unpack, and satisfy its deterministic manifest; it is not
+physical Intel-Mac support evidence. Promotion requires the checksum-selected archive to pass the
+real-device, golden-vector, Metal-selection, CPU-fallback, and performance gates on a physical Intel
+Mac. It cannot inherit Apple arm64 evidence or the M2 Ultra throughput result; record an approved
+Intel reference machine and lane-specific floor before marking the x64 archive supported.
 
 CUDA, HIP/ROCm, and SYCL archives are vendor-specific lanes. They do not substitute for portable-lane
 proof and become supported only after their own exact-checksum real-device, golden-vector, fallback,

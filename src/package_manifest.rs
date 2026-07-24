@@ -294,7 +294,10 @@ fn validate_profile(profile: &PackageProfile) -> Result<(), PackageError> {
     }
     match (profile.advertised_backend, profile.tier) {
         (AdvertisedBackend::Metal, PackageTier::Portable)
-            if profile.rust_target == "aarch64-apple-darwin" => {}
+            if matches!(
+                profile.rust_target.as_str(),
+                "aarch64-apple-darwin" | "x86_64-apple-darwin"
+            ) => {}
         (AdvertisedBackend::Vulkan, PackageTier::Portable)
             if matches!(
                 profile.rust_target.as_str(),
