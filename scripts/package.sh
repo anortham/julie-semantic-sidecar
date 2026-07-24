@@ -80,7 +80,7 @@ JULIE_NATIVE_PATCH_IDENTITY="$(
   python3 scripts/patch-native-source.py --vendor-root "$vendor_root"
 )"
 if [[ "$JULIE_NATIVE_PATCH_IDENTITY" == *$'\n'* ]] ||
-  [[ ! "$JULIE_NATIVE_PATCH_IDENTITY" =~ ^llama-cpp-sys-2-0\.1\.151:vulkan-infinity-v2:[0-9a-f]{64}$ ]]; then
+  [[ ! "$JULIE_NATIVE_PATCH_IDENTITY" =~ ^llama-cpp-sys-2-0\.1\.151:vulkan-infinity-v3:[0-9a-f]{64}$ ]]; then
   echo "package: native source patch returned an invalid identity" >&2
   exit 1
 fi

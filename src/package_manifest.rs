@@ -14,7 +14,7 @@ use crate::{manifest, DEFAULT_MODEL_ID, VERSION};
 pub const MANIFEST_FILE: &str = "package-manifest.json";
 pub const SCHEMA_VERSION: u32 = 1;
 const NATIVE_PATCH_IDENTITY_PREFIX: &str =
-    "native_patch=llama-cpp-sys-2-0.1.151:vulkan-infinity-v2:";
+    "native_patch=llama-cpp-sys-2-0.1.151:vulkan-infinity-v3:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

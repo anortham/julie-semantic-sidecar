@@ -10,6 +10,13 @@ from pathlib import Path
 CRATE = "llama-cpp-sys-2-0.1.151"
 SHADER_ROOT = Path("llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders")
 PATCHES = {
+    Path("build.rs"): (
+        (
+            b"if !dst.exists() {",
+            b"if std::fs::symlink_metadata(&dst).is_err() {",
+            3,
+        ),
+    ),
     SHADER_ROOT / "topk_moe.comp": (
         (
             b"const float INFINITY = 1.0 / 0.0;",
@@ -33,7 +40,7 @@ PATCHES = {
         ),
     ),
 }
-PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-infinity-v2"
+PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-infinity-v3"
 
 
 def patch(vendor_root: Path) -> str:

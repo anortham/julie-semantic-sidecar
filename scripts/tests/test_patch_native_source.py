@@ -13,6 +13,10 @@ SCRIPT = Path(__file__).parents[1] / "patch-native-source.py"
 CRATE = "llama-cpp-sys-2-0.1.151"
 SHADER_ROOT = Path("llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders")
 PATCHES = {
+    Path("build.rs"): (
+        b"if !dst.exists() {\n" * 3,
+        b"if std::fs::symlink_metadata(&dst).is_err() {\n" * 3,
+    ),
     SHADER_ROOT / "topk_moe.comp": (
         b"const float INFINITY = 1.0 / 0.0;\n"
         + b"float max_val = -INFINITY;\n"
@@ -30,7 +34,7 @@ PATCHES = {
         b"float m_max = uintBitsToFloat(0xFF800000);\n",
     ),
 }
-PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-infinity-v2"
+PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-infinity-v3"
 
 
 def expected_patch_identity() -> str:
