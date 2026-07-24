@@ -176,6 +176,7 @@ jobs:
             -EvidenceDir "artifact-validation/${{ matrix.profile }}"
 
       - name: Upload private archive, manifest, checksum, and raw logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: artifact-candidate-${{ matrix.profile }}

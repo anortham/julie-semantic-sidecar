@@ -364,6 +364,17 @@ fn windows_packaging_routes_deterministic_linking_through_a_native_ci_test() {
 }
 
 #[test]
+fn failed_checksum_proofs_retain_the_candidate_for_diagnosis() {
+    let workflow = std::fs::read_to_string(".github/workflows/release.yml").expect("workflow");
+    let upload = workflow
+        .split("- name: Upload private archive, manifest, checksum, and raw logs")
+        .nth(1)
+        .expect("candidate upload step");
+
+    assert!(upload.trim_start().starts_with("if: always()"));
+}
+
+#[test]
 fn public_docs_and_promotion_gate_name_every_portable_profile() {
     for path in ["README.md", "docs/rc-promotion-gate.md"] {
         let document = std::fs::read_to_string(path).expect("package documentation");
