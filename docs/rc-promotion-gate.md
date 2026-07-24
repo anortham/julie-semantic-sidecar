@@ -34,12 +34,15 @@ target hardware against the exact archive checksum under consideration before pr
    and accelerator. The accelerator may resolve by default only when the first-start benchmark wins.
 8. **Throughput floor (this document)** — the packaged binary sustains
    **≥ 40 units/s steady-state on the M2 Ultra reference machine (64-text batches, warm model)**,
-   measured by `scripts/bench-throughput.py`.
+   measured by `scripts/bench-throughput.py`. The JSON record binds the UTC timestamp, unpacked binary
+   path and SHA-256, harness path and SHA-256, cache and forcing environment, expected backend, model,
+   and resolved health/backend truth.
 9. **Concurrent process determinism** — `scripts/probe-concurrency.py` runs at least three independent
    processes with eight pipelined queries each against both forced CPU and the advertised accelerator. The
    records must bind the unpacked binary SHA-256, cache and forcing environment, expected backend, model, and UTC
    timestamp; require the expected backend rather than accepting silent CPU fallback; return bit-exact vectors
-   across processes; and shut down every process cleanly.
+   across processes; prove a positive common execution window across every process; and shut down every process
+   cleanly.
 
 Items defined by scripts retain their script-level pass rules. This document adds the checksum-bound
 package, hardware, fallback, and throughput promotion rules.
@@ -151,7 +154,7 @@ fresh exact-archive measurement and may tighten the floor, but cannot inherit an
 | P0 llama-server reference floor | 52.3 | M2 Ultra |
 | **Gate floor** | **40** | M2 Ultra |
 | Historical Qwen CPU-only regression | ~6.6 | M2 Ultra |
-| RC3 BGE Metal exact archive | 775.7 | M2 Ultra |
+| RC3 BGE Metal exact archive | 736.7 | M2 Ultra |
 
 **40 remains the minimum useful-throughput floor, not the backend-identity test.** It sits well below the
 healthy Qwen Metal range (77–89 units/s), the P0 llama-server reference (52.3), and the RC3 BGE Metal result,

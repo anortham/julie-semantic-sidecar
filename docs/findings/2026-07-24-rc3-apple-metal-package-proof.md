@@ -59,7 +59,9 @@ by the measured package.
 
 The promotion-floor run used the default 64-text batch, four measured rounds,
 the real 40 texts/s floor, and an explicit `--expect-backend metal` assertion.
-It sustained 775.69 texts/s on Metal and passed.
+It sustained 736.73 texts/s on Metal and passed. The JSON record self-binds the
+released executable SHA-256, throughput-harness SHA-256, UTC timestamp, cache
+and forcing environment, expected backend, and resolved health/backend truth.
 The earlier batch-1 and batch-16 records are measurements rather than floor
 gates.
 
@@ -71,28 +73,32 @@ eight pipelined query requests without request/response pauses.
 
 | Backend | Processes | Queries | Total wall ms | Per-process elapsed ms |
 |---|---:|---:|---:|---|
-| CPU | 3 | 24 | 9,480.66 | 573.93–9,436.40 |
-| Metal | 3 | 24 | 642.61 | 576.57–577.02 |
+| CPU | 3 | 24 | 599.85 | 547.19–548.68 |
+| Metal | 3 | 24 | 639.61 | 573.59–573.99 |
 
 Both lanes returned bit-exact vectors across all three processes, identical
 health objects, ordered request IDs, correct dimensions, and clean zero exits.
+The synchronized pipelines had positive common live windows of 547.15 ms for
+CPU and 573.49 ms for Metal; overlap is a PASS requirement rather than an
+inference from process launch.
 The hardened harness also required `resolved_backend=cpu` for the forced CPU
 lane and `resolved_backend=metal` with `accelerated=true` for the Metal lane.
 Each JSON record carries the unpacked binary path and SHA-256, cache path,
 forcing environment, expected backend, model, timeout, and UTC timestamp. This
 proves concurrent independent-process behavior and per-process pipelining for
-the RC3 Apple archive. The CPU run also records a 9.4-second process outlier
-under simultaneous model load; it passed the 60-second response timeout but is
-retained as resource-contention evidence rather than hidden. Miller's in-process
-broker serialization remains covered by Miller's own tests.
+the RC3 Apple archive. Miller's in-process broker serialization remains covered
+by Miller's own tests.
 
 The first probe attempt exposed a harness-only stderr deadlock. Fresh Claude
 review then found that the initial harness did not bind its binary or
 environment, could accept silent CPU fallback, had unbounded reads and unsafe
-cleanup, and allowed an arbitrarily large pipelined request count. The versioned
-probe now records its own SHA-256 plus the binary identity, enforces the expected
-backend, times out reads, kills every child on any failure or partial spawn,
-bounds the pipeline at 32 requests, and has five executable regression tests.
+cleanup, and allowed an arbitrarily large pipelined request count. The
+proof-branch probe now records its own SHA-256 plus the binary identity,
+enforces the expected backend, times out reads, kills every child on any failure or partial spawn,
+bounds the pipeline at 32 requests, requires a positive common execution
+window, and has eight executable concurrency regression tests. Both proof
+harnesses accept every backend name advertised by protocol health:
+`cpu`, `cuda`, `directml`, `mps`, `metal`, and `vulkan`.
 
 ## Reproduction
 
@@ -121,8 +127,10 @@ promotion-floor record, GitHub release asset metadata, review binding, and the
 CPU/Metal concurrency probe records.
 
 The concurrency records are reproduced separately from the hardware-smoke
-command using the versioned proof-branch harness whose SHA-256 is
-`83e1678a7d1f14933d72f367ba193503335912d7d5d56abbaf146f079b92a947`:
+command using the proof-branch harness whose content SHA-256 is
+`2b0188db5c060a822147327400c4c2a758f30422a3b24c351311c114e97f957b`.
+This harness is not part of release commit `24ce625`; the self-recorded content
+hash, not that release commit, binds the concurrency proof:
 
 ```bash
 JULIE_EMBEDDING_CACHE_DIR=/Users/murphy/source/julie-semantic-sidecar-evidence/2026-07-24-rc3-metal/cache \
@@ -148,10 +156,17 @@ python3 -B scripts/bench-throughput.py \
   --batch 64 --floor 40 --expect-backend metal --json
 ```
 
-`raw-logs/review-binding.txt` records release/harness commit
+The floor record identifies throughput-harness content SHA-256
+`f17ce7d62531ca2470b63cb59c872c9645f4117822c2d5edbe607c3c6496e188`.
+That harness is also a proof-branch artifact rather than a file from release
+commit `24ce625`.
+
+`raw-logs/review-binding.txt` records release/hardware-smoke commit
 `24ce6257bee7f41865b10daf1457ed9b4fd71a8a`, confirms the conformance and
-hardware-smoke owners were unchanged, binds the Miller fixture tree to SHA-256
-`7a4b4c2f1f28fefcbe450aa95c2786cc3515f625cf644bddab7feb427a484156`,
-and closes the original `real-device-pending-review` marker for Apple arm64
-only. Both concurrency JSON records independently carry the same harness
+hardware-smoke owners used for the original archive proof, and binds the Miller
+fixtures to commit `d21e359e79e9f5b65b6ae38aab034a18f8d01f57` plus Git tree object
+`e29e0c1fae78758545334c9857efdbb2b0ace714`. The tree identity is reproduced
+with the exact `git rev-parse` command recorded beside it. The binding closes
+the original `real-device-pending-review` marker for Apple arm64 only. Both
+concurrency JSON records independently carry the same concurrency-harness
 SHA-256.

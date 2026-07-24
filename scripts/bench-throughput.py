@@ -19,7 +19,11 @@ Input texts are generated deterministically from their indices — no randomness
 timestamps — so two runs embed byte-identical payloads.
 """
 import argparse
+import datetime
+import hashlib
 import json
+import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -32,6 +36,7 @@ DEFAULT_BATCH = 64
 DEFAULT_ROUNDS = 4
 DEFAULT_FLOOR = 40.0
 HEALTH_TIMEOUT_S = 120.0
+SUPPORTED_BACKENDS = ("cpu", "cuda", "directml", "mps", "metal", "vulkan")
 
 
 class BenchError(Exception):
@@ -127,6 +132,14 @@ def sidecar_rss_bytes(pid):
         return None
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def validate_expected_backend(health, expected_backend):
     if expected_backend is None:
         return
@@ -142,11 +155,13 @@ def validate_expected_backend(health, expected_backend):
 
 
 def run_bench(binary, batch, rounds, floor, model=None, expected_backend=None):
+    resolved_binary = str(pathlib.Path(binary).resolve())
+    resolved_harness = str(pathlib.Path(__file__).resolve())
     with tempfile.NamedTemporaryFile(
         mode="w+", suffix=".sidecar-bench-stderr.log", delete=False
     ) as stderr_file:
         stderr_path = stderr_file.name
-        sidecar = Sidecar(binary, stderr_file, model)
+        sidecar = Sidecar(resolved_binary, stderr_file, model)
         try:
             _, health = sidecar.call("bench-health", "health", {})
             if not health.get("ready", False):
@@ -182,7 +197,15 @@ def run_bench(binary, batch, rounds, floor, model=None, expected_backend=None):
 
     steady = sum(rates) / len(rates)
     return {
-        "binary": binary,
+        "recorded_utc": datetime.datetime.now(datetime.timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "binary": resolved_binary,
+        "binary_sha256": sha256_file(resolved_binary),
+        "harness": resolved_harness,
+        "harness_sha256": sha256_file(resolved_harness),
+        "forced_backend": os.environ.get("JULIE_SIDECAR_FORCE_BACKEND"),
+        "cache_dir": os.environ.get("JULIE_EMBEDDING_CACHE_DIR"),
         "sidecar_rss_bytes": rss_bytes,
         "batch": batch,
         "rounds": rounds,
@@ -235,7 +258,7 @@ def parse_args(argv):
     )
     parser.add_argument(
         "--expect-backend",
-        choices=("cpu", "metal", "vulkan", "cuda"),
+        choices=SUPPORTED_BACKENDS,
         help="fail before measuring unless health reports this backend truthfully",
     )
     parser.add_argument(

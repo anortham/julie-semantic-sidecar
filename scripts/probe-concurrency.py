@@ -18,6 +18,7 @@ import time
 SCHEMA = "julie.embedding.sidecar"
 VERSION = 1
 MAX_PIPELINED_REQUESTS = 32
+SUPPORTED_BACKENDS = ("cpu", "cuda", "directml", "mps", "metal", "vulkan")
 
 
 class ProbeError(Exception):
@@ -67,7 +68,7 @@ class Sidecar:
             raise ProbeError(f"sidecar exited before replying: {stderr.strip()}")
         return json.loads(line)
 
-    def pipeline(self, client_index, texts):
+    def pipeline(self, client_index, texts, start_barrier):
         requests = [
             {
                 "schema": SCHEMA,
@@ -87,6 +88,10 @@ class Sidecar:
             }
             for query_index, text in enumerate(texts)
         )
+        try:
+            start_barrier.wait(timeout=self.response_timeout)
+        except threading.BrokenBarrierError as error:
+            raise ProbeError("concurrent pipeline start barrier failed") from error
         started = time.monotonic()
         for request in requests:
             self.process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
@@ -103,7 +108,8 @@ class Sidecar:
             if "error" in reply:
                 raise ProbeError(f"{request['request_id']}: {reply['error']}")
             replies.append(reply["result"])
-        elapsed_ms = (time.monotonic() - started) * 1000
+        finished = time.monotonic()
+        elapsed_ms = (finished - started) * 1000
 
         health = replies[0]
         if health.get("ready") is not True:
@@ -113,6 +119,8 @@ class Sidecar:
             raise ProbeError(f"client {client_index} returned a wrong vector dimension")
         return {
             "client": client_index,
+            "started_monotonic": started,
+            "finished_monotonic": finished,
             "elapsed_ms": elapsed_ms,
             "health": health,
             "vectors": vectors,
@@ -181,6 +189,12 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def common_overlap_ms(results):
+    latest_start = max(result["started_monotonic"] for result in results)
+    earliest_finish = min(result["finished_monotonic"] for result in results)
+    return round(max(0, earliest_finish - latest_start) * 1000, 6)
+
+
 def run_probe(binary, clients, requests, model, expected_backend, response_timeout):
     texts = [
         f"deterministic concurrent semantic probe {request_index}"
@@ -199,9 +213,10 @@ def run_probe(binary, clients, requests, model, expected_backend, response_timeo
 
     started = time.monotonic()
     try:
+        start_barrier = threading.Barrier(clients)
         with concurrent.futures.ThreadPoolExecutor(max_workers=clients) as executor:
             futures = [
-                executor.submit(sidecar.pipeline, index, texts)
+                executor.submit(sidecar.pipeline, index, texts, start_barrier)
                 for index, sidecar in enumerate(sidecars)
             ]
             try:
@@ -238,6 +253,8 @@ def run_probe(binary, clients, requests, model, expected_backend, response_timeo
         and result["health"].get("accelerated") is expected_accelerated
         for result in results
     )
+    overlap_ms = common_overlap_ms(results)
+    pipelines_overlapped = overlap_ms > 0
     clean_exit = all(code == 0 for code in exit_codes)
     return {
         "recorded_utc": datetime.datetime.now(datetime.timezone.utc)
@@ -257,12 +274,28 @@ def run_probe(binary, clients, requests, model, expected_backend, response_timeo
         "total_requests": clients * requests,
         "total_wall_ms": total_ms,
         "client_elapsed_ms": [result["elapsed_ms"] for result in results],
+        "client_intervals_ms": [
+            {
+                "client": result["client"],
+                "started": (result["started_monotonic"] - started) * 1000,
+                "finished": (result["finished_monotonic"] - started) * 1000,
+            }
+            for result in results
+        ],
+        "pipeline_overlap_ms": overlap_ms,
+        "pipelines_overlapped": pipelines_overlapped,
         "health": results[0]["health"],
         "vectors_bit_exact_across_processes": deterministic,
         "health_equal_across_processes": consistent_health,
         "expected_backend_selected": expected_health,
         "clean_exit": clean_exit,
-        "pass": deterministic and consistent_health and expected_health and clean_exit,
+        "pass": (
+            deterministic
+            and consistent_health
+            and expected_health
+            and pipelines_overlapped
+            and clean_exit
+        ),
     }
 
 
@@ -277,7 +310,7 @@ def parse_args(argv):
     parser.add_argument(
         "--expect-backend",
         required=True,
-        choices=("cpu", "metal", "vulkan", "cuda"),
+        choices=SUPPORTED_BACKENDS,
     )
     parser.add_argument("--response-timeout", type=float, default=60)
     parser.add_argument("--json", action="store_true")

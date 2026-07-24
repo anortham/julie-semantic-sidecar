@@ -57,7 +57,7 @@ cargo fmt --check
 python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
 ```
 
-All three must be green before a task is reported complete. Never weaken a gate to make work look
+All four must be green before a task is reported complete. Never weaken a gate to make work look
 finished; stop and report instead.
 
 ## Layout

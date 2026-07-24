@@ -40,6 +40,8 @@ class ProbeConcurrencyTests(unittest.TestCase):
                     if os.environ.get("FAKE_MODE") == "hang":
                         time.sleep(300)
                     method = request["method"]
+                    if method == "embed_query":
+                        time.sleep(float(os.environ.get("FAKE_QUERY_DELAY", "0")))
                     if method == "health":
                         result = {
                             "ready": True,
@@ -76,6 +78,7 @@ class ProbeConcurrencyTests(unittest.TestCase):
             os.environ,
             {
                 "FAKE_BACKEND": "cpu",
+                "FAKE_QUERY_DELAY": "0.05",
                 "JULIE_SIDECAR_FORCE_BACKEND": "cpu",
                 "JULIE_EMBEDDING_CACHE_DIR": str(cache),
             },
@@ -100,6 +103,8 @@ class ProbeConcurrencyTests(unittest.TestCase):
         self.assertEqual("cpu", report["forced_backend"])
         self.assertEqual(str(cache), report["cache_dir"])
         self.assertTrue(report["expected_backend_selected"])
+        self.assertTrue(report["pipelines_overlapped"])
+        self.assertGreater(report["pipeline_overlap_ms"], 0)
 
     def test_backend_mismatch_fails_the_probe(self):
         with mock.patch.dict(os.environ, {"FAKE_BACKEND": "cpu"}, clear=False):
@@ -173,6 +178,64 @@ class ProbeConcurrencyTests(unittest.TestCase):
                         "cpu",
                     ]
                 )
+
+    def test_parser_accepts_every_advertised_backend_name(self):
+        for backend in ("cpu", "cuda", "directml", "mps", "metal", "vulkan"):
+            with self.subTest(backend=backend):
+                args = PROBE.parse_args(
+                    [
+                        "--binary",
+                        str(self.binary),
+                        "--clients",
+                        "2",
+                        "--requests",
+                        "2",
+                        "--expect-backend",
+                        backend,
+                    ]
+                )
+                self.assertEqual(backend, args.expect_backend)
+
+    def test_common_overlap_requires_every_pipeline_to_be_live(self):
+        self.assertEqual(
+            60,
+            PROBE.common_overlap_ms(
+                [
+                    {"started_monotonic": 1.00, "finished_monotonic": 1.10},
+                    {"started_monotonic": 1.04, "finished_monotonic": 1.12},
+                ]
+            ),
+        )
+        self.assertEqual(
+            0,
+            PROBE.common_overlap_ms(
+                [
+                    {"started_monotonic": 1.00, "finished_monotonic": 1.04},
+                    {"started_monotonic": 1.04, "finished_monotonic": 1.12},
+                ]
+            ),
+        )
+
+    def test_pass_fails_when_pipeline_windows_do_not_overlap(self):
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"FAKE_BACKEND": "cpu", "FAKE_QUERY_DELAY": "0.05"},
+                clear=False,
+            ),
+            mock.patch.object(PROBE, "common_overlap_ms", return_value=0),
+        ):
+            report = PROBE.run_probe(
+                str(self.binary),
+                clients=2,
+                requests=2,
+                model=None,
+                expected_backend="cpu",
+                response_timeout=5,
+            )
+
+        self.assertFalse(report["pipelines_overlapped"])
+        self.assertFalse(report["pass"])
 
 
 if __name__ == "__main__":
