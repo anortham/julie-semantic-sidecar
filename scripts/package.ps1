@@ -42,7 +42,7 @@ $helper = if ($targetIsWindows) { "julie-package-manifest.exe" } else { "julie-p
 $archiveKind = if ($targetIsWindows) { "zip" } else { "tar.gz" }
 
 if ($targetIsWindows) {
-    Enable-ReproducibleWindowsLinking
+    Enable-ReproducibleWindowsBuild
 }
 
 $cargoArguments = @(

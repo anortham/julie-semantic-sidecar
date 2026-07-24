@@ -16,8 +16,14 @@ function Add-CommandLineFlag {
     return "$Value $Flag"
 }
 
-function Enable-ReproducibleWindowsLinking {
+function Enable-ReproducibleWindowsBuild {
     $brepro = "/Brepro"
+    $compilerOptions = [Environment]::GetEnvironmentVariable("CL")
+    [Environment]::SetEnvironmentVariable(
+        "CL",
+        (Add-CommandLineFlag -Value $compilerOptions -Flag $brepro)
+    )
+
     $linkOptions = [Environment]::GetEnvironmentVariable("LINK")
     [Environment]::SetEnvironmentVariable(
         "LINK",
@@ -37,6 +43,8 @@ function Enable-ReproducibleWindowsLinking {
     }
 
     foreach ($name in @(
+        "CMAKE_C_FLAGS",
+        "CMAKE_CXX_FLAGS",
         "CMAKE_EXE_LINKER_FLAGS",
         "CMAKE_SHARED_LINKER_FLAGS",
         "CMAKE_MODULE_LINKER_FLAGS"

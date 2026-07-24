@@ -356,10 +356,12 @@ fn windows_packaging_routes_deterministic_linking_through_a_native_ci_test() {
         std::fs::read_to_string("scripts/tests/package-env.tests.ps1").expect("native test");
     let workflow = std::fs::read_to_string(".github/workflows/release.yml").expect("workflow");
 
-    assert!(powershell.contains("Enable-ReproducibleWindowsLinking"));
+    assert!(powershell.contains("Enable-ReproducibleWindowsBuild"));
     assert!(helper.contains("[StringComparison]::OrdinalIgnoreCase"));
+    assert!(helper.contains("\"CL\""));
     assert!(helper.contains("link-arg=/Brepro"));
-    assert!(native_test.contains("Enable-ReproducibleWindowsLinking"));
+    assert!(helper.contains("\"CMAKE_CXX_FLAGS\""));
+    assert!(native_test.contains("Enable-ReproducibleWindowsBuild"));
     assert!(workflow.contains("scripts/tests/package-env.tests.ps1"));
 }
 
