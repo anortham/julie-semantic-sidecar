@@ -349,6 +349,21 @@ fn packaging_scripts_define_only_the_explicit_portable_and_cuda_candidate_profil
 }
 
 #[test]
+fn windows_packaging_routes_deterministic_linking_through_a_native_ci_test() {
+    let [_, powershell] = packaging_scripts();
+    let helper = std::fs::read_to_string("scripts/package-env.ps1").expect("package environment");
+    let native_test =
+        std::fs::read_to_string("scripts/tests/package-env.tests.ps1").expect("native test");
+    let workflow = std::fs::read_to_string(".github/workflows/release.yml").expect("workflow");
+
+    assert!(powershell.contains("Enable-ReproducibleWindowsLinking"));
+    assert!(helper.contains("[StringComparison]::OrdinalIgnoreCase"));
+    assert!(helper.contains("link-arg=/Brepro"));
+    assert!(native_test.contains("Enable-ReproducibleWindowsLinking"));
+    assert!(workflow.contains("scripts/tests/package-env.tests.ps1"));
+}
+
+#[test]
 fn public_docs_and_promotion_gate_name_every_portable_profile() {
     for path in ["README.md", "docs/rc-promotion-gate.md"] {
         let document = std::fs::read_to_string(path).expect("package documentation");

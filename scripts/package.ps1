@@ -14,6 +14,7 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
+. (Join-Path $PSScriptRoot "package-env.ps1")
 
 $settings = switch ($Profile) {
     "apple-arm64-metal-portable" { @{ Target = "aarch64-apple-darwin"; Backend = "metal"; Tier = "portable"; Features = "metal" } }
@@ -39,6 +40,10 @@ $targetIsWindows = $settings.Target.Contains("windows")
 $exe = if ($targetIsWindows) { "julie-semantic-sidecar.exe" } else { "julie-semantic-sidecar" }
 $helper = if ($targetIsWindows) { "julie-package-manifest.exe" } else { "julie-package-manifest" }
 $archiveKind = if ($targetIsWindows) { "zip" } else { "tar.gz" }
+
+if ($targetIsWindows) {
+    Enable-ReproducibleWindowsLinking
+}
 
 $cargoArguments = @(
     "build", "--release", "--target", $settings.Target,

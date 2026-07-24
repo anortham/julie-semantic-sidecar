@@ -98,6 +98,11 @@ jobs:
         with:
           arch: x64
 
+      - name: Test Windows packaging environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '& ./scripts/tests/package-env.tests.ps1'
+
       - name: Select Ninja for Windows CMake builds
         if: runner.os == 'Windows'
         shell: pwsh
