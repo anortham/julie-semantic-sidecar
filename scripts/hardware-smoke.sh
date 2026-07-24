@@ -323,10 +323,12 @@ JULIE_EMBEDDING_CACHE_DIR="$cache_dir" JULIE_CONFORMANCE_UNAVAILABLE_BACKEND="$f
 
 for measured_backend in cpu "$backend"; do
   JULIE_EMBEDDING_CACHE_DIR="$cache_dir" JULIE_SIDECAR_FORCE_BACKEND="$measured_backend" \
-    python3 scripts/bench-throughput.py --binary "$binary" --batch 1 --rounds 4 --floor 0 --json \
+    python3 scripts/bench-throughput.py --binary "$binary" --batch 1 --rounds 4 --floor 0 \
+    --expect-backend "$measured_backend" --json \
     >"$evidence_dir/raw-logs/bench-$measured_backend-batch-1.json"
   JULIE_EMBEDDING_CACHE_DIR="$cache_dir" JULIE_SIDECAR_FORCE_BACKEND="$measured_backend" \
-    python3 scripts/bench-throughput.py --binary "$binary" --batch 16 --rounds 4 --floor 0 --json \
+    python3 scripts/bench-throughput.py --binary "$binary" --batch 16 --rounds 4 --floor 0 \
+    --expect-backend "$measured_backend" --json \
     >"$evidence_dir/raw-logs/bench-$measured_backend-batch-16.json"
 done
 

@@ -54,6 +54,7 @@ change.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
 ```
 
 All three must be green before a task is reported complete. Never weaken a gate to make work look

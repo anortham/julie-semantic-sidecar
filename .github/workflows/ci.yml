@@ -46,6 +46,9 @@ jobs:
       - name: cargo test
         run: cargo test
 
+      - name: Python harness tests
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
+
   conformance:
     name: conformance (${{ matrix.name }})
     needs: fast

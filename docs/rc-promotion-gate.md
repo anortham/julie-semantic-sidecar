@@ -35,6 +35,11 @@ target hardware against the exact archive checksum under consideration before pr
 8. **Throughput floor (this document)** — the packaged binary sustains
    **≥ 40 units/s steady-state on the M2 Ultra reference machine (64-text batches, warm model)**,
    measured by `scripts/bench-throughput.py`.
+9. **Concurrent process determinism** — `scripts/probe-concurrency.py` runs at least three independent
+   processes with eight pipelined queries each against both forced CPU and the advertised accelerator. The
+   records must bind the unpacked binary SHA-256, cache and forcing environment, expected backend, model, and UTC
+   timestamp; require the expected backend rather than accepting silent CPU fallback; return bit-exact vectors
+   across processes; and shut down every process cleanly.
 
 Items defined by scripts retain their script-level pass rules. This document adds the checksum-bound
 package, hardware, fallback, and throughput promotion rules.
@@ -70,6 +75,22 @@ The evidence directory contains the package manifest, checksum, device/runtime i
 cache, protocol smoke output, CPU and accelerator conformance logs, and batch-1/indexing-batch results.
 Review this evidence before changing support status; script success does not promote a backend.
 
+Run the concurrency probe separately for the forced CPU and accelerator lanes:
+
+```bash
+JULIE_SIDECAR_FORCE_BACKEND=cpu \
+JULIE_EMBEDDING_CACHE_DIR=/path/to/proof-cache \
+python3 scripts/probe-concurrency.py \
+  --binary /path/to/unpacked/julie-semantic-sidecar \
+  --clients 3 --requests 8 --expect-backend cpu --json
+
+env -u JULIE_SIDECAR_FORCE_BACKEND \
+JULIE_EMBEDDING_CACHE_DIR=/path/to/proof-cache \
+python3 scripts/probe-concurrency.py \
+  --binary /path/to/unpacked/julie-semantic-sidecar \
+  --clients 3 --requests 8 --expect-backend metal --json
+```
+
 ## Artifact workflow boundary
 
 The manual artifact workflow requires the protected `artifact-release-approval` environment plus an
@@ -104,11 +125,13 @@ amendment before those lanes can report support truthfully.
 One command, run on the target machine against the binary unpacked from the checksum being promoted:
 
 ```
-scripts/bench-throughput.py --binary /path/to/unpacked/julie-semantic-sidecar
+scripts/bench-throughput.py \
+  --binary /path/to/unpacked/julie-semantic-sidecar \
+  --expect-backend metal
 ```
 
-It probes `health` and **fails the bench** unless the sidecar reports `ready: true` — a
-`model_not_prepared` binary can never pass, so the gate cannot be satisfied by measuring zeros.
+It probes `health` and **fails the bench** unless the sidecar reports `ready: true` and the named backend with
+truthful acceleration — a `model_not_prepared` binary or silent CPU fallback can never pass.
 It then times `embed_batch` rounds after a discarded warm-up round and prints steady-state
 units/s with a PASS/FAIL verdict against the floor (default `40`, overridable with `--floor`).
 Exit code: `0` PASS, `1` below floor, `2` not-ready / bad arguments / protocol error. Use
@@ -127,13 +150,13 @@ fresh exact-archive measurement and may tighten the floor, but cannot inherit an
 | rc.2 steady-state, 250-text batches | 77.4 | M2 Ultra |
 | P0 llama-server reference floor | 52.3 | M2 Ultra |
 | **Gate floor** | **40** | M2 Ultra |
-| CPU-only backend regression | ~6.6 | M2 Ultra |
+| Historical Qwen CPU-only regression | ~6.6 | M2 Ultra |
+| RC3 BGE Metal exact archive | 775.7 | M2 Ultra |
 
-**40 is roughly half of rc.2's observed rate.** It sits well below the healthy Metal-backed
-range (77–89 units/s in repeat runs) and the P0 llama-server reference (52.3), so machine noise
-and normal run-to-run variance never trip it. It sits far **above** a CPU-only regression (~6.6,
-about 12× under the floor), so a backend that silently falls back to CPU — the exact failure this
-gate exists to catch — fails loudly.
+**40 remains the minimum useful-throughput floor, not the backend-identity test.** It sits well below the
+healthy Qwen Metal range (77–89 units/s), the P0 llama-server reference (52.3), and the RC3 BGE Metal result,
+so machine noise does not trip it. `--expect-backend` is the load-bearing guard against silent CPU fallback;
+BGE CPU throughput can exceed the historical Qwen-derived floor.
 
 ## Why this gate exists (the rc.1 lesson)
 
@@ -145,5 +168,5 @@ harness's, not the shipping engine's on the real artifact. The full record is in
 The correction is this gate: the floor is measured on the **target machine**, against the
 **checksum-identified packaged binary**, over the **real embedding path** (`health` + `embed_batch`
 over stdio) — not a harness, not a synthetic microbenchmark, not a different backend. A binary that
-cannot clear 40 units/s on the reference machine does not get promoted, regardless of what any other
-benchmark reported.
+does not select the expected accelerated backend or cannot clear 40 units/s on the reference machine does not
+get promoted, regardless of what any other benchmark reported.

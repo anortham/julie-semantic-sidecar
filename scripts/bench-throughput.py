@@ -127,7 +127,21 @@ def sidecar_rss_bytes(pid):
         return None
 
 
-def run_bench(binary, batch, rounds, floor, model=None):
+def validate_expected_backend(health, expected_backend):
+    if expected_backend is None:
+        return
+    expected_accelerated = expected_backend != "cpu"
+    resolved_backend = health.get("resolved_backend")
+    accelerated = health.get("accelerated")
+    if resolved_backend != expected_backend or accelerated is not expected_accelerated:
+        raise BenchError(
+            f"expected backend {expected_backend} with accelerated="
+            f"{str(expected_accelerated).lower()}, got backend={resolved_backend} "
+            f"accelerated={accelerated}"
+        )
+
+
+def run_bench(binary, batch, rounds, floor, model=None, expected_backend=None):
     with tempfile.NamedTemporaryFile(
         mode="w+", suffix=".sidecar-bench-stderr.log", delete=False
     ) as stderr_file:
@@ -142,6 +156,7 @@ def run_bench(binary, batch, rounds, floor, model=None):
                     f"(degraded_reason={reason}); a not-prepared sidecar cannot be "
                     "benched — run `prepare` first. stderr: " + stderr_path
                 )
+            validate_expected_backend(health, expected_backend)
 
             warmup_texts = [deterministic_text(0, i) for i in range(batch)]
             sidecar.call("bench-warmup", "embed_batch", {"texts": warmup_texts})
@@ -173,6 +188,8 @@ def run_bench(binary, batch, rounds, floor, model=None):
         "rounds": rounds,
         "warmup_rounds": 1,
         "floor_units_per_s": floor,
+        "expected_backend": expected_backend,
+        "expected_backend_selected": None if expected_backend is None else True,
         "steady_state_units_per_s": steady,
         "per_round_units_per_s": rates,
         "pass": steady >= floor,
@@ -217,6 +234,11 @@ def parse_args(argv):
         help="model id passed through to `serve --model` (default: the sidecar's default model)",
     )
     parser.add_argument(
+        "--expect-backend",
+        choices=("cpu", "metal", "vulkan", "cuda"),
+        help="fail before measuring unless health reports this backend truthfully",
+    )
+    parser.add_argument(
         "--json", action="store_true", help="emit the result as a single JSON object"
     )
     args = parser.parse_args(argv)
@@ -236,7 +258,14 @@ def parse_args(argv):
 def main(argv):
     args = parse_args(argv)
     try:
-        report = run_bench(args.binary, args.batch, args.rounds, args.floor, args.model)
+        report = run_bench(
+            args.binary,
+            args.batch,
+            args.rounds,
+            args.floor,
+            args.model,
+            args.expect_backend,
+        )
     except BenchError as exc:
         if args.json:
             print(json.dumps({"error": str(exc), "pass": False}))
