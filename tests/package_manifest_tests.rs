@@ -461,7 +461,7 @@ fn public_docs_and_promotion_gate_name_every_portable_profile() {
 }
 
 #[test]
-fn current_release_candidate_has_matching_public_notes_and_status() {
+fn current_prerelease_has_matching_public_notes_and_status() {
     let version = env!("CARGO_PKG_VERSION");
     assert_eq!(version, "0.1.0-rc.4");
 
@@ -473,9 +473,13 @@ fn current_release_candidate_has_matching_public_notes_and_status() {
 
     assert!(
         readme.contains(&format!(
-            "**Current candidate: [`{tag}`]({release_notes_path}).**"
+            "**Current prerelease: [`{tag}`](https://github.com/anortham/julie-semantic-sidecar/releases/tag/{tag}).**"
         )),
-        "README current-candidate pointer does not match {tag}"
+        "README current-prerelease pointer does not match {tag}"
+    );
+    assert!(
+        readme.contains(&format!("[release notes]({release_notes_path})")),
+        "README release-notes pointer does not match {tag}"
     );
     assert!(
         release_notes.starts_with(&format!("# {tag}\n")),

@@ -6,12 +6,13 @@ A thin Rust stdio binary that turns text into embedding vectors. It speaks the f
 Metal / Vulkan / CPU backends. Consumers (Miller, Julie) spawn it and talk NDJSON; they never
 download models or compute model paths.
 
-**Status: release candidate under active validation.**
-**Current candidate: [`v0.1.0-rc.4`](docs/release-notes/v0.1.0-rc.4.md).** It remains a source
-and package candidate until checksum-bound archives are built and published with approval. The exact
-RC3 Apple arm64 archive has physical Apple Silicon CPU and Metal proof. RC4 does not inherit that
-archive-specific result. Apple x64, Linux Vulkan, Windows Vulkan, and CUDA remain package candidates
-until their exact archives pass the applicable physical-hardware gates.
+**Status: prerelease under active validation.**
+**Current prerelease: [`v0.1.0-rc.4`](https://github.com/anortham/julie-semantic-sidecar/releases/tag/v0.1.0-rc.4).**
+See the local [release notes](docs/release-notes/v0.1.0-rc.4.md) for the exact artifact and evidence record.
+Its four portable archives reproduced byte-for-byte across two clean hosted runs. The exact public
+Apple arm64 archive also passes physical Apple Silicon CPU and Metal proof. Apple x64, Linux Vulkan,
+Windows Vulkan, and CUDA remain package candidates until their exact archives pass the applicable
+physical-hardware gates.
 
 ## Launch interface
 
@@ -61,8 +62,9 @@ windows-x64-cuda-vendor
 Metal is built into both Apple executables; each uses Metal when the runtime selects it and retains
 the CPU backend as the truthful fallback when Metal is unavailable or loses selection. Windows and
 Linux profiles place llama.cpp core libraries, CPU modules, and the advertised Vulkan or CUDA module
-flat beside the executable. The Apple x64 and CUDA archives are candidates, not supported releases,
-until exact-archive real-hardware validation passes on an Intel Mac or NVIDIA device respectively.
+flat beside the executable. The Apple x64, Linux Vulkan, Windows Vulkan, and CUDA archives remain
+package candidates, not physical-hardware support claims, until exact-archive real-device validation
+passes on the corresponding hardware.
 
 Build with `scripts/package.sh --profile <name>` or
 `scripts/package.ps1 -Profile <name>`. Archive names include sidecar version, Rust target, backend,
