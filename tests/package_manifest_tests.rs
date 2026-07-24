@@ -366,6 +366,80 @@ fn windows_packaging_routes_deterministic_linking_through_a_native_ci_test() {
 }
 
 #[test]
+fn packaging_patches_the_pinned_native_shader_before_building() {
+    let [bash, powershell] = packaging_scripts();
+    let build_script = std::fs::read_to_string("build.rs").expect("build script");
+
+    for script in [&bash, &powershell] {
+        assert!(script.contains("cargo vendor"));
+        assert!(script.contains("patch-native-source.py"));
+        assert!(script.contains("JULIE_NATIVE_PATCH_IDENTITY"));
+        assert!(script.contains("--config"));
+        assert!(script.contains("package-vendor"));
+    }
+    assert!(bash.find("patch-native-source.py") < bash.find("cargo --config"));
+    assert!(powershell.find("patch-native-source.py") < powershell.find("$messages = & cargo"));
+    assert!(bash.contains("vulkan-infinity-v1:[0-9a-f]{64}"));
+    assert!(powershell.contains("vulkan-infinity-v1:[0-9a-f]{64}"));
+    assert!(powershell.contains("-cnotmatch"));
+    assert!(bash.contains("verify-patched"));
+    assert!(powershell.contains("verify-patched"));
+    assert!(build_script.contains("JULIE_NATIVE_PATCH_IDENTITY"));
+}
+
+#[test]
+fn patched_package_verification_rejects_every_invalid_native_patch_identity_shape() {
+    for identity in [
+        "cargo=release".to_string(),
+        "cargo=release;native_patch=none".to_string(),
+        format!(
+            "cargo=release;native_patch=llama-cpp-sys-2-0.1.151:vulkan-infinity-v1:{}",
+            "0".repeat(63)
+        ),
+        format!(
+            "cargo=release;native_patch=llama-cpp-sys-2-0.1.151:vulkan-infinity-v1:{}",
+            "A".repeat(64)
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "julie-semantic-sidecar", b"executable");
+        write(dir.path(), "LICENSE", b"license");
+        write(dir.path(), "README.md", b"readme");
+
+        let create = Command::new(HELPER)
+            .args([
+                "create",
+                "--root",
+                dir.path().to_str().expect("root"),
+                "--target",
+                "aarch64-apple-darwin",
+                "--tier",
+                "portable",
+                "--backend",
+                "metal",
+            ])
+            .output()
+            .expect("create helper");
+        assert!(create.status.success());
+
+        rewrite(dir.path(), |manifest| {
+            manifest.native_build_identity = identity;
+        });
+        let verify = Command::new(HELPER)
+            .args([
+                "verify-patched",
+                "--root",
+                dir.path().to_str().expect("root"),
+            ])
+            .output()
+            .expect("verify helper");
+
+        assert!(!verify.status.success());
+        assert!(String::from_utf8_lossy(&verify.stderr).contains("native patch identity"));
+    }
+}
+
+#[test]
 fn failed_checksum_proofs_retain_the_candidate_for_diagnosis() {
     let workflow = std::fs::read_to_string(".github/workflows/release.yml").expect("workflow");
     let upload = workflow

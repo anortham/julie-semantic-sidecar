@@ -4,7 +4,7 @@ use julie_semantic_sidecar::package_manifest::{
 };
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: julie-package-manifest create --root <dir> --target <triple> --tier <portable|vendor> --backend <metal|vulkan|cuda>\n       julie-package-manifest verify --root <dir>";
+const USAGE: &str = "usage: julie-package-manifest create --root <dir> --target <triple> --tier <portable|vendor> --backend <metal|vulkan|cuda>\n       julie-package-manifest verify --root <dir>\n       julie-package-manifest verify-patched --root <dir>";
 
 fn main() {
     match run(std::env::args().skip(1).collect()) {
@@ -52,6 +52,9 @@ fn run(arguments: Vec<String>) -> Result<(), (i32, String)> {
         }
         "verify" => {
             package_manifest::verify(&root).map_err(|error| (1, error.to_string()))?;
+        }
+        "verify-patched" => {
+            package_manifest::verify_patched(&root).map_err(|error| (1, error.to_string()))?;
         }
         value => return Err((2, format!("unknown command {value}"))),
     }

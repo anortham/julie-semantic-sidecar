@@ -45,12 +45,48 @@ if ($targetIsWindows) {
     Enable-ReproducibleWindowsBuild
 }
 
+$cargoTargetDir = if ($env:CARGO_TARGET_DIR) {
+    [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR, $repoRoot)
+}
+else {
+    Join-Path $repoRoot "target"
+}
+$vendorParent = Join-Path $cargoTargetDir "package-vendor/$Profile"
+$vendorRoot = Join-Path $vendorParent "vendor"
+$vendorConfig = Join-Path $vendorParent "config.toml"
+if (Test-Path $vendorParent) { Remove-Item -Recurse -Force $vendorParent }
+New-Item -ItemType Directory -Force -Path $vendorRoot | Out-Null
+$previousNativePatchIdentity = $env:JULIE_NATIVE_PATCH_IDENTITY
+
 $cargoArguments = @(
-    "build", "--release", "--target", $settings.Target,
+    "--config", $vendorConfig, "build", "--release", "--target", $settings.Target,
     "--features", $settings.Features, "--bins", "--message-format=json"
 )
-$messages = & cargo @cargoArguments
-if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+try {
+    $vendorConfigLines = & cargo vendor --locked --versioned-dirs $vendorRoot
+    if ($LASTEXITCODE -ne 0) { throw "cargo vendor failed" }
+    [System.IO.File]::WriteAllLines($vendorConfig, $vendorConfigLines)
+
+    $nativePatchOutput = @(
+        & python (Join-Path $PSScriptRoot "patch-native-source.py") --vendor-root $vendorRoot
+    )
+    $nativePatchExitCode = $LASTEXITCODE
+    if ($nativePatchExitCode -ne 0) { throw "native source patch failed" }
+    if (
+        $nativePatchOutput.Count -ne 1 -or
+        $nativePatchOutput[0].Trim() -cnotmatch '^llama-cpp-sys-2-0\.1\.151:vulkan-infinity-v1:[0-9a-f]{64}$'
+    ) {
+        throw "native source patch returned an invalid identity"
+    }
+    $env:JULIE_NATIVE_PATCH_IDENTITY = $nativePatchOutput[0].Trim()
+
+    $messages = & cargo @cargoArguments
+    if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+}
+finally {
+    $env:JULIE_NATIVE_PATCH_IDENTITY = $previousNativePatchIdentity
+    Remove-Item -Recurse -Force -ErrorAction Continue $vendorParent
+}
 $nativeOut = @(
     $messages |
         ForEach-Object { $_ | ConvertFrom-Json } |
@@ -59,12 +95,6 @@ $nativeOut = @(
 )
 if ($nativeOut.Count -ne 1) { throw "expected one llama-cpp-sys out_dir, found $($nativeOut.Count)" }
 
-$cargoTargetDir = if ($env:CARGO_TARGET_DIR) {
-    [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR, $repoRoot)
-}
-else {
-    Join-Path $repoRoot "target"
-}
 $buildDir = Join-Path $cargoTargetDir "$($settings.Target)/release"
 $stageRoot = Join-Path $repoRoot "dist"
 $stage = Join-Path $stageRoot $Profile
@@ -105,7 +135,7 @@ if ($settings.Features.Contains("dynamic-backends")) {
 }
 & $helperPath create --root $stage --target $settings.Target --tier $settings.Tier --backend $settings.Backend
 if ($LASTEXITCODE -ne 0) { throw "package manifest creation failed" }
-& $helperPath verify --root $stage
+& $helperPath verify-patched --root $stage
 if ($LASTEXITCODE -ne 0) { throw "package manifest verification failed" }
 
 if ($settings.Target.Contains("linux") -and $settings.Features.Contains("dynamic-backends")) {

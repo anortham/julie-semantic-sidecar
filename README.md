@@ -72,6 +72,9 @@ and portable/vendor tier. Both scripts reject `-Ctarget-cpu=native`, create and 
 The manifest records every payload file with its SHA-256, size, and role. The manifest itself is
 the sole metadata exception because a file cannot truthfully contain its own SHA-256. Verification
 rejects every other undeclared file, nested path, model weight, or backend/profile mismatch.
+Package builds use a deterministic Cargo-vendored dependency tree. The content-derived native patch
+identity recorded in the manifest binds the strict llama.cpp Vulkan infinity fixes applied before
+shader compilation.
 
 ## License
 

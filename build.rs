@@ -11,12 +11,15 @@ fn main() {
         "CARGO_FEATURE_CUDA",
         "CARGO_FEATURE_ROCM",
         "CARGO_FEATURE_DYNAMIC_BACKENDS",
+        "JULIE_NATIVE_PATCH_IDENTITY",
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
 
     let target = env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
     let target_features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    let native_patch_identity =
+        env::var("JULIE_NATIVE_PATCH_IDENTITY").unwrap_or_else(|_| "none".to_string());
     let rustflags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
     let rustflags = rustflags
         .as_bytes()
@@ -32,7 +35,7 @@ fn main() {
         .collect::<Vec<_>>()
         .join(",");
     println!(
-        "cargo:rustc-env=JULIE_NATIVE_BUILD_IDENTITY=target={target};target_features={target_features};package_features={package_features};rustflags={rustflags}"
+        "cargo:rustc-env=JULIE_NATIVE_BUILD_IDENTITY=target={target};target_features={target_features};package_features={package_features};native_patch={native_patch_identity};rustflags={rustflags}"
     );
 
     if env::var_os("CARGO_FEATURE_DYNAMIC_BACKENDS").is_some()

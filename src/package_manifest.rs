@@ -13,6 +13,8 @@ use crate::{manifest, DEFAULT_MODEL_ID, VERSION};
 
 pub const MANIFEST_FILE: &str = "package-manifest.json";
 pub const SCHEMA_VERSION: u32 = 1;
+const NATIVE_PATCH_IDENTITY_PREFIX: &str =
+    "native_patch=llama-cpp-sys-2-0.1.151:vulkan-infinity-v1:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -201,6 +203,34 @@ pub fn verify(root: &Path) -> Result<PackageManifest, PackageError> {
                 declared.path
             )));
         }
+    }
+    Ok(package)
+}
+
+pub fn verify_patched(root: &Path) -> Result<PackageManifest, PackageError> {
+    let package = verify(root)?;
+    let Some(patch_identity) = package
+        .native_build_identity
+        .split(';')
+        .find(|value| value.starts_with("native_patch="))
+    else {
+        return Err(PackageError::new(
+            "package native patch identity is missing",
+        ));
+    };
+    let Some(digest) = patch_identity.strip_prefix(NATIVE_PATCH_IDENTITY_PREFIX) else {
+        return Err(PackageError::new(
+            "package native patch identity is invalid",
+        ));
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(PackageError::new(
+            "package native patch identity is invalid",
+        ));
     }
     Ok(package)
 }

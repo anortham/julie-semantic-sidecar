@@ -57,14 +57,34 @@ fi
 
 build_messages="$(mktemp)"
 helper_run_dir=""
+cargo_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+if [[ "$cargo_target_dir" != /* ]]; then
+  cargo_target_dir="$repo_root/$cargo_target_dir"
+fi
+vendor_parent="$cargo_target_dir/package-vendor/$profile"
+vendor_root="$vendor_parent/vendor"
+vendor_config="$vendor_parent/config.toml"
+rm -rf "$vendor_parent"
+mkdir -p "$vendor_root"
 cleanup() {
   rm -f "$build_messages"
+  rm -rf "$vendor_parent"
   if [[ -n "$helper_run_dir" ]]; then
     rm -rf "$helper_run_dir"
   fi
 }
 trap cleanup EXIT
-cargo build --release --target "$target" --features "$features" --bins --message-format=json-render-diagnostics >"$build_messages"
+cargo vendor --locked --versioned-dirs "$vendor_root" >"$vendor_config"
+export JULIE_NATIVE_PATCH_IDENTITY
+JULIE_NATIVE_PATCH_IDENTITY="$(
+  python3 scripts/patch-native-source.py --vendor-root "$vendor_root"
+)"
+if [[ "$JULIE_NATIVE_PATCH_IDENTITY" == *$'\n'* ]] ||
+  [[ ! "$JULIE_NATIVE_PATCH_IDENTITY" =~ ^llama-cpp-sys-2-0\.1\.151:vulkan-infinity-v1:[0-9a-f]{64}$ ]]; then
+  echo "package: native source patch returned an invalid identity" >&2
+  exit 1
+fi
+cargo --config "$vendor_config" build --release --target "$target" --features "$features" --bins --message-format=json-render-diagnostics >"$build_messages"
 native_out="$(python3 - "$build_messages" <<'PY'
 import json, sys
 found = []
@@ -79,7 +99,7 @@ print(found[0])
 PY
 )"
 
-build_dir="$repo_root/target/$target/release"
+build_dir="$cargo_target_dir/$target/release"
 stage_root="$repo_root/dist"
 stage="$stage_root/$profile"
 rm -rf "$stage"
@@ -127,7 +147,7 @@ if [[ "$features" == *dynamic-backends* ]]; then
   helper_path="$helper_run_dir/$helper"
 fi
 "$helper_path" create --root "$stage" --target "$target" --tier "$tier" --backend "$backend"
-"$helper_path" verify --root "$stage"
+"$helper_path" verify-patched --root "$stage"
 
 if [[ "$target" == *linux* && "$features" == *dynamic-backends* ]]; then
   if ! readelf -d "$stage/$exe" | grep -E '(RPATH|RUNPATH).*[\$]ORIGIN' >/dev/null; then
