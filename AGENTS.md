@@ -23,6 +23,7 @@ model acquisition, model paths, or download URLs — this binary does.
 ```
 julie-semantic-sidecar [serve [--model <id>]]   # default verb; default model bge-small-en-v1.5-f32
 julie-semantic-sidecar prepare [--model <id>]
+julie-semantic-sidecar broker --model <id> --endpoint <path> --lock <path> --accelerator-lock <path>
 julie-semantic-sidecar --version
 ```
 
@@ -31,6 +32,22 @@ Unknown verb → exit 2 with usage on stderr. Env knobs are exactly two:
 (diagnostic/CI only). No others.
 Consumers pass an explicit model id so their selected encoder never follows a standalone-default
 change.
+
+## Shared broker
+
+- `broker` speaks the unchanged protocol on a current-user local endpoint and accepts multiple
+  connections. `shutdown` flushes its reply and closes only that connection.
+- Acquire the model service lock before starting the owner-stdin watcher or loading the model.
+  Only the service-lock holder may unlink a stale Unix socket, immediately before bind.
+- The owner-stdin watcher is armed before model load. EOF is process-fatal even during a blocked
+  cold load, so the OS releases service and accelerator locks without a PID reaper.
+- The admitted queue is bounded at 64. While batch work waits, at most eight interactive requests
+  dequeue before one batch request. Queue-full and expired requests use protocol v1
+  `internal_error` and do not poison the connection.
+- A request active for 60 seconds aborts the process. The engine is entered only by its scheduler
+  thread.
+- Unix broker directories use mode `0700`; sockets use `0600`. Do not add PID/state files, tokens,
+  HTTP, environment knobs, or self-reaper machinery.
 
 ## Load-bearing rules
 
@@ -69,6 +86,7 @@ dispatcher whose handlers call into library modules, so later tasks fill bodies 
 | Module | Owns |
 |---|---|
 | `protocol` | NDJSON envelope parsing, method dispatch, the four error codes, serve loop |
+| `broker` | Model-service lease, owner lifetime, bounded scheduling, watchdog, local transports |
 | `engine_trait` | The engine abstraction that keeps `protocol` pure and model-free in tests |
 | `manifest` | Embedded model manifest (id → sha256, size, source URL, serving knobs) + cache paths |
 | `health` | `health` result assembly: readiness, dims, capabilities, load policy |
@@ -81,4 +99,5 @@ dispatcher whose handlers call into library modules, so later tasks fill bodies 
 - HTTP: `ureq` (blocking, rustls-backed, no async runtime — the sidecar has none by design).
 - File locking: `fs4`. Its `FileExt::lock`/`unlock` are shadowed by `std::fs::File`'s inherent
   methods (stabilized in Rust 1.89), so call them fully qualified: `fs4::FileExt::lock(&file)`.
-- `llama-cpp-2` is NOT a dependency yet; Task 5 adds it with exact `=` pins.
+- `llama-cpp-2` and `llama-cpp-sys-2` are exact-pinned because the engine ABI and packaged native
+  modules must move together.

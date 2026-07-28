@@ -5,6 +5,7 @@
 //! binary runs; `src/main.rs` is only a verb dispatcher.
 
 pub mod backend_select;
+pub mod broker;
 pub mod engine;
 pub mod engine_trait;
 pub mod health;

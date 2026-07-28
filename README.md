@@ -19,10 +19,15 @@ physical-hardware gates.
 ```
 julie-semantic-sidecar [serve [--model <id>]]   # default verb; default model bge-small-en-v1.5-f32
 julie-semantic-sidecar prepare [--model <id>]   # download + verify a model into the shared cache
+julie-semantic-sidecar broker --model <id> --endpoint <path> --lock <path> --accelerator-lock <path>
 julie-semantic-sidecar --version
 ```
 
 `serve` reads requests from stdin and writes one response line per request to stdout until EOF.
+`broker` serves the same frozen protocol over a current-user local endpoint. The process keeps the
+model-service and any acquired accelerator lock for its lifetime, accepts multiple connections, and
+exits when its inherited owner stdin reaches EOF. The lock holder alone removes a stale Unix socket;
+the broker directory and socket are restricted to modes `0700` and `0600`.
 An unknown verb exits 2 with usage on stderr.
 Consumers should always pass an explicit model id so their selected encoder never follows a
 standalone-default change.

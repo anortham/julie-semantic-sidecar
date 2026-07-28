@@ -88,20 +88,10 @@ pub fn run_loop_with_limits<R: BufRead, W: Write, E: EmbedEngine>(
 ) -> std::io::Result<()> {
     let mut buffer: Vec<u8> = Vec::new();
     loop {
-        let reply = match read_line_capped(&mut input, &mut buffer, limits.max_request_bytes)? {
-            LineRead::Eof => return Ok(()),
-            LineRead::Oversized => serialize_outcome(Outcome {
-                response: failure(
-                    "",
-                    INVALID_REQUEST,
-                    format!(
-                        "request line exceeds max_request_bytes ({})",
-                        limits.max_request_bytes
-                    ),
-                ),
-                stop: false,
-            })?,
-            LineRead::Line => match process_line(&buffer, engine, limits)? {
+        let reply = match read_request(&mut input, &mut buffer, limits)? {
+            FramedRequest::Eof => return Ok(()),
+            FramedRequest::Rejected(reply) => reply,
+            FramedRequest::Line => match process_line(&buffer, engine, limits)? {
                 Some(reply) => reply,
                 None => continue,
             },
@@ -121,6 +111,39 @@ pub struct ProtocolReply {
     pub stop_connection: bool,
 }
 
+/// One transport-neutral framing result for a bounded protocol request.
+pub enum FramedRequest {
+    /// The transport reached EOF without another request.
+    Eof,
+    /// `buffer` contains one complete request line.
+    Line,
+    /// Framing rejected the request and produced the frozen protocol reply.
+    Rejected(ProtocolReply),
+}
+
+/// Reads and drains one bounded request line while preserving the frozen oversize response.
+pub fn read_request<R: BufRead>(
+    input: &mut R,
+    buffer: &mut Vec<u8>,
+    limits: Limits,
+) -> std::io::Result<FramedRequest> {
+    match read_line_capped(input, buffer, limits.max_request_bytes)? {
+        LineRead::Eof => Ok(FramedRequest::Eof),
+        LineRead::Line => Ok(FramedRequest::Line),
+        LineRead::Oversized => Ok(FramedRequest::Rejected(serialize_outcome(Outcome {
+            response: failure(
+                "",
+                INVALID_REQUEST,
+                format!(
+                    "request line exceeds max_request_bytes ({})",
+                    limits.max_request_bytes
+                ),
+            ),
+            stop: false,
+        })?)),
+    }
+}
+
 /// Processes one bounded protocol request line without transport I/O.
 pub fn process_line<E: EmbedEngine>(
     line: &[u8],
@@ -130,6 +153,18 @@ pub fn process_line<E: EmbedEngine>(
     handle_line(line, engine, limits)
         .map(serialize_outcome)
         .transpose()
+}
+
+/// Renders an application failure through the frozen protocol-v1 error serializer.
+pub fn internal_error_reply(
+    request_id: &str,
+    kind: &str,
+    message: &str,
+) -> std::io::Result<ProtocolReply> {
+    serialize_outcome(Outcome {
+        response: internal_error(request_id.to_string(), &EngineError::new(kind, message)),
+        stop: false,
+    })
 }
 
 enum LineRead {
