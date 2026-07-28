@@ -461,9 +461,9 @@ fn public_docs_and_promotion_gate_name_every_portable_profile() {
 }
 
 #[test]
-fn current_prerelease_has_matching_public_notes_and_status() {
+fn source_candidate_has_notes_without_moving_published_pointer() {
     let version = env!("CARGO_PKG_VERSION");
-    assert_eq!(version, "0.1.0-rc.4");
+    assert_eq!(version, "0.1.0-rc.5");
 
     let tag = format!("v{version}");
     let release_notes_path = format!("docs/release-notes/{tag}.md");
@@ -472,21 +472,22 @@ fn current_prerelease_has_matching_public_notes_and_status() {
         std::fs::read_to_string(&release_notes_path).expect("current release notes");
 
     assert!(
-        readme.contains(&format!(
-            "**Current prerelease: [`{tag}`](https://github.com/anortham/julie-semantic-sidecar/releases/tag/{tag}).**"
-        )),
-        "README current-prerelease pointer does not match {tag}"
-    );
-    assert!(
-        readme.contains(&format!("[release notes]({release_notes_path})")),
-        "README release-notes pointer does not match {tag}"
-    );
-    assert!(
         release_notes.starts_with(&format!("# {tag}\n")),
         "release-note title does not match {tag}"
     );
     assert!(release_notes.contains("package candidate"));
     assert!(release_notes.contains("physical Intel Mac"));
+    assert!(release_notes.contains("has not been tagged or published"));
+    assert!(
+        readme.contains(
+            "**Current prerelease: [`v0.1.0-rc.4`](https://github.com/anortham/julie-semantic-sidecar/releases/tag/v0.1.0-rc.4).**"
+        ),
+        "README must continue to identify the live published prerelease"
+    );
+    assert!(
+        readme.contains("[release notes](docs/release-notes/v0.1.0-rc.4.md)"),
+        "README must continue to link the live published release notes"
+    );
     assert!(
         readme.contains("python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'"),
         "README must list the Python release-harness gate"
