@@ -1,10 +1,36 @@
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub fn bind(path: &Path, endpoint_bound: &AtomicBool) -> io::Result<UnixListener> {
+pub struct Listener(UnixListener);
+
+impl Listener {
+    pub fn accept(&self) -> io::Result<Connection> {
+        self.0.accept().map(|(stream, _)| Connection(stream))
+    }
+}
+
+pub struct Connection(UnixStream);
+
+impl Read for Connection {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
+impl Write for Connection {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+pub fn bind(path: &Path, endpoint_bound: &AtomicBool) -> io::Result<Listener> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -28,5 +54,5 @@ pub fn bind(path: &Path, endpoint_bound: &AtomicBool) -> io::Result<UnixListener
         let _ = std::fs::remove_file(path);
         return Err(err);
     }
-    Ok(listener)
+    Ok(Listener(listener))
 }

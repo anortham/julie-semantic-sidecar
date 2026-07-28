@@ -1,7 +1,7 @@
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use julie_semantic_sidecar::broker::{self, BrokerConfig, BrokerEndpoint};
 use julie_semantic_sidecar::{prepare, protocol, DEFAULT_MODEL_ID, VERSION};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -65,7 +65,29 @@ fn run_broker(
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn run_broker(
+    model: String,
+    endpoint: String,
+    service_lock: String,
+    accelerator_lock: String,
+) -> ExitCode {
+    let config = BrokerConfig {
+        model_id: model,
+        endpoint: BrokerEndpoint::Windows(endpoint),
+        service_lock: PathBuf::from(service_lock),
+        accelerator_lock: PathBuf::from(accelerator_lock),
+    };
+    match broker::serve(config) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("julie-semantic-sidecar: broker failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn run_broker(
     _model: String,
     _endpoint: String,

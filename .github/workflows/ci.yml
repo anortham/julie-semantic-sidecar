@@ -49,9 +49,32 @@ jobs:
       - name: Python harness tests
         run: python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
 
+  windows-broker-lifecycle:
+    name: windows-x64 broker lifecycle
+    needs: fast
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Configure Windows compiler environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Windows broker connect, I/O, ACL, and lifecycle
+        run: cargo test --test broker_windows_tests -- --nocapture
+
   conformance:
     name: conformance (${{ matrix.name }})
-    needs: fast
+    needs: [fast, windows-broker-lifecycle]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:

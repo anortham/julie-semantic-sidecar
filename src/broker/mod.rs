@@ -13,8 +13,6 @@ use lease::{AcceleratorLease, ServiceLease};
 use queue::{BrokerQueue, Dequeued, QueueError, RequestClass};
 use serde_json::Value;
 use std::io::{self, BufReader, Write};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, SyncSender};
@@ -30,6 +28,8 @@ const QUEUE_DEADLINE: Duration = Duration::from_secs(30);
 pub enum BrokerEndpoint {
     #[cfg(unix)]
     Unix(PathBuf),
+    #[cfg(windows)]
+    Windows(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,45 +93,28 @@ where
     }
 }
 
-#[cfg(unix)]
 fn bind_and_accept(
     endpoint: &BrokerEndpoint,
     endpoint_bound: Arc<AtomicBool>,
     queue: Arc<BrokerQueue<BrokerRequest>>,
 ) -> io::Result<()> {
-    let BrokerEndpoint::Unix(path) = endpoint;
-    let listener = transport::unix::bind(path, &endpoint_bound)?;
+    let listener = transport::bind(endpoint, &endpoint_bound)?;
     thread::Builder::new()
-        .name("semantic-broker-unix-accept".to_string())
-        .spawn(move || {
-            for connection in listener.incoming() {
-                match connection {
-                    Ok(stream) => spawn_connection(stream, Arc::clone(&queue)),
-                    Err(err) => {
-                        eprintln!("julie-semantic-sidecar: broker accept failed: {err}");
-                    }
+        .name("semantic-broker-accept".to_string())
+        .spawn(move || loop {
+            match listener.accept() {
+                Ok(stream) => spawn_connection(stream, Arc::clone(&queue)),
+                Err(err) => {
+                    eprintln!("julie-semantic-sidecar: broker accept failed: {err}");
                 }
             }
         })?;
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn bind_and_accept(
-    _endpoint: &BrokerEndpoint,
-    _endpoint_bound: Arc<AtomicBool>,
-    _queue: Arc<BrokerQueue<BrokerRequest>>,
-) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "broker transport is not available on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn spawn_connection(stream: UnixStream, queue: Arc<BrokerQueue<BrokerRequest>>) {
+fn spawn_connection(stream: transport::Connection, queue: Arc<BrokerQueue<BrokerRequest>>) {
     if let Err(err) = thread::Builder::new()
-        .name("semantic-broker-unix-connection".to_string())
+        .name("semantic-broker-connection".to_string())
         .spawn(move || {
             if let Err(err) = handle_connection(stream, queue) {
                 eprintln!("julie-semantic-sidecar: broker connection failed: {err}");
@@ -142,18 +125,17 @@ fn spawn_connection(stream: UnixStream, queue: Arc<BrokerQueue<BrokerRequest>>) 
     }
 }
 
-#[cfg(unix)]
 fn handle_connection(
-    mut stream: UnixStream,
+    stream: transport::Connection,
     queue: Arc<BrokerQueue<BrokerRequest>>,
 ) -> io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
     loop {
         match read_request(&mut reader, &mut line, Limits::default())? {
             FramedRequest::Eof => return Ok(()),
             FramedRequest::Rejected(reply) => {
-                write_reply(&mut stream, &reply)?;
+                write_reply(reader.get_mut(), &reply)?;
                 continue;
             }
             FramedRequest::Line => {}
@@ -168,14 +150,14 @@ fn handle_connection(
             == Err(QueueError::Full)
         {
             let reply = failure_reply(&line, "BrokerQueueFull", "broker queue is full")?;
-            write_reply(&mut stream, &reply)?;
+            write_reply(reader.get_mut(), &reply)?;
             continue;
         }
         let reply = reply_rx
             .recv()
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "broker scheduler stopped"))??;
         if let Some(reply) = reply {
-            write_reply(&mut stream, &reply)?;
+            write_reply(reader.get_mut(), &reply)?;
             if reply.stop_connection {
                 return Ok(());
             }
@@ -222,5 +204,7 @@ fn endpoint_path(endpoint: &BrokerEndpoint) -> Option<PathBuf> {
     match endpoint {
         #[cfg(unix)]
         BrokerEndpoint::Unix(path) => Some(path.clone()),
+        #[cfg(windows)]
+        BrokerEndpoint::Windows(_) => None,
     }
 }
