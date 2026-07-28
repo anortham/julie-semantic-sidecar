@@ -7,7 +7,7 @@
 //! loading concurrently race on it.
 
 use julie_semantic_sidecar::engine::{isolate, EncodeFailure, LlamaEngine, LLAMA_CPP_BUILD};
-use julie_semantic_sidecar::engine_trait::{EmbedEngine, Role};
+use julie_semantic_sidecar::engine_trait::{EmbedEngine, EngineFailureClass, Role};
 use julie_semantic_sidecar::manifest;
 use julie_semantic_sidecar::sanitize::sanitize;
 use julie_semantic_sidecar::truncate::{body_budget, fit};
@@ -84,6 +84,20 @@ fn a_systemic_encoder_failure_errors_the_request_instead_of_returning_zero_vecto
     let encode = |_: &[usize]| Err(EncodeFailure::systemic("ContextAlloc", "null reference"));
     let err = isolate(&[0usize, 1, 2, 3], 4, &encode).expect_err("a broken backend must not pass");
     assert_eq!(err.kind, "ContextAlloc");
+}
+
+#[test]
+fn context_allocation_resource_exhaustion_is_typed_without_changing_wire_rendering() {
+    let encode = |_: &[usize]| {
+        Err(EncodeFailure::resource_exhausted(
+            "ContextAlloc",
+            "out of memory",
+        ))
+    };
+    let err = isolate(&[0usize, 1, 2, 3], 4, &encode).expect_err("allocation failure errors");
+
+    assert_eq!(err.failure_class, EngineFailureClass::ResourceExhausted);
+    assert_eq!(err.to_string(), "ContextAlloc: out of memory");
 }
 
 #[test]

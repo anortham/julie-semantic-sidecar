@@ -34,6 +34,10 @@ const BACKEND_FALLBACK_REASON: &str = "requested_backend_unavailable";
 /// Exact reason string a `health` call reports when the model is absent from the cache.
 pub const MODEL_NOT_PREPARED: &str = "model_not_prepared";
 
+/// Broker-lifetime degradation recorded after accelerated allocation failure.
+pub const ACCELERATOR_RESOURCE_EXHAUSTED: &str =
+    "accelerator resource exhausted; permanently demoted to CPU";
+
 /// Backend availability, spanning both the torch-compatible reference keys and the
 /// llama.cpp backends v1 adds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -204,6 +208,28 @@ pub fn build(
     result.insert("sidecar_version".to_string(), json!(sidecar_version));
 
     Value::Object(result)
+}
+
+/// Adds broker-owned accelerator state to an engine health object.
+pub fn apply_broker_runtime_facts(
+    health: &mut Value,
+    accelerator_lease_held: bool,
+    degraded_reason: Option<&str>,
+) {
+    let Some(result) = health.as_object_mut() else {
+        return;
+    };
+    result.insert(
+        "accelerator_lease_held".to_string(),
+        json!(accelerator_lease_held),
+    );
+    let Some(reason) = degraded_reason else {
+        return;
+    };
+    result.insert("degraded_reason".to_string(), json!(reason));
+    if let Some(load_policy) = result.get_mut("load_policy").and_then(Value::as_object_mut) {
+        load_policy.insert("degraded_reason".to_string(), json!(reason));
+    }
 }
 
 fn resolve_degraded_reason(model: &ModelState, engine: &EngineFacts) -> Option<String> {

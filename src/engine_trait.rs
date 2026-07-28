@@ -29,6 +29,13 @@ pub struct EmbedOutput {
     pub vectors: Vec<Vec<f32>>,
 }
 
+/// Whether a request failure can trigger broker-local recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineFailureClass {
+    Application,
+    ResourceExhausted,
+}
+
 /// A failure raised while handling a well-formed request.
 ///
 /// The wire loop renders it as an `internal_error` envelope with the message
@@ -39,6 +46,8 @@ pub struct EngineError {
     pub kind: String,
     /// Human-readable detail.
     pub message: String,
+    /// Recovery class used by the process-local engine owner.
+    pub failure_class: EngineFailureClass,
 }
 
 impl EngineError {
@@ -47,6 +56,16 @@ impl EngineError {
         Self {
             kind: kind.into(),
             message: message.into(),
+            failure_class: EngineFailureClass::Application,
+        }
+    }
+
+    /// Builds a typed resource-exhaustion failure without changing its wire text.
+    pub fn resource_exhausted(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            message: message.into(),
+            failure_class: EngineFailureClass::ResourceExhausted,
         }
     }
 }
@@ -67,6 +86,11 @@ pub trait EmbedEngine {
     /// be a JSON object; every health invariant in the contract (`capabilities`,
     /// `load_policy`, the degradation rule, `dims` when ready) is the engine's obligation.
     fn health_facts(&self) -> Result<Value, EngineError>;
+
+    /// Whether the engine actually resolved to an accelerated backend.
+    fn is_accelerated(&self) -> bool {
+        false
+    }
 
     /// Embeds `texts` under `role`, returning one vector per input in input order.
     fn embed(&self, texts: &[String], role: Role) -> Result<EmbedOutput, EngineError>;

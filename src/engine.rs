@@ -40,6 +40,13 @@ pub const LLAMA_CPP_BUILD: &str = "llama-cpp-2 0.1.151 (llama-cpp-rs 7f0a0d95, v
 /// Runtime family reported through `health`.
 const RUNTIME: &str = "llama.cpp";
 
+/// Backend discovery policy for one engine load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendPolicy {
+    Auto,
+    CpuOnly,
+}
+
 /// Probe used to measure the tokenizer's per-input special-token overhead.
 const OVERHEAD_PROBE: &str = "probe";
 
@@ -202,6 +209,15 @@ impl LlamaEngine {
     /// 1 — the contract's § Stdout purity obligation. The guard covers the backend
     /// selection benchmark for the same reason.
     pub fn load(pin: &'static ModelPin, cache_dir: &Path) -> Result<Self, EngineError> {
+        Self::load_with_policy(pin, cache_dir, BackendPolicy::Auto)
+    }
+
+    /// Loads `pin` under an explicit backend policy.
+    pub fn load_with_policy(
+        pin: &'static ModelPin,
+        cache_dir: &Path,
+        policy: BackendPolicy,
+    ) -> Result<Self, EngineError> {
         let path = cache_dir.join(pin.file);
         if !path.is_file() {
             return Err(EngineError::new(
@@ -211,15 +227,19 @@ impl LlamaEngine {
         }
         verify_cached_digest(&path, pin.sha256)?;
 
-        crate::stdio_guard::guarded(|| Self::load_guarded(pin, cache_dir, &path))
+        crate::stdio_guard::guarded(|| Self::load_guarded(pin, cache_dir, &path, policy))
     }
 
     fn load_guarded(
         pin: &'static ModelPin,
         cache_dir: &Path,
         path: &Path,
+        policy: BackendPolicy,
     ) -> Result<Self, EngineError> {
-        let forced = backend_select::forced_backend();
+        let forced = match policy {
+            BackendPolicy::Auto => backend_select::forced_backend(),
+            BackendPolicy::CpuOnly => Some(backend_select::CPU.to_string()),
+        };
         if forced
             .as_deref()
             .is_some_and(|value| value.eq_ignore_ascii_case(backend_select::CPU))
@@ -561,7 +581,9 @@ impl LlamaEngine {
         let mut context = self
             .model
             .new_context(&self.backend, params)
-            .map_err(|err| EncodeFailure::systemic("ContextAlloc", format!("{err} ({shape})")))?;
+            .map_err(|err| {
+                EncodeFailure::resource_exhausted("ContextAlloc", format!("{err} ({shape})"))
+            })?;
 
         // `logits_all=true` on the causal decode path makes llama.cpp reserve a
         // vocab-width output row for EVERY token — 19 GiB for a 32768-token Qwen3 input
@@ -651,6 +673,10 @@ impl EmbedEngine for LlamaEngine {
             Limits::default(),
             VERSION,
         ))
+    }
+
+    fn is_accelerated(&self) -> bool {
+        self.selection.accelerated
     }
 
     fn embed(&self, texts: &[String], role: Role) -> Result<EmbedOutput, EngineError> {
@@ -755,6 +781,11 @@ impl EncodeFailure {
     /// Builds a systemic failure carrying the error the request will fail with.
     pub fn systemic(kind: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Systemic(EngineError::new(kind, message))
+    }
+
+    /// Builds a systemic resource-exhaustion failure.
+    pub fn resource_exhausted(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Systemic(EngineError::resource_exhausted(kind, message))
     }
 }
 
