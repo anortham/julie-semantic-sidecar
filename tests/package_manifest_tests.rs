@@ -463,7 +463,7 @@ fn public_docs_and_promotion_gate_name_every_portable_profile() {
 }
 
 #[test]
-fn source_candidate_has_notes_without_moving_published_pointer() {
+fn published_candidate_has_exact_release_pointer_and_evidence() {
     let version = env!("CARGO_PKG_VERSION");
     assert_eq!(version, "0.1.0-rc.5");
 
@@ -477,18 +477,22 @@ fn source_candidate_has_notes_without_moving_published_pointer() {
         release_notes.starts_with(&format!("# {tag}\n")),
         "release-note title does not match {tag}"
     );
-    assert!(release_notes.contains("package candidate"));
-    assert!(release_notes.contains("physical Intel Mac"));
-    assert!(release_notes.contains("has not been tagged or published"));
+    assert!(release_notes.contains("13fff87bcaa9cc93feac465141756f4fc36183f5"));
+    assert!(release_notes.contains("30360072357"));
+    assert!(release_notes.contains("30360964021"));
+    assert!(
+        release_notes.contains("47f9b1bcc149c781d6d95d74e3e0207142d3f587210872758e5b208fef3b091a")
+    );
+    assert!(release_notes.contains("inherits no RC4 hardware proof"));
     assert!(
         readme.contains(
-            "**Current prerelease: [`v0.1.0-rc.4`](https://github.com/anortham/julie-semantic-sidecar/releases/tag/v0.1.0-rc.4).**"
+            "**Current prerelease: [`v0.1.0-rc.5`](https://github.com/anortham/julie-semantic-sidecar/releases/tag/v0.1.0-rc.5).**"
         ),
-        "README must continue to identify the live published prerelease"
+        "README must identify the live published prerelease"
     );
     assert!(
-        readme.contains("[release notes](docs/release-notes/v0.1.0-rc.4.md)"),
-        "README must continue to link the live published release notes"
+        readme.contains("[release notes](docs/release-notes/v0.1.0-rc.5.md)"),
+        "README must link the live published release notes"
     );
     assert!(
         readme.contains("python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'"),

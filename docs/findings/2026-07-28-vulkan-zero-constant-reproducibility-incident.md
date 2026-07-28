@@ -54,3 +54,14 @@ Synthetic tests cover direct half zero, 32-bit zero converted to half, infinity,
 words, missing modules, and duplicate modules. The verifier was also exercised against the
 extracted divergent CI modules: it accepted the first run and rejected the second at
 `diag_f16.spv` with `0x7f800000`.
+
+## Closure
+
+Commit `13fff87bcaa9cc93feac465141756f4fc36183f5` implemented the correction and guard. Fresh runs
+`30360072357` and `30360964021` produced byte-identical Apple arm64, Apple x64, Linux Vulkan, and
+Windows Vulkan archives. Both Vulkan package logs recorded successful zero-store verification, and
+the checksum-bound second run was fully green.
+
+The exact public `v0.1.0-rc.5` assets match the retained second-run bytes and their checksum
+sidecars. RC5 therefore closes this reproducibility defect; RC4's withdrawn Windows claim remains
+withdrawn.

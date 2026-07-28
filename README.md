@@ -7,14 +7,12 @@ Metal / Vulkan / CPU backends. Consumers (Miller, Julie) spawn it and talk NDJSO
 download models or compute model paths.
 
 **Status: prerelease under active validation.**
-**Current prerelease: [`v0.1.0-rc.4`](https://github.com/anortham/julie-semantic-sidecar/releases/tag/v0.1.0-rc.4).**
-See the local [release notes](docs/release-notes/v0.1.0-rc.4.md) for the exact artifact and evidence record.
-Its Apple arm64, Apple x64, and Linux portable archives reproduced byte-for-byte across two clean
-hosted runs. A later RC5 candidate build exposed that RC4's Windows pair had sampled the same
-undefined SPIR-V result, so RC4's four-platform reproducibility claim is withdrawn. The exact public
-Apple arm64 archive still passes physical Apple Silicon CPU and Metal proof. Apple x64, Linux Vulkan,
-Windows Vulkan, and CUDA remain package candidates until their exact archives pass the applicable
-physical-hardware gates.
+**Current prerelease: [`v0.1.0-rc.5`](https://github.com/anortham/julie-semantic-sidecar/releases/tag/v0.1.0-rc.5).**
+See the local [release notes](docs/release-notes/v0.1.0-rc.5.md) for the exact artifact and evidence record.
+Its four portable archives reproduced byte-for-byte across two independent hosted builds, and both
+Vulkan lanes passed generated-SPIR-V zero-store verification. The public Apple arm64, Apple x64,
+Linux Vulkan, and Windows Vulkan archives remain package candidates until their exact checksums pass
+the applicable physical-hardware gates. CUDA is not included in RC5.
 
 ## Launch interface
 
