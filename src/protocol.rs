@@ -88,9 +88,9 @@ pub fn run_loop_with_limits<R: BufRead, W: Write, E: EmbedEngine>(
 ) -> std::io::Result<()> {
     let mut buffer: Vec<u8> = Vec::new();
     loop {
-        let outcome = match read_line_capped(&mut input, &mut buffer, limits.max_request_bytes)? {
+        let reply = match read_line_capped(&mut input, &mut buffer, limits.max_request_bytes)? {
             LineRead::Eof => return Ok(()),
-            LineRead::Oversized => Outcome {
+            LineRead::Oversized => serialize_outcome(Outcome {
                 response: failure(
                     "",
                     INVALID_REQUEST,
@@ -100,20 +100,36 @@ pub fn run_loop_with_limits<R: BufRead, W: Write, E: EmbedEngine>(
                     ),
                 ),
                 stop: false,
-            },
-            LineRead::Line => match handle_line(&buffer, engine, limits) {
-                Some(outcome) => outcome,
+            })?,
+            LineRead::Line => match process_line(&buffer, engine, limits)? {
+                Some(reply) => reply,
                 None => continue,
             },
         };
-        let line = serde_json::to_string(&outcome.response).map_err(std::io::Error::other)?;
-        output.write_all(line.as_bytes())?;
+        output.write_all(reply.line.as_bytes())?;
         output.write_all(b"\n")?;
         output.flush()?;
-        if outcome.stop {
+        if reply.stop_connection {
             return Ok(());
         }
     }
+}
+
+/// Serialized response for one protocol request line.
+pub struct ProtocolReply {
+    pub line: String,
+    pub stop_connection: bool,
+}
+
+/// Processes one bounded protocol request line without transport I/O.
+pub fn process_line<E: EmbedEngine>(
+    line: &[u8],
+    engine: &E,
+    limits: Limits,
+) -> std::io::Result<Option<ProtocolReply>> {
+    handle_line(line, engine, limits)
+        .map(serialize_outcome)
+        .transpose()
 }
 
 enum LineRead {
@@ -175,6 +191,13 @@ fn read_line_capped<R: BufRead>(
 struct Outcome {
     response: Response,
     stop: bool,
+}
+
+fn serialize_outcome(outcome: Outcome) -> std::io::Result<ProtocolReply> {
+    Ok(ProtocolReply {
+        line: serde_json::to_string(&outcome.response).map_err(std::io::Error::other)?,
+        stop_connection: outcome.stop,
+    })
 }
 
 impl Outcome {

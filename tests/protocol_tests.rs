@@ -133,6 +133,53 @@ fn error_code(response: &Value) -> &str {
 }
 
 #[test]
+fn reusable_processor_matches_stdio_for_success_error_blank_and_shutdown() {
+    let engine = FakeEngine::ready();
+    let fixtures: &[(&[u8], bool)] = &[
+        (br#"{"request_id":"ok","method":"health"}"#, false),
+        (br#"{"request_id":"bad","method":"nope"}"#, false),
+        (b"   ", false),
+        (br#"{"request_id":"stop","method":"shutdown"}"#, true),
+    ];
+
+    for &(line, expected_stop) in fixtures {
+        let mut stdio_input = line.to_vec();
+        stdio_input.push(b'\n');
+        let mut stdio_output = Vec::new();
+        protocol::run_loop(stdio_input.as_slice(), &mut stdio_output, &engine).expect("stdio");
+
+        let processed =
+            protocol::process_line(line, &engine, Limits::default()).expect("processor");
+
+        if stdio_output.is_empty() {
+            assert!(processed.is_none());
+            continue;
+        }
+
+        let reply = processed.expect("processor reply");
+        let stdio_line = std::str::from_utf8(&stdio_output)
+            .expect("utf-8")
+            .strip_suffix('\n')
+            .expect("newline");
+        assert_eq!(reply.line, stdio_line);
+        assert_eq!(reply.stop_connection, expected_stop);
+    }
+
+    let reply = protocol::process_line(
+        br#"{"request_id":"after","method":"health"}"#,
+        &engine,
+        Limits::default(),
+    )
+    .expect("processor")
+    .expect("reply after connection-scoped shutdown");
+    assert!(!reply.stop_connection);
+    assert_eq!(
+        serde_json::from_str::<Value>(&reply.line).expect("json")["request_id"],
+        "after"
+    );
+}
+
+#[test]
 fn a1_every_response_carries_schema_and_version() {
     let engine = FakeEngine::ready();
     let requests = [
