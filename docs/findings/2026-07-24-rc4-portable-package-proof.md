@@ -2,9 +2,15 @@
 
 ## Verdict
 
-The exact public `v0.1.0-rc.4` portable archives are reproducible and internally valid. Two clean
-GitHub Actions runs built byte-identical Apple arm64 Metal, Apple x64 Metal, Linux x64 Vulkan, and
-Windows x64 Vulkan archives from commit `7cab71190b5d5b4424747ffff6eafcb49a94aec0`.
+The exact public `v0.1.0-rc.4` Apple arm64 Metal, Apple x64 Metal, and Linux x64 Vulkan archives are
+reproducible and internally valid. Two clean GitHub Actions runs built byte-identical archives from
+commit `7cab71190b5d5b4424747ffff6eafcb49a94aec0`.
+
+The original four-platform verdict is withdrawn. A 2026-07-28 RC5 candidate exposed that the two
+RC4 Windows runs sampled the same undefined SPIR-V constant result. The public RC4 Windows archive
+remains checksum-bound to the bytes listed below, but the two-run record does not prove those bytes
+are reproducible. See
+[`2026-07-28-vulkan-zero-constant-reproducibility-incident.md`](2026-07-28-vulkan-zero-constant-reproducibility-incident.md).
 
 The public Apple arm64 archive additionally passes physical Apple Silicon CPU and Metal proof.
 Hosted artifact validation for the other three archives proves build, package, manifest, and
@@ -27,7 +33,9 @@ unpacked behavior only; it is not physical-hardware support evidence.
 Each archive matched its generated checksum sidecar, matched the same-named archive from the other
 run with `cmp`, and matched the corresponding public GitHub asset after a fresh release download.
 All four manifests report sidecar version `0.1.0-rc.4`, the expected target/backend, and the same
-content-derived native patch digest.
+content-derived native patch digest. This establishes artifact identity, but the matching Windows
+pair is now known to be an accidental same-value sample rather than sufficient reproducibility
+proof.
 
 ## Reproducibility incident
 

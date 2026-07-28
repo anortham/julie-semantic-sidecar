@@ -33,8 +33,16 @@ PATCHES = {
         b"float m_max = -1.0/0.0;\n",
         b"float m_max = uintBitsToFloat(0xFF800000);\n",
     ),
+    SHADER_ROOT / "diag.comp": (
+        b"data_d[get_doffset() + dst_idx(idx)] = D_TYPE(0);\n",
+        b"data_d[get_doffset() + dst_idx(idx)] = D_TYPE(0.0f);\n",
+    ),
+    SHADER_ROOT / "tri.comp": (
+        b"data_d[get_doffset() + dst_idx(idx)] = D_TYPE(0);\n",
+        b"data_d[get_doffset() + dst_idx(idx)] = D_TYPE(0.0f);\n",
+    ),
 }
-PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-infinity-v3"
+PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-repro-v4"
 
 
 def expected_patch_identity() -> str:
@@ -100,7 +108,7 @@ class NativeSourcePatchTests(unittest.TestCase):
         )
         return result, crate_root, checksum
 
-    def test_replaces_every_undefined_infinity_expression(self) -> None:
+    def test_replaces_every_nondeterministic_shader_expression(self) -> None:
         result, crate_root, checksum = self.run_patch()
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -120,7 +128,7 @@ class NativeSourcePatchTests(unittest.TestCase):
         result, crate_root, checksum = self.run_patch({path: source})
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("expected pinned unpatched infinity expressions", result.stderr)
+        self.assertIn("expected pinned unpatched native expressions", result.stderr)
         self.assertEqual((crate_root / path).read_bytes(), source)
         self.assertEqual(
             json.loads(checksum.read_text(encoding="utf-8"))["files"][path.as_posix()],
@@ -133,11 +141,37 @@ class NativeSourcePatchTests(unittest.TestCase):
         result, crate_root, checksum = self.run_patch({path: patched})
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("expected pinned unpatched infinity expressions", result.stderr)
+        self.assertIn("expected pinned unpatched native expressions", result.stderr)
         self.assertEqual((crate_root / path).read_bytes(), patched)
         self.assertEqual(
             json.loads(checksum.read_text(encoding="utf-8"))["files"][path.as_posix()],
             hashlib.sha256(patched).hexdigest(),
+        )
+
+    def test_rejects_an_already_patched_typed_zero(self) -> None:
+        path = SHADER_ROOT / "diag.comp"
+        patched = PATCHES[path][1]
+        result, crate_root, checksum = self.run_patch({path: patched})
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("expected pinned unpatched native expressions", result.stderr)
+        self.assertEqual((crate_root / path).read_bytes(), patched)
+        self.assertEqual(
+            json.loads(checksum.read_text(encoding="utf-8"))["files"][path.as_posix()],
+            hashlib.sha256(patched).hexdigest(),
+        )
+
+    def test_rejects_a_duplicate_typed_zero_expression(self) -> None:
+        path = SHADER_ROOT / "tri.comp"
+        original = PATCHES[path][0] * 2
+        result, crate_root, checksum = self.run_patch({path: original})
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("expected pinned unpatched native expressions", result.stderr)
+        self.assertEqual((crate_root / path).read_bytes(), original)
+        self.assertEqual(
+            json.loads(checksum.read_text(encoding="utf-8"))["files"][path.as_posix()],
+            hashlib.sha256(original).hexdigest(),
         )
 
     def test_rejects_a_mismatched_vendor_checksum_without_mutation(self) -> None:

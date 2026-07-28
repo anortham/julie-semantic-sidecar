@@ -39,8 +39,22 @@ PATCHES = {
             1,
         ),
     ),
+    SHADER_ROOT / "diag.comp": (
+        (
+            b"data_d[get_doffset() + dst_idx(idx)] = D_TYPE(0);",
+            b"data_d[get_doffset() + dst_idx(idx)] = D_TYPE(0.0f);",
+            1,
+        ),
+    ),
+    SHADER_ROOT / "tri.comp": (
+        (
+            b"data_d[get_doffset() + dst_idx(idx)] = D_TYPE(0);",
+            b"data_d[get_doffset() + dst_idx(idx)] = D_TYPE(0.0f);",
+            1,
+        ),
+    ),
 }
-PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-infinity-v3"
+PATCH_IDENTITY_PREFIX = "llama-cpp-sys-2-0.1.151:vulkan-repro-v4"
 
 
 def patch(vendor_root: Path) -> str:
@@ -69,7 +83,7 @@ def patch(vendor_root: Path) -> str:
         for original, replacement, expected_count in replacements:
             if source.count(original) != expected_count or replacement in source:
                 raise ValueError(
-                    f"expected pinned unpatched infinity expressions in {shader}"
+                    f"expected pinned unpatched native expressions in {shader}"
                 )
         source_key = source_path.as_posix()
         expected_source_checksum = hashlib.sha256(source).hexdigest()

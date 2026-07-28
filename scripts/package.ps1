@@ -74,7 +74,7 @@ try {
     if ($nativePatchExitCode -ne 0) { throw "native source patch failed" }
     if (
         $nativePatchOutput.Count -ne 1 -or
-        $nativePatchOutput[0].Trim() -cnotmatch '^llama-cpp-sys-2-0\.1\.151:vulkan-infinity-v3:[0-9a-f]{64}$'
+        $nativePatchOutput[0].Trim() -cnotmatch '^llama-cpp-sys-2-0\.1\.151:vulkan-repro-v4:[0-9a-f]{64}$'
     ) {
         throw "native source patch returned an invalid identity"
     }
@@ -94,6 +94,10 @@ $nativeOut = @(
         ForEach-Object { $_.out_dir }
 )
 if ($nativeOut.Count -ne 1) { throw "expected one llama-cpp-sys out_dir, found $($nativeOut.Count)" }
+if ($settings.Backend -eq "vulkan") {
+    & python (Join-Path $PSScriptRoot "verify-vulkan-shader-constants.py") --native-out $nativeOut[0]
+    if ($LASTEXITCODE -ne 0) { throw "Vulkan shader constant verification failed" }
+}
 
 $buildDir = Join-Path $cargoTargetDir "$($settings.Target)/release"
 $stageRoot = Join-Path $repoRoot "dist"

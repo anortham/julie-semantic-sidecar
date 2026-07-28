@@ -9,8 +9,10 @@ download models or compute model paths.
 **Status: prerelease under active validation.**
 **Current prerelease: [`v0.1.0-rc.4`](https://github.com/anortham/julie-semantic-sidecar/releases/tag/v0.1.0-rc.4).**
 See the local [release notes](docs/release-notes/v0.1.0-rc.4.md) for the exact artifact and evidence record.
-Its four portable archives reproduced byte-for-byte across two clean hosted runs. The exact public
-Apple arm64 archive also passes physical Apple Silicon CPU and Metal proof. Apple x64, Linux Vulkan,
+Its Apple arm64, Apple x64, and Linux portable archives reproduced byte-for-byte across two clean
+hosted runs. A later RC5 candidate build exposed that RC4's Windows pair had sampled the same
+undefined SPIR-V result, so RC4's four-platform reproducibility claim is withdrawn. The exact public
+Apple arm64 archive still passes physical Apple Silicon CPU and Metal proof. Apple x64, Linux Vulkan,
 Windows Vulkan, and CUDA remain package candidates until their exact archives pass the applicable
 physical-hardware gates.
 
@@ -80,8 +82,10 @@ The manifest records every payload file with its SHA-256, size, and role. The ma
 the sole metadata exception because a file cannot truthfully contain its own SHA-256. Verification
 rejects every other undeclared file, nested path, model weight, or backend/profile mismatch.
 Package builds use a deterministic Cargo-vendored dependency tree. The content-derived native patch
-identity recorded in the manifest binds the strict llama.cpp Vulkan infinity fixes applied before
-shader compilation.
+identity recorded in the manifest binds the strict llama.cpp Vulkan reproducibility fixes applied
+before shader compilation. Vulkan packaging also parses the generated `diag_f16.spv` and
+`tri_f16.spv` modules and rejects any constant-derived half-float store whose source value is not
+zero.
 
 ## License
 

@@ -16,7 +16,10 @@ target hardware against the exact archive checksum under consideration before pr
 3. **Package manifest and archive integrity** — the unpacked archive matches its machine-readable
    manifest: target, portability tier, advertised backend, sidecar version, native build identity,
    file inventory, per-file checksums, and archive SHA-256. The archive contains no model weights,
-   development paths, or undeclared native libraries.
+   development paths, or undeclared native libraries. Every Vulkan package build must parse the
+   generated `diag_f16.spv` and `tri_f16.spv` modules and prove that each contains exactly one
+   constant-derived half-float store whose source value is zero. Missing, duplicate, malformed, or
+   nonzero modules fail before archiving; patched source text alone is not proof.
 4. **Unpacked artifact validation** — `scripts/hardware-smoke.sh --artifact-validation` or
    `scripts/hardware-smoke.ps1 -ArtifactValidation` verifies the supplied SHA-256, extracts into a
    new temporary directory, validates the flat manifest inventory, runs that extracted binary's
