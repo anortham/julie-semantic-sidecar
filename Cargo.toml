@@ -33,7 +33,7 @@ fs4 = "1.1.0"
 libc = "0.2.186"
 libloading = "0.8.9"
 llama-cpp-2 = { version = "=0.1.151", default-features = false }
-llama-cpp-sys-2 = { version = "=0.1.151", default-features = false }
+llama-cpp-sys-2 = { version = "=0.1.153", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.10.9"
