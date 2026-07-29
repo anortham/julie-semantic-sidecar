@@ -1,5 +1,7 @@
 use std::env;
 
+mod build_support;
+
 fn main() {
     for name in [
         "TARGET",
@@ -21,11 +23,7 @@ fn main() {
     let native_patch_identity =
         env::var("JULIE_NATIVE_PATCH_IDENTITY").unwrap_or_else(|_| "none".to_string());
     let rustflags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
-    let rustflags = rustflags
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let rustflags = build_support::identity_rustflags(&rustflags);
     let package_features = ["metal", "vulkan", "cuda", "rocm", "dynamic-backends"]
         .into_iter()
         .filter(|feature| {

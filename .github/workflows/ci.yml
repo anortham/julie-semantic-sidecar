@@ -10,6 +10,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Frozen fixture pin: anortham/miller, the commit the protocol contract and the
@@ -17,11 +20,25 @@ env:
   MILLER_PIN: 8edfa14ffb4f0f696d6c4c4aaa572d5967495961
 
 jobs:
+  security-audit:
+    name: dependency vulnerability audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: RustSec dependency audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   fast:
     name: fast (fmt + clippy + unit tests)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install toolchain from rust-toolchain.toml
         run: |
@@ -34,7 +51,7 @@ jobs:
       - name: Verify cmake is present
         run: cmake --version
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
@@ -54,7 +71,7 @@ jobs:
     needs: fast
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install toolchain from rust-toolchain.toml
         run: |
@@ -63,11 +80,11 @@ jobs:
           cargo --version
 
       - name: Configure Windows compiler environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Windows broker connect, I/O, ACL, and lifecycle
         run: cargo test --test broker_windows_tests -- --nocapture
@@ -100,10 +117,10 @@ jobs:
         shell: bash
     steps:
       - name: Checkout sidecar
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Checkout pinned Miller fixtures
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: anortham/miller
           ref: ${{ env.MILLER_PIN }}
@@ -133,13 +150,13 @@ jobs:
         if: matrix.name == 'linux-x64'
         run: vulkaninfo --summary || true
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # Key = both manifest sha256 values (src/manifest.rs, qwen3 then bge). A pin bump
       # changes the key, so the next run re-prepares instead of serving a stale weight file.
       - name: Restore model cache
         id: models
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ github.workspace }}/model-cache
           key: models-${{ runner.os }}-${{ runner.arch }}-421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340-bf40c42ad7d89382e9ba7376d5c4b73f6b556cb541fab37aaa1da9c320149b65
@@ -236,7 +253,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install toolchain from rust-toolchain.toml
         run: |
@@ -246,7 +263,7 @@ jobs:
 
       - name: Prepare Vulkan SDK for compile proof
         if: matrix.backend == 'vulkan'
-        uses: humbletim/install-vulkan-sdk@v1.2
+        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
         with:
           version: 1.4.309.0
           cache: true
@@ -254,7 +271,7 @@ jobs:
 
       - name: Install Windows SPIR-V CMake package
         if: matrix.backend == 'vulkan' && runner.os == 'Windows'
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        uses: humbletim/setup-vulkan-sdk@c25f41106918cde0bf347e6f201277392b3a9e9d # v1.2.1
         with:
           vulkan-query-version: 1.4.309.0
           vulkan-components: SPIRV-Headers
@@ -262,7 +279,7 @@ jobs:
 
       - name: Configure Windows compiler environment
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -280,7 +297,7 @@ jobs:
         shell: bash
         run: echo "CMAKE_PREFIX_PATH=${VULKAN_SDK}" >> "${GITHUB_ENV}"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Compile and package portable profile with Bash
         if: matrix.package_shell == 'bash'
@@ -320,7 +337,7 @@ jobs:
             -EvidenceDir "artifact-validation/${{ matrix.profile }}"
 
       - name: Upload archive validation evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: artifact-validation-${{ matrix.profile }}
           path: |

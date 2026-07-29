@@ -6,13 +6,11 @@ A thin Rust stdio binary that turns text into embedding vectors. It speaks the f
 Metal / Vulkan / CPU backends. Consumers (Miller, Julie) spawn it and talk NDJSON; they never
 download models or compute model paths.
 
-**Status: prerelease under active validation.**
-**Current prerelease: [`v0.1.0-rc.5`](https://github.com/anortham/julie-semantic-sidecar/releases/tag/v0.1.0-rc.5).**
-See the local [release notes](docs/release-notes/v0.1.0-rc.5.md) for the exact artifact and evidence record.
-Its four portable archives reproduced byte-for-byte across two independent hosted builds, and both
-Vulkan lanes passed generated-SPIR-V zero-store verification. The public Apple arm64, Apple x64,
-Linux Vulkan, and Windows Vulkan archives remain package candidates until their exact checksums pass
-the applicable physical-hardware gates. CUDA is not included in RC5.
+**Release line: `v0.1.0` stable.**
+See the local [release notes](docs/release-notes/v0.1.0.md) for the change summary and evidence
+boundary. RC5 source, reproducibility, and hardware results informed this release, but versioning
+changes the executable and archive bytes. Stable support claims are bound to the exact archive
+checksums that pass the applicable physical-hardware gates. CUDA is not included in `v0.1.0`.
 
 ## Launch interface
 

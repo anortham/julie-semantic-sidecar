@@ -61,6 +61,28 @@ cargo_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 if [[ "$cargo_target_dir" != /* ]]; then
   cargo_target_dir="$repo_root/$cargo_target_dir"
 fi
+unit_separator=$'\x1f'
+encoded_rustflags="${CARGO_ENCODED_RUSTFLAGS:-}"
+if [[ -z "$encoded_rustflags" && -n "${RUSTFLAGS:-}" ]]; then
+  encoded_rustflags="$(
+    python3 -c 'import os, shlex, sys; sys.stdout.write(chr(31).join(shlex.split(os.environ["RUSTFLAGS"])))'
+  )"
+fi
+remap_rustflags="--remap-path-prefix=$cargo_target_dir=/cargo-target${unit_separator}--remap-path-prefix=$repo_root=/workspace"
+if [[ -n "$encoded_rustflags" ]]; then
+  remap_rustflags="${encoded_rustflags}${unit_separator}${remap_rustflags}"
+fi
+export CARGO_ENCODED_RUSTFLAGS="$remap_rustflags"
+unset RUSTFLAGS
+native_remap_flags="-ffile-prefix-map=$cargo_target_dir=/cargo-target -ffile-prefix-map=$repo_root=/workspace"
+export CFLAGS="${CFLAGS:+$CFLAGS }$native_remap_flags"
+export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }$native_remap_flags"
+export OBJCFLAGS="${OBJCFLAGS:+$OBJCFLAGS }$native_remap_flags"
+export OBJCXXFLAGS="${OBJCXXFLAGS:+$OBJCXXFLAGS }$native_remap_flags"
+export CMAKE_C_FLAGS="${CMAKE_C_FLAGS:+$CMAKE_C_FLAGS }$native_remap_flags"
+export CMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS:+$CMAKE_CXX_FLAGS }$native_remap_flags"
+export CMAKE_OBJC_FLAGS="${CMAKE_OBJC_FLAGS:+$CMAKE_OBJC_FLAGS }$native_remap_flags"
+export CMAKE_OBJCXX_FLAGS="${CMAKE_OBJCXX_FLAGS:+$CMAKE_OBJCXX_FLAGS }$native_remap_flags"
 vendor_parent="$cargo_target_dir/package-vendor/$profile"
 vendor_root="$vendor_parent/vendor"
 vendor_config="$vendor_parent/config.toml"
@@ -110,6 +132,7 @@ mkdir -p "$stage"
 cp "$build_dir/$exe" "$stage/$exe"
 cp LICENSE "$stage/LICENSE"
 cp README.md "$stage/README.md"
+cp THIRD_PARTY-LICENSES.html "$stage/THIRD_PARTY-LICENSES.html"
 chmod +x "$stage/$exe"
 
 copy_native_file() {

@@ -1466,15 +1466,20 @@ fn vulkan_workflows_install_the_complete_sdk_and_windows_cmake_headers() {
         let workflow = repository_file(path);
         assert!(workflow.contains(r#""os":"windows-2022""#));
         assert!(!workflow.contains(r#""os":"windows-2025""#));
-        assert!(workflow.contains("uses: ilammy/msvc-dev-cmd@v1"));
+        assert!(workflow
+            .contains("uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1"));
         assert!(workflow.contains("CMAKE_GENERATOR=Ninja"));
         assert!(workflow.contains("subst T: $env:RUNNER_TEMP"));
         assert!(workflow.contains(r#"CARGO_TARGET_DIR=T:\"#));
-        assert!(workflow.contains("uses: humbletim/install-vulkan-sdk@v1.2"));
+        assert!(workflow.contains(
+            "uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2"
+        ));
         assert!(workflow.contains("version: 1.4.309.0"));
         assert!(workflow.contains("cache: true"));
         assert!(workflow.contains("CMAKE_PREFIX_PATH=${VULKAN_SDK}"));
-        assert!(workflow.contains("uses: humbletim/setup-vulkan-sdk@v1.2.1"));
+        assert!(workflow.contains(
+            "uses: humbletim/setup-vulkan-sdk@c25f41106918cde0bf347e6f201277392b3a9e9d # v1.2.1"
+        ));
         assert!(workflow.contains("vulkan-components: SPIRV-Headers"));
     }
 }

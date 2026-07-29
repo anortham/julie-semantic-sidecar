@@ -12,7 +12,7 @@ use std::time::UNIX_EPOCH;
 use crate::{manifest, DEFAULT_MODEL_ID, VERSION};
 
 pub const MANIFEST_FILE: &str = "package-manifest.json";
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 const NATIVE_PATCH_IDENTITY_PREFIX: &str = "native_patch=llama-cpp-sys-2-0.1.151:vulkan-repro-v4:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +48,7 @@ pub enum PackageFileRole {
     CpuBackend,
     AcceleratorBackend,
     License,
+    ThirdPartyLicenses,
     Readme,
 }
 
@@ -413,6 +414,9 @@ fn classify(name: &str, profile: &PackageProfile) -> Result<PackageFileRole, Pac
     if name == "LICENSE" {
         return Ok(PackageFileRole::License);
     }
+    if name == "THIRD_PARTY-LICENSES.html" {
+        return Ok(PackageFileRole::ThirdPartyLicenses);
+    }
     if name == "README.md" {
         return Ok(PackageFileRole::Readme);
     }
@@ -461,6 +465,7 @@ fn validate_shape(package: &PackageManifest) -> Result<(), PackageError> {
     for (role, name) in [
         (PackageFileRole::Executable, "executable"),
         (PackageFileRole::License, "license"),
+        (PackageFileRole::ThirdPartyLicenses, "third-party licenses"),
         (PackageFileRole::Readme, "readme"),
     ] {
         if count(role) != 1 {

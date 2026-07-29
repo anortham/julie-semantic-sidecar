@@ -57,12 +57,30 @@ $vendorConfig = Join-Path $vendorParent "config.toml"
 if (Test-Path $vendorParent) { Remove-Item -Recurse -Force $vendorParent }
 New-Item -ItemType Directory -Force -Path $vendorRoot | Out-Null
 $previousNativePatchIdentity = $env:JULIE_NATIVE_PATCH_IDENTITY
+$previousRustFlags = $env:RUSTFLAGS
+$previousEncodedRustFlags = $env:CARGO_ENCODED_RUSTFLAGS
 
 $cargoArguments = @(
     "--config", $vendorConfig, "build", "--release", "--target", $settings.Target,
     "--features", $settings.Features, "--bins", "--message-format=json"
 )
 try {
+    $unitSeparator = [char]0x1f
+    $encodedRustFlags = $env:CARGO_ENCODED_RUSTFLAGS
+    if (-not $encodedRustFlags -and $env:RUSTFLAGS) {
+        $encodedRustFlags = & python -c 'import os, shlex, sys; sys.stdout.write(chr(31).join(shlex.split(os.environ["RUSTFLAGS"])))'
+        if ($LASTEXITCODE -ne 0) { throw "failed to encode RUSTFLAGS" }
+    }
+    $remapRustFlags = @(
+        "--remap-path-prefix=$cargoTargetDir=/cargo-target",
+        "--remap-path-prefix=$repoRoot=/workspace"
+    )
+    $env:CARGO_ENCODED_RUSTFLAGS = @(
+        if ($encodedRustFlags) { $encodedRustFlags }
+        $remapRustFlags
+    ) -join $unitSeparator
+    Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+
     $vendorConfigLines = & cargo vendor --locked --versioned-dirs $vendorRoot
     if ($LASTEXITCODE -ne 0) { throw "cargo vendor failed" }
     [System.IO.File]::WriteAllLines($vendorConfig, $vendorConfigLines)
@@ -85,6 +103,8 @@ try {
 }
 finally {
     $env:JULIE_NATIVE_PATCH_IDENTITY = $previousNativePatchIdentity
+    $env:RUSTFLAGS = $previousRustFlags
+    $env:CARGO_ENCODED_RUSTFLAGS = $previousEncodedRustFlags
     Remove-Item -Recurse -Force -ErrorAction Continue $vendorParent
 }
 $nativeOut = @(
@@ -107,6 +127,7 @@ New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item (Join-Path $buildDir $exe) (Join-Path $stage $exe)
 Copy-Item LICENSE (Join-Path $stage "LICENSE")
 Copy-Item README.md (Join-Path $stage "README.md")
+Copy-Item THIRD_PARTY-LICENSES.html (Join-Path $stage "THIRD_PARTY-LICENSES.html")
 
 function Copy-NativeFile([System.IO.FileInfo]$Source) {
     if ($Source.Name -match '\.dll$|\.so($|\.)|\.dylib($|\.)') {

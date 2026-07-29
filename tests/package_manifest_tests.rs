@@ -27,6 +27,7 @@ fn dynamic_stage(root: &Path) {
     write(root, "libggml-vulkan.so", b"vulkan");
     write(root, "LICENSE", b"license");
     write(root, "README.md", b"readme");
+    write(root, "THIRD_PARTY-LICENSES.html", b"third-party licenses");
 }
 
 fn vulkan_profile() -> PackageProfile {
@@ -67,7 +68,7 @@ fn create_is_deterministic_and_records_sorted_verified_payloads_and_model_policy
         .collect::<Vec<_>>();
     assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(!paths.contains(&MANIFEST_FILE));
-    assert_eq!(manifest.schema_version, 1);
+    assert_eq!(manifest.schema_version, 2);
     assert_eq!(manifest.rust_target, vulkan_profile().rust_target);
     assert_eq!(manifest.advertised_backend, AdvertisedBackend::Vulkan);
     assert_eq!(
@@ -82,6 +83,43 @@ fn create_is_deterministic_and_records_sorted_verified_payloads_and_model_policy
         .files
         .iter()
         .all(|file| file.sha256.len() == 64 && file.size > 0));
+    let third_party_licenses = manifest
+        .files
+        .iter()
+        .find(|file| file.role == PackageFileRole::ThirdPartyLicenses)
+        .expect("third-party license role");
+    assert_eq!(third_party_licenses.path, "THIRD_PARTY-LICENSES.html");
+    assert_eq!(third_party_licenses.size, 20);
+}
+
+#[test]
+fn third_party_license_report_is_required_and_hash_bound() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    dynamic_stage(dir.path());
+    std::fs::remove_file(dir.path().join("THIRD_PARTY-LICENSES.html"))
+        .expect("remove third-party licenses");
+
+    let error = package_manifest::write(dir.path(), &vulkan_profile()).expect_err("missing report");
+    assert!(error
+        .to_string()
+        .contains("missing required third-party licenses role"));
+
+    write(
+        dir.path(),
+        "THIRD_PARTY-LICENSES.html",
+        b"third-party licenses",
+    );
+    package_manifest::write(dir.path(), &vulkan_profile()).expect("write manifest");
+    write(
+        dir.path(),
+        "THIRD_PARTY-LICENSES.html",
+        b"other-party licenses",
+    );
+
+    let error = package_manifest::verify(dir.path()).expect_err("changed report");
+    assert!(error
+        .to_string()
+        .contains("checksum mismatch for THIRD_PARTY-LICENSES.html"));
 }
 
 #[test]
@@ -208,6 +246,11 @@ fn apple_metal_is_built_in_and_rejects_a_fake_plugin() {
         write(dir.path(), "julie-semantic-sidecar", b"executable");
         write(dir.path(), "LICENSE", b"license");
         write(dir.path(), "README.md", b"readme");
+        write(
+            dir.path(),
+            "THIRD_PARTY-LICENSES.html",
+            b"third-party licenses",
+        );
         let profile = PackageProfile {
             rust_target: rust_target.to_string(),
             tier: PackageTier::Portable,
@@ -216,7 +259,7 @@ fn apple_metal_is_built_in_and_rejects_a_fake_plugin() {
         };
 
         let manifest = package_manifest::write(dir.path(), &profile).expect("built in metal");
-        assert_eq!(manifest.files.len(), 3);
+        assert_eq!(manifest.files.len(), 4);
         assert!(manifest
             .files
             .iter()
@@ -232,6 +275,11 @@ fn rust_helper_creates_and_verifies_with_the_shared_validator() {
     write(dir.path(), "julie-semantic-sidecar", b"executable");
     write(dir.path(), "LICENSE", b"license");
     write(dir.path(), "README.md", b"readme");
+    write(
+        dir.path(),
+        "THIRD_PARTY-LICENSES.html",
+        b"third-party licenses",
+    );
 
     let create = Command::new(HELPER)
         .args([
@@ -407,6 +455,11 @@ fn patched_package_verification_rejects_every_invalid_native_patch_identity_shap
         write(dir.path(), "julie-semantic-sidecar", b"executable");
         write(dir.path(), "LICENSE", b"license");
         write(dir.path(), "README.md", b"readme");
+        write(
+            dir.path(),
+            "THIRD_PARTY-LICENSES.html",
+            b"third-party licenses",
+        );
 
         let create = Command::new(HELPER)
             .args([
@@ -463,9 +516,9 @@ fn public_docs_and_promotion_gate_name_every_portable_profile() {
 }
 
 #[test]
-fn published_candidate_has_exact_release_pointer_and_evidence() {
+fn stable_candidate_docs_are_publication_neutral_and_preserve_artifact_boundary() {
     let version = env!("CARGO_PKG_VERSION");
-    assert_eq!(version, "0.1.0-rc.5");
+    assert_eq!(version, "0.1.0");
 
     let tag = format!("v{version}");
     let release_notes_path = format!("docs/release-notes/{tag}.md");
@@ -477,27 +530,66 @@ fn published_candidate_has_exact_release_pointer_and_evidence() {
         release_notes.starts_with(&format!("# {tag}\n")),
         "release-note title does not match {tag}"
     );
-    assert!(release_notes.contains("13fff87bcaa9cc93feac465141756f4fc36183f5"));
-    assert!(release_notes.contains("30360072357"));
-    assert!(release_notes.contains("30360964021"));
     assert!(
-        release_notes.contains("47f9b1bcc149c781d6d95d74e3e0207142d3f587210872758e5b208fef3b091a")
-    );
-    assert!(release_notes.contains("inherits no RC4 hardware proof"));
-    assert!(
-        readme.contains(
-            "**Current prerelease: [`v0.1.0-rc.5`](https://github.com/anortham/julie-semantic-sidecar/releases/tag/v0.1.0-rc.5).**"
-        ),
-        "README must identify the live published prerelease"
+        release_notes.contains("Publication state, download links, and checksum-bound evidence"),
+        "release notes must name publication and checksum evidence separately"
     );
     assert!(
-        readme.contains("[release notes](docs/release-notes/v0.1.0-rc.5.md)"),
-        "README must link the live published release notes"
+        release_notes.contains("recorded outside these source\nrelease notes."),
+        "release notes must keep publication state outside the shipped source document"
     );
+    assert!(
+        release_notes.contains("RC5 evidence does not transfer to a stable archive"),
+        "release notes must preserve the exact-artifact evidence boundary"
+    );
+    assert!(
+        release_notes.contains("exact stable archive checksum"),
+        "release notes must require checksum-bound stable evidence"
+    );
+    assert!(
+        readme.contains("**Release line: `v0.1.0` stable.**"),
+        "README must identify the stable line without encoding publication state"
+    );
+    assert!(
+        readme.contains("[release notes](docs/release-notes/v0.1.0.md)"),
+        "README must link the stable release notes"
+    );
+    assert!(
+        !readme.contains("releases/tag/v0.1.0"),
+        "README must not link an unpublished stable tag"
+    );
+    assert!(
+        !release_notes.contains("## Released archives"),
+        "release notes must not claim unpublished stable archives"
+    );
+    assert!(
+        !release_notes.contains("No stable tag or archive is claimed"),
+        "release notes must not encode a transient unpublished state"
+    );
+    for current_doc in [&readme, &release_notes] {
+        let current_doc = current_doc.to_ascii_lowercase();
+        assert!(
+            !current_doc.contains("stable release candidate")
+                && !current_doc.contains("candidate evidence"),
+            "current stable documentation must not encode transient candidate status"
+        );
+    }
     assert!(
         readme.contains("python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'"),
         "README must list the Python release-harness gate"
     );
+
+    for historical_notes in [
+        "docs/release-notes/v0.1.0-rc.4.md",
+        "docs/release-notes/v0.1.0-rc.5.md",
+    ] {
+        let historical_notes =
+            std::fs::read_to_string(historical_notes).expect("historical release notes");
+        assert!(
+            !historical_notes.contains("current prerelease"),
+            "historical release notes must not claim current status"
+        );
+    }
 }
 
 #[test]
@@ -524,10 +616,16 @@ fn packaging_scripts_reject_native_cpu_flags_and_contain_no_publication_behavior
     let [bash, powershell] = packaging_scripts();
     for script in [&bash, &powershell] {
         assert!(script.contains("target-cpu=native"));
+        assert!(script.contains("--remap-path-prefix"));
+        assert!(script.contains("/workspace"));
+        assert!(script.contains("/cargo-target"));
         for forbidden in ["cargo publish", "gh release", "git push", "Publish-Module"] {
             assert!(!script.contains(forbidden), "forbidden {forbidden}");
         }
     }
+    assert!(bash.contains("-ffile-prefix-map"));
+    assert!(bash.contains("CMAKE_C_FLAGS"));
+    assert!(bash.contains("CMAKE_CXX_FLAGS"));
     assert!(bash.contains("sha256sum \"$archive_name\""));
     assert!(!bash.contains("sha256sum \"$archive\""));
     assert!(powershell.contains("GetFileName($archive)"));

@@ -68,7 +68,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install toolchain from rust-toolchain.toml
         run: |
@@ -78,7 +78,7 @@ jobs:
 
       - name: Prepare Vulkan SDK for artifact build
         if: matrix.backend == 'vulkan'
-        uses: humbletim/install-vulkan-sdk@v1.2
+        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
         with:
           version: 1.4.309.0
           cache: true
@@ -86,7 +86,7 @@ jobs:
 
       - name: Install Windows SPIR-V CMake package
         if: matrix.backend == 'vulkan' && runner.os == 'Windows'
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        uses: humbletim/setup-vulkan-sdk@c25f41106918cde0bf347e6f201277392b3a9e9d # v1.2.1
         with:
           vulkan-query-version: 1.4.309.0
           vulkan-components: SPIRV-Headers
@@ -94,7 +94,7 @@ jobs:
 
       - name: Configure Windows compiler environment
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -119,12 +119,12 @@ jobs:
 
       - name: Prepare CUDA toolkit for optional candidate build
         if: matrix.backend == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.35
+        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
         with:
           cuda: 13.2.0
           log-file-suffix: ${{ matrix.profile }}.txt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Package candidate with Bash
         if: matrix.package_shell == 'bash'
@@ -177,7 +177,7 @@ jobs:
 
       - name: Upload private archive, manifest, checksum, and raw logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: artifact-candidate-${{ matrix.profile }}
           path: |
