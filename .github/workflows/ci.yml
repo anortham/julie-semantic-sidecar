@@ -156,7 +156,7 @@ jobs:
       # changes the key, so the next run re-prepares instead of serving a stale weight file.
       - name: Restore model cache
         id: models
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/model-cache
           key: models-${{ runner.os }}-${{ runner.arch }}-421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340-bf40c42ad7d89382e9ba7376d5c4b73f6b556cb541fab37aaa1da9c320149b65
