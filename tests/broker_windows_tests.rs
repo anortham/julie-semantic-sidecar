@@ -17,11 +17,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
-use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, HANDLE,
+};
 use windows_sys::Win32::Security::{
     EqualSid, GetAce, GetKernelObjectSecurity, GetSecurityDescriptorDacl, GetTokenInformation,
     TokenUser, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
 };
+use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -112,7 +115,10 @@ fn cancelled_write_releases_the_pipe_instance_within_one_second() {
     let (_listener, connection, _client) = connected_pair("cancel-write");
     let mut writer = connection.clone();
     let started = Instant::now();
-    let join = thread::spawn(move || writer.write_all(&vec![b'x'; 8 * 1024 * 1024]).unwrap_err());
+    let join = thread::spawn(move || {
+        let buffer = vec![b'x'; 8 * 1024 * 1024];
+        writer.write(&buffer).unwrap_err()
+    });
     thread::sleep(Duration::from_millis(50));
 
     connection.cancel_io().unwrap();
@@ -186,7 +192,7 @@ fn pipe_acl_contains_only_the_current_process_user() {
     let mut ace: *mut c_void = null_mut();
     assert_ne!(unsafe { GetAce(acl, 0, &mut ace) }, 0);
     let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
-    assert_eq!(unsafe { (*allowed).Mask }, GENERIC_ALL);
+    assert_eq!(unsafe { (*allowed).Mask }, FILE_ALL_ACCESS);
     let ace_sid = unsafe { std::ptr::addr_of_mut!((*allowed).SidStart).cast() };
     let token_user = current_token_user();
     assert_ne!(unsafe { EqualSid(ace_sid, token_user.sid()) }, 0);
@@ -276,10 +282,7 @@ fn shutdown_closes_only_the_requesting_connection() {
         request(&mut first, "shutdown", "shutdown", json!({}))["request_id"],
         "shutdown"
     );
-    assert_eq!(
-        BufReader::new(first).read_line(&mut String::new()).unwrap(),
-        0
-    );
+    assert_pipe_closed(first);
     assert_eq!(
         request(&mut second, "health", "health", json!({}))["result"]["ready"],
         true
@@ -356,6 +359,21 @@ fn request(stream: &mut File, request_id: &str, method: &str, params: Value) -> 
         .read_line(&mut line)
         .unwrap();
     serde_json::from_str(&line).unwrap()
+}
+
+fn assert_pipe_closed(stream: File) {
+    let mut line = String::new();
+    match BufReader::new(stream).read_line(&mut line) {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(code)
+                    if code == ERROR_BROKEN_PIPE as i32
+                        || code == ERROR_PIPE_NOT_CONNECTED as i32
+            ) => {}
+        result => panic!("expected a closed named pipe, got {result:?}"),
+    }
 }
 
 fn config(root: &Path, endpoint: String) -> BrokerConfig {
