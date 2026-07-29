@@ -7,8 +7,8 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED,
-    ERROR_PIPE_CONNECTED, GENERIC_ALL, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_PIPE_CONNECTED,
+    GENERIC_ALL, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::{
     AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
@@ -497,14 +497,7 @@ fn last_error() -> io::Error {
 }
 
 fn io_error(error: u32) -> io::Error {
-    if error == ERROR_OPERATION_ABORTED {
-        io::Error::new(
-            io::ErrorKind::Interrupted,
-            "overlapped pipe operation cancelled",
-        )
-    } else {
-        io::Error::from_raw_os_error(error as i32)
-    }
+    io::Error::from_raw_os_error(error as i32)
 }
 
 fn poisoned<T>(_error: std::sync::PoisonError<T>) -> io::Error {

@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, HANDLE,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_OPERATION_ABORTED, ERROR_PIPE_NOT_CONNECTED, HANDLE,
 };
 use windows_sys::Win32::Security::{
     EqualSid, GetAce, GetKernelObjectSecurity, GetSecurityDescriptorDacl, GetTokenInformation,
@@ -89,7 +89,10 @@ fn cancelled_connect_releases_the_pipe_instance_within_one_second() {
 
     listener.cancel_pending().unwrap();
 
-    assert!(join.join().unwrap().kind() == std::io::ErrorKind::Interrupted);
+    assert_eq!(
+        join.join().unwrap().raw_os_error(),
+        Some(ERROR_OPERATION_ABORTED as i32)
+    );
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
@@ -106,7 +109,10 @@ fn cancelled_read_releases_the_pipe_instance_within_one_second() {
 
     connection.cancel_io().unwrap();
 
-    assert!(join.join().unwrap().kind() == std::io::ErrorKind::Interrupted);
+    assert_eq!(
+        join.join().unwrap().raw_os_error(),
+        Some(ERROR_OPERATION_ABORTED as i32)
+    );
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
@@ -115,15 +121,15 @@ fn cancelled_write_releases_the_pipe_instance_within_one_second() {
     let (_listener, connection, _client) = connected_pair("cancel-write");
     let mut writer = connection.clone();
     let started = Instant::now();
-    let join = thread::spawn(move || {
-        let buffer = vec![b'x'; 8 * 1024 * 1024];
-        writer.write(&buffer).unwrap_err()
-    });
+    let join = thread::spawn(move || writer.write_all(&vec![b'x'; 8 * 1024 * 1024]).unwrap_err());
     thread::sleep(Duration::from_millis(50));
 
     connection.cancel_io().unwrap();
 
-    assert!(join.join().unwrap().kind() == std::io::ErrorKind::Interrupted);
+    assert_eq!(
+        join.join().unwrap().raw_os_error(),
+        Some(ERROR_OPERATION_ABORTED as i32)
+    );
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
