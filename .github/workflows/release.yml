@@ -119,7 +119,7 @@ jobs:
 
       - name: Prepare CUDA toolkit for optional candidate build
         if: matrix.backend == 'cuda'
-        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
         with:
           cuda: 13.2.0
           log-file-suffix: ${{ matrix.profile }}.txt
